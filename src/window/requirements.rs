@@ -1121,7 +1121,7 @@ mod tests {
         // The phone-screen window's control refusal from an older phone,
         // which cannot be asked for control (no "control" in its report).
         (
-            "Turn it on there (its notification opens the setting).",
+            "Turn it on there.",
             "legacy phone build (its own notification opens the setup); Ask on phone otherwise",
         ),
         // Panel applets: no desktop offers an API to add one; System check

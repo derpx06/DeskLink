@@ -697,7 +697,7 @@ pub(super) fn send_remote_session_message(
 /// there is no switch to turn on), or the picture alone was approved.
 pub(super) fn control_denied_reason(can_control: bool, view_only_desktop: bool) -> String {
     if can_control {
-        "The approved desktop-control session is not active".to_string()
+        "Control on the computer stopped. Ask again.".to_string()
     } else if view_only_desktop {
         "This computer's desktop lets the phone watch its screen but not control it. Only \
          GNOME and KDE Plasma allow control."

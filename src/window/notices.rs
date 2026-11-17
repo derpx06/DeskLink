@@ -241,7 +241,7 @@ impl DesklinkWindow {
         for done in &finished {
             let device = names
                 .get(&done.device_id)
-                .map_or("your device", String::as_str);
+                .map_or("your phone", String::as_str);
             self.announce_transfer(done, device);
         }
         // "Received here" has a new entry.
@@ -386,7 +386,7 @@ impl DesklinkWindow {
             .replace(Some((message.clone(), std::time::Instant::now())));
         let toast = adw::Toast::new(&message);
         toast.set_use_markup(false);
-        toast.set_timeout(6);
+        toast.set_timeout(10);
         toast.set_button_label(Some("Details"));
         toast.set_action_name(Some("win.error-details"));
         toast.set_action_target_value(Some(&raw.to_variant()));

@@ -1,5 +1,5 @@
 //! Walk-away lock: lock this computer when a paired phone that was connected
-//! has been out of reach for a minute. Off unless turned on, per phone
+//! goes out of reach (a few minutes if it was asleep). Off unless turned on, per phone
 //! (Settings > Privacy & security).
 //!
 //! Only a phone that was feature-ready can walk away, and only when *nothing*

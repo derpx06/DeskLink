@@ -28,7 +28,7 @@ pub(super) fn friendly_error(raw: &str) -> (String, bool) {
         (OFFLINE, true)
     } else if has(&["downgraded protocol"]) {
         (
-            "That device runs an older DeskLink. Update DeskLink on it to connect.",
+            "That phone runs an older DeskLink. Update DeskLink on it to connect.",
             true,
         )
     } else if has(&["trusted device certificate changed"]) {
@@ -53,7 +53,7 @@ pub(super) fn friendly_error(raw: &str) -> (String, bool) {
         )
     } else if has(&["too many links are waiting to pair"]) {
         (
-            "Several devices are trying to pair at once. Wait a moment, then scan again.",
+            "Several phones are trying to pair at once. Wait a moment, then scan again.",
             false,
         )
     } else if has(&["qr pairing code expired"]) {
@@ -100,7 +100,7 @@ pub(super) fn friendly_error(raw: &str) -> (String, bool) {
         )
     } else if has(&["(os error 111)", "connection refused"]) {
         (
-            "The device refused the connection. Make sure DeskLink is open on it.",
+            "The phone refused the connection. Make sure DeskLink is open on it.",
             false,
         )
     } else if has(&["(os error 110)", "timed out"]) {
@@ -164,7 +164,7 @@ pub(super) fn friendly_error(raw: &str) -> (String, bool) {
         "failed to resolve",
     ]) {
         (
-            "DeskLink could not find the device on the network. It will keep looking.",
+            "DeskLink could not find the phone on the network. It will keep looking.",
             false,
         )
     } else if has(&["(os error 13)", "(os error 1)", "permission denied"]) {

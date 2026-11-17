@@ -98,7 +98,7 @@ impl DesklinkApplication {
                         "{phone} wants to share a Bucket"
                     ));
                     notification.set_body(Some(
-                        "One place for files, pictures, text and links on both devices.",
+                        "One place for files, pictures, text and links on the phone and the computer.",
                     ));
                     notification.add_button_with_target_value(
                         "Turn on",

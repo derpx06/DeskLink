@@ -319,7 +319,7 @@ fn daemon_errors_read_as_plain_words() {
 
     let (refused, lasting) =
         friendly_error("connect 10.0.0.2:1716: Connection refused (os error 111)");
-    assert!(refused.starts_with("The device refused"), "{refused}");
+    assert!(refused.starts_with("The phone refused"), "{refused}");
     assert!(!lasting);
     assert!(friendly_error("Refusing downgraded protocol from Pixel: 8")
         .0
@@ -753,4 +753,104 @@ fn the_sidebar_search_word_is_never_cut() {
         .find(|label| label.contains("dl-search-placeholder"))
         .expect("the placeholder label");
     assert!(!placeholder.contains("ellipsize"), "{placeholder}");
+}
+
+/// Drawn: a banner 420 px wide, and again at a 1.5 text scale, shows every
+/// sentence whole (F-QA-3: "...(off and\u{2026}" was cut). (Needs a display.)
+#[test]
+fn the_banner_shows_every_sentence_whole_at_420_px() {
+    fn ellipsized(widget: &gtk::Widget) -> bool {
+        let mut found = widget
+            .downcast_ref::<gtk::Label>()
+            .is_some_and(|label| label.layout().is_ellipsized());
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            found |= ellipsized(&next);
+            child = next.next_sibling();
+        }
+        found
+    }
+    crate::test_display::run(|| {
+        let texts: Vec<String> = [
+            "Enable DeskLink accessibility control on this Android device",
+            "Android turned off DeskLink accessibility control on this Android device (after an update or a force stop)",
+            "something else",
+        ]
+        .into_iter()
+        .flat_map(|denial| {
+            [false, true].into_iter().filter_map(move |askable| {
+                crate::remote_control::status_notice(crate::remote_control::Seen {
+                    state: Some(crate::device_links::webrtc::remote_session::SessionState::Viewing),
+                    has_picture: true,
+                    denial: Some(denial),
+                    phone: "Pixel 9",
+                    askable,
+                    ..crate::remote_control::Seen::default()
+                })
+                .map(|notice| notice.text)
+            })
+        })
+        .collect();
+        assert!(texts.len() >= 4);
+        // The probe sees a cut when there is one: the old, long sentence.
+        let long = "View only: DeskLink\u{2019}s accessibility service is not running on Pixel 9 (some phones turn it off after an update or a force stop). Turn it on again there (off and on, if it still shows on).";
+        {
+            let banner = adw::Banner::builder()
+                .use_markup(false)
+                .title(long)
+                .button_label("Ask on phone")
+                .revealed(true)
+                .build();
+            let window = gtk::Window::builder()
+                .default_width(420)
+                .child(&banner)
+                .build();
+            window.present();
+            let context = gtk::glib::MainContext::default();
+            for _ in 0..30 {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(
+                ellipsized(banner.upcast_ref()),
+                "the probe must see the old sentence cut"
+            );
+            window.close();
+        }
+        let settings = gtk::Settings::default().unwrap();
+        // However the asserts end, the text scale goes back for later tests.
+        struct ResetDpi(gtk::Settings);
+        impl Drop for ResetDpi {
+            fn drop(&mut self) {
+                self.0.set_gtk_xft_dpi(-1);
+            }
+        }
+        let _reset = ResetDpi(settings.clone());
+        for scale in [1.0, 1.5] {
+            settings.set_gtk_xft_dpi((96.0 * 1024.0 * scale) as i32);
+            for text in &texts {
+                let banner = adw::Banner::builder()
+                    .use_markup(false)
+                    .title(text.as_str())
+                    .button_label("Ask on phone")
+                    .revealed(true)
+                    .build();
+                let window = gtk::Window::builder()
+                    .default_width(420)
+                    .child(&banner)
+                    .build();
+                window.present();
+                let context = gtk::glib::MainContext::default();
+                for _ in 0..30 {
+                    while context.iteration(false) {}
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert!(
+                    !ellipsized(banner.upcast_ref()),
+                    "cut at 420 px, text scale {scale}: {text}"
+                );
+                window.close();
+            }
+        }
+    });
 }

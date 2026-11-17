@@ -182,12 +182,12 @@ pub(super) fn refresh_times(root: &gtk::Widget) {
 /// The line under the sharing switch: what is shared and what is not.
 pub(super) fn sharing_note() -> &'static str {
     match crate::device_links::daemon::clipboard::password_detection() {
-        Some(true) => "Copy on one device, paste on the other. Passwords are never shared.",
+        Some(true) => "Copy on the phone, paste on the computer, and back. Passwords are never shared.",
         Some(false) => {
-            "Copy on one device, paste on the other. Password detection isn't available in \
+            "Copy on the phone, paste on the computer, and back. Password detection isn't available in \
              this session, so copied passwords are shared too."
         }
-        None => "Copy on one device, paste on the other.",
+        None => "Copy on the phone, paste on the computer, and back.",
     }
 }
 
@@ -238,7 +238,7 @@ pub(super) fn history_box(on: bool) -> gtk::Box {
             if on {
                 "Text you copy here or on the phone appears here."
             } else {
-                "Sharing is off. Turn it on above to copy between the devices."
+                "Sharing is off. Turn it on above to copy between the phone and the computer."
             },
         );
         rows.append(&empty.root);

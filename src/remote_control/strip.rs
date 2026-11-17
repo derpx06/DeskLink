@@ -17,6 +17,7 @@ fn control_denied(seen: Seen) -> Notice {
     let again = Some(("Ask again", Action::RequestControl));
     if !denial.to_ascii_lowercase().contains("accessibility") {
         return Notice {
+            stopped: false,
             text: format!("View only: {phone} did not allow control ({denial})"),
             button: again,
         };
@@ -26,10 +27,10 @@ fn control_denied(seen: Seen) -> Notice {
     let stopped = denial.contains("turned off") || denial.contains("not running");
     if stopped && seen.control_ask != Some(AskState::Waiting) {
         return Notice {
+            stopped: true,
             text: format!(
-                "View only: DeskLink\u{2019}s accessibility service is not running on {phone} \
-                 (some phones turn it off after an update or a force stop). Turn it on again \
-                 there (off and on, if it still shows on)."
+                "View only: DeskLink\u{2019}s accessibility service is not running on {phone}. \
+                 Turn it off and on again there."
             ),
             button: if seen.askable {
                 Some((ask_label(seen.control_ask), Action::AskPhone))
@@ -40,26 +41,30 @@ fn control_denied(seen: Seen) -> Notice {
     }
     if !seen.askable {
         return Notice {
+            stopped: false,
             text: format!(
                 "View only: control needs DeskLink\u{2019}s accessibility service on {phone}. \
-                 Turn it on there (its notification opens the setting)."
+                 Turn it on there."
             ),
             button: again,
         };
     }
     match seen.control_ask {
         Some(AskState::Waiting) => Notice {
+            stopped: false,
             text: words(AskState::Waiting, phone),
             button: None,
         },
         Some(state) => Notice {
+            stopped: false,
             text: words(state, phone),
             button: Some((ask_label(Some(state)), Action::AskPhone)),
         },
         None => Notice {
+            stopped: false,
             text: format!(
                 "View only: control needs DeskLink\u{2019}s accessibility service on {phone}. \
-                 Ask on phone shows a request there; its Allow opens the setup."
+                 Ask on phone, then Allow there."
             ),
             button: Some((ask_label(None), Action::AskPhone)),
         },
@@ -82,6 +87,8 @@ pub(crate) enum Action {
 pub(crate) struct Notice {
     pub(crate) text: String,
     pub(crate) button: Option<(&'static str, Action)>,
+    /// The phone's service was on and Android turned it off (its tooltip says why).
+    pub(crate) stopped: bool,
 }
 
 /// What the window knows when it words its state.
@@ -183,6 +190,23 @@ pub(crate) fn typing_words(code: &str, phone: &str) -> String {
     }
 }
 
+/// What the banner's tooltip says beyond its title: why the service may have
+/// stopped, and, with a button, the steps for a greyed-out switch.
+pub(crate) fn banner_tooltip(notice: &Notice, denial: &str, steps: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    if notice.stopped {
+        parts.push(
+            "Some phones turn the service off after an update or a force stop. \
+             DeskLink\u{2019}s notification on the phone opens the setting."
+                .to_string(),
+        );
+    }
+    if notice.button.is_some() {
+        parts.push(format!("{denial} {steps}").trim().to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
 /// What the strip says. Control granted (`lease_active`) says nothing at all, so
 /// the strip goes the moment the phone allows it, with no click. Before the
 /// phone's picture there is no control to ask for: the phone's person has
@@ -206,6 +230,7 @@ pub(crate) fn status_notice(seen: Seen) -> Option<Notice> {
         return seen
             .typing
             .map(|code| Notice {
+                stopped: false,
                 text: typing_words(code, seen.phone),
                 button: None,
             })
@@ -223,7 +248,13 @@ pub(crate) fn status_notice(seen: Seen) -> Option<Notice> {
 
 /// What the strip says about the session itself.
 fn state_notice(seen: Seen) -> Option<Notice> {
-    let say = |text: String| Some(Notice { text, button: None });
+    let say = |text: String| {
+        Some(Notice {
+            stopped: false,
+            text,
+            button: None,
+        })
+    };
     let phone = seen.phone;
     let waiting = || {
         say(if seen.answered {

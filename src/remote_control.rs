@@ -270,17 +270,17 @@ pub fn show_remote_control_dialog(
     for (icon, tooltip, name) in [
         (
             "go-previous-symbolic",
-            "Phone Back (or right click)",
+            "Phone back (or right-click)",
             "backclick",
         ),
         (
             "go-home-symbolic",
-            "Phone Home (or middle click)",
+            "Phone home (or middle-click)",
             "middleclick",
         ),
         (
             "view-app-grid-symbolic",
-            "Phone Recent Apps",
+            "Phone recent apps",
             "forwardclick",
         ),
     ] {
@@ -325,10 +325,10 @@ pub fn show_remote_control_dialog(
     keys.append(&speaker);
     let fullscreen = gtk::Button::builder()
         .icon_name("view-fullscreen-symbolic")
-        .tooltip_text("Full Screen")
+        .tooltip_text("Full screen")
         .css_classes(["circular"])
         .build();
-    fullscreen.update_property(&[gtk::accessible::Property::Label("Full Screen")]);
+    fullscreen.update_property(&[gtk::accessible::Property::Label("Full screen")]);
     {
         let window = window.downgrade();
         fullscreen.connect_clicked(move |_| {
@@ -352,9 +352,9 @@ pub fn show_remote_control_dialog(
             }
             if let Some(button) = fullscreen.upgrade() {
                 let label = if full {
-                    "Leave Full Screen"
+                    "Leave full screen"
                 } else {
-                    "Full Screen"
+                    "Full screen"
                 };
                 button.set_icon_name(if full {
                     "view-restore-symbolic"
@@ -701,10 +701,11 @@ pub fn show_remote_control_dialog(
                 if let Some((_, action)) = notice.button {
                     strip_action.set(action);
                 }
-                let hint = notice
-                    .button
-                    .is_some()
-                    .then(|| format!("{} {ACCESSIBILITY_STEPS}", denial.as_deref().unwrap_or("")));
+                // A mouse extra: a screen reader reads the title, which is the
+                // whole (short) sentence; the tooltip holds what was cut from
+                // it and the steps.
+                let hint =
+                    banner_tooltip(notice, denial.as_deref().unwrap_or(""), ACCESSIBILITY_STEPS);
                 status.set_tooltip_text(hint.as_deref());
             }
             glib::ControlFlow::Continue
@@ -1450,6 +1451,49 @@ impl Restarter {
 mod tests {
     use super::*;
 
+    /// (A COPY-2 pin for this window's own buttons; the rest of the desk is
+    /// covered by the palette and notification tests.)
+    /// Every tooltip and accessible name in this window is sentence case
+    /// ("Phone recent apps", "Full screen"), like the rest of the desk.
+    #[test]
+    fn the_viewer_buttons_are_sentence_case() {
+        let production = crate::source_scan::production(include_str!("remote_control.rs"));
+        let title_case = |text: &str| {
+            let mut words = text.split(' ');
+            words.next();
+            words.any(|word| {
+                word.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                    && word.chars().skip(1).all(|c| c.is_ascii_lowercase())
+            })
+        };
+        let mut seen = 0;
+        for line in production.lines() {
+            for marker in [
+                "tooltip_text(\"",
+                "Property::Label(\"",
+                "set_tooltip_text(Some(\"",
+            ] {
+                if let Some(at) = line.find(marker) {
+                    seen += 1;
+                    let text = &line[at + marker.len()..];
+                    let text = &text[..text.find('"').unwrap_or(text.len())];
+                    assert!(!title_case(text), "Title Case: {text:?}");
+                }
+            }
+        }
+        assert!(seen > 3, "the scan found the buttons ({seen})");
+        // The ones that were Title Case, as the tooltips list them.
+        for text in [
+            "Phone back (or right-click)",
+            "Phone home (or middle-click)",
+            "Phone recent apps",
+            "Full screen",
+            "Leave full screen",
+        ] {
+            assert!(production.contains(&format!("\"{text}\"")), "{text}");
+        }
+    }
+
     #[test]
     fn a_point_maps_through_the_letterbox_to_phone_pixels() {
         // 576x1280 video of a 1080x2400 phone, shown in a 1000x1000 widget:
@@ -1584,6 +1628,65 @@ mod tests {
         })
         .unwrap();
         assert_eq!(other.button, Some(("Ask again", Action::RequestControl)));
+    }
+
+    /// The banner shows about two lines at a window as narrow as 420 px: no
+    /// sentence is longer than that, so none is cut ("...(off and\u{2026}").
+    #[test]
+    fn every_banner_sentence_fits_two_lines() {
+        let denials = [
+            "Enable DeskLink accessibility control on this Android device",
+            "Android turned off DeskLink accessibility control on this Android device (after an update or a force stop)",
+            "something else",
+        ];
+        for denial in denials {
+            for askable in [false, true] {
+                for ask in [None, Some(crate::device_links::asks::AskState::Waiting)] {
+                    let notice = status_notice(Seen {
+                        state: Some(SessionState::Viewing),
+                        has_picture: true,
+                        denial: Some(denial),
+                        phone: "Pixel 9",
+                        askable,
+                        control_ask: ask,
+                        ..Seen::default()
+                    });
+                    if let Some(notice) = notice {
+                        assert!(notice.text.chars().count() <= 105, "{}", notice.text);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The banner's tooltip carries what its short sentence dropped, and the
+    /// steps with a button; it is not overwritten by anything else.
+    #[test]
+    fn the_banner_tooltip_holds_the_dropped_explanation() {
+        let stopped = status_notice(Seen {
+            state: Some(SessionState::Viewing),
+            has_picture: true,
+            denial: Some(
+                "Android turned off DeskLink accessibility control on this Android device",
+            ),
+            phone: "Pixel",
+            askable: true,
+            ..Seen::default()
+        })
+        .unwrap();
+        let tip = banner_tooltip(&stopped, "denied", ACCESSIBILITY_STEPS).unwrap();
+        assert!(tip.contains("force stop"), "{tip}");
+        assert!(
+            tip.contains("notification on the phone opens the setting"),
+            "{tip}"
+        );
+        assert!(tip.contains(ACCESSIBILITY_STEPS), "{tip}");
+        let plain = Notice {
+            stopped: false,
+            text: "View only".into(),
+            button: None,
+        };
+        assert_eq!(banner_tooltip(&plain, "denied", ACCESSIBILITY_STEPS), None);
     }
 
     /// Android turned the service off (ColorOS on a force stop or an update):

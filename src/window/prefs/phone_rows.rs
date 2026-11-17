@@ -13,7 +13,7 @@ pub(super) fn bucket_row(device: &DeviceView) -> adw::SwitchRow {
     let on = crate::device_links::folders::bucket_on(&device.id);
     let row = adw::SwitchRow::builder()
         .title(esc(format!("Bucket with {}", device.name)))
-        .subtitle("One place for files, pictures, text and links on both devices")
+        .subtitle("One place for files, pictures, text and links on the phone and the computer")
         .active(on)
         .build();
     with_icon(&row, "folder-symbolic");

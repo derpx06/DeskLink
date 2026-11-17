@@ -55,7 +55,7 @@ impl Portal {
             ]),
         )?;
         let handle = lookup::<String>(&created, "session_handle")?
-            .ok_or_else(|| "The desktop did not start input capture".to_string())?;
+            .ok_or_else(|| "This computer did not start input capture".to_string())?;
         let granted = lookup::<u32>(&created, "capabilities")?.unwrap_or(0);
         let signals = std::rc::Rc::new(std::cell::RefCell::new(VecDeque::new()));
         static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -70,7 +70,7 @@ impl Portal {
             armed_at: VecDeque::new(),
         };
         if granted & 3 != 3 {
-            return Err("The desktop allowed only part of the input".to_string());
+            return Err("This computer allowed only part of the input".to_string());
         }
         portal.subscribe();
         let socket = portal.connect_to_eis()?;
@@ -171,7 +171,7 @@ impl Portal {
             .map_err(|error| format!("Input capture ConnectToEIS failed: {error}"))?;
         let index = pipewire_fd_index(&reply)?;
         let raw = list
-            .ok_or_else(|| "The desktop sent no input socket".to_string())?
+            .ok_or_else(|| "This computer sent no input socket".to_string())?
             .get(index)
             .map_err(|error| format!("Could not receive the input socket: {error}"))?;
         // SAFETY: `get` returned a fresh descriptor this side now owns.
@@ -248,7 +248,9 @@ impl Portal {
             .map_err(ArmError::Retry)?
             .is_some_and(|failed| !failed.is_empty())
         {
-            return Err(ArmError::Retry("The desktop refused that edge".to_string()));
+            return Err(ArmError::Retry(
+                "This computer refused that edge".to_string(),
+            ));
         }
         self.call("Enable", tuple([session, options(|_| {})]))
             .map_err(ArmError::Retry)?;

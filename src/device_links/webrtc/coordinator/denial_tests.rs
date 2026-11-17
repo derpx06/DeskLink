@@ -12,5 +12,5 @@ fn a_view_only_desktop_is_not_told_to_turn_on_a_switch_it_lacks() {
     );
     let gnome = control_denied_reason(false, false);
     assert!(gnome.contains("Allow remote interaction"), "{gnome}");
-    assert!(control_denied_reason(true, true).contains("not active"));
+    assert!(control_denied_reason(true, true).contains("stopped"));
 }

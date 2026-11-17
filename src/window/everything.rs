@@ -599,7 +599,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
         Group::Computer,
         "desklink-front-hand-symbolic",
         "Lock when you walk away".into(),
-        format!("This computer locks when {name} has been out of reach for a minute."),
+        format!("This computer locks about a minute after {name} goes out of reach (a few minutes if it was asleep)."),
         broken("lock").unwrap_or_else(|| {
             if facts.walk_away {
                 open("Privacy & security", guide::settings("Privacy & security"))
