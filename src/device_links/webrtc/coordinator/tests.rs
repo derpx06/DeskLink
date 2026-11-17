@@ -1433,11 +1433,11 @@ fn a_sign_of_a_phone_with_no_link_still_clears_the_unavailable_state() {
     let dir = std::env::temp_dir().join(format!("desklink-nolink-{}", uuid::Uuid::new_v4()));
     let config = Arc::new(Mutex::new(Config::load_from_dir(dir.clone()).unwrap()));
     let sessions = Arc::new(DeviceManager::new());
-    let binding = paired_session(&sessions, "00");
+    let binding = paired_session(&sessions, "00-nolink");
     let devices: Arc<Mutex<HashMap<String, crate::device_links::device::DeviceView>>> =
         Arc::default();
     let info = crate::device_links::device_info::DeviceInfo {
-        id: "00".into(),
+        id: "00-nolink".into(),
         name: "Pixel 9".into(),
         device_type: "phone".into(),
         protocol_version: 9,
@@ -1449,7 +1449,7 @@ fn a_sign_of_a_phone_with_no_link_still_clears_the_unavailable_state() {
     let mut card =
         crate::device_links::device::DeviceView::from_info(&info, "10.0.0.2".into(), true);
     card.last_error = Some(super::unavailable_words("Pixel 9"));
-    devices.lock().unwrap().insert("00".into(), card);
+    devices.lock().unwrap().insert("00-nolink".into(), card);
     sessions
         .with_session(&binding, |session| {
             session.webrtc_recovery_attempt = RECOVERY_BACKOFF_MILLIS.len() as u32
@@ -1458,11 +1458,11 @@ fn a_sign_of_a_phone_with_no_link_still_clears_the_unavailable_state() {
     // The liveness verdict took the link out of the session.
     sessions.disconnect_if_current(&binding, "silent".into());
     assert!(sessions.current_bindings().is_empty(), "no link");
-    super::reconnect("00", &sessions, &config, &devices, &Arc::default());
-    assert_eq!(devices.lock().unwrap()["00"].last_error, None);
+    super::reconnect("00-nolink", &sessions, &config, &devices, &Arc::default());
+    assert_eq!(devices.lock().unwrap()["00-nolink"].last_error, None);
     // The ladder starts over too (read through the paired session by id).
-    assert_eq!(sessions.reset_recovery("00"), Some(0));
-    crate::device_links::daemon::discovery::forget_addresses("00");
+    assert_eq!(sessions.reset_recovery("00-nolink"), Some(0));
+    crate::device_links::daemon::discovery::forget_addresses("00-nolink");
     let _ = std::fs::remove_dir_all(dir);
 }
 
