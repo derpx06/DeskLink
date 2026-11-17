@@ -27,7 +27,12 @@ pub(super) fn incoming_tcp_loop(
 ) {
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((stream, source)) => {
+                // Before a slot, a byte read or a thread: a routable host (a port forward, a routed VPN, a hotel
+                // network) must not reach the pairing prompt, the "nearby device" cards or the unpaired slots.
+                if !super::network::source_allowed(source) {
+                    continue; // dropping the stream closes it
+                }
                 let Some(slot) = stream
                     .peer_addr()
                     .ok()

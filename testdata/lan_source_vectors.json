@@ -1,0 +1,160 @@
+{
+ "_about": "Source addresses a TCP connection may come from: the desk's lan_scope::inbound_source_ok and the phone's isPrivateAddress must agree on all of these (loopback is accepted by the phone only in debug builds: the phone's test asserts that separately). Identical copy in both repos. Not in the list on purpose: fec0::/10 (deprecated site-local IPv6: the phone's Java isSiteLocalAddress accepts it, the desk refuses it) and addresses with a scope id (fe80::1%wlan0 does not parse into an IpAddr).",
+ "cases": [
+  {
+   "ip": "192.168.1.5",
+   "accepted": true,
+   "why": "RFC 1918 home Wi-Fi"
+  },
+  {
+   "ip": "10.0.0.2",
+   "accepted": true,
+   "why": "RFC 1918"
+  },
+  {
+   "ip": "172.16.4.9",
+   "accepted": true,
+   "why": "RFC 1918 (a phone hotspot)"
+  },
+  {
+   "ip": "172.31.255.1",
+   "accepted": true,
+   "why": "RFC 1918 upper end"
+  },
+  {
+   "ip": "169.254.1.1",
+   "accepted": true,
+   "why": "IPv4 link-local"
+  },
+  {
+   "ip": "fe80::1",
+   "accepted": true,
+   "why": "IPv6 link-local"
+  },
+  {
+   "ip": "fd12:3456::1",
+   "accepted": true,
+   "why": "IPv6 unique-local"
+  },
+  {
+   "ip": "127.0.0.1",
+   "accepted": true,
+   "why": "loopback: the emulator's proxy and the test harness"
+  },
+  {
+   "ip": "::1",
+   "accepted": true,
+   "why": "IPv6 loopback"
+  },
+  {
+   "ip": "::ffff:192.168.1.5",
+   "accepted": true,
+   "why": "IPv4-mapped private"
+  },
+  {
+   "ip": "100.64.0.1",
+   "accepted": true,
+   "why": "CGNAT / Tailscale (the phone accepts it, so a hotspot keeps working)"
+  },
+  {
+   "ip": "100.127.255.254",
+   "accepted": true,
+   "why": "CGNAT upper end"
+  },
+  {
+   "ip": "100.63.255.255",
+   "accepted": false,
+   "why": "just below CGNAT: public"
+  },
+  {
+   "ip": "100.128.0.1",
+   "accepted": false,
+   "why": "just above CGNAT: public"
+  },
+  {
+   "ip": "8.8.8.8",
+   "accepted": false,
+   "why": "public IPv4"
+  },
+  {
+   "ip": "172.32.0.1",
+   "accepted": false,
+   "why": "just above 172.16/12: public"
+  },
+  {
+   "ip": "192.169.0.1",
+   "accepted": false,
+   "why": "just above 192.168/16: public"
+  },
+  {
+   "ip": "2001:4860:4860::8888",
+   "accepted": false,
+   "why": "public IPv6"
+  },
+  {
+   "ip": "::ffff:8.8.8.8",
+   "accepted": false,
+   "why": "IPv4-mapped public"
+  },
+  {
+   "ip": "0.0.0.0",
+   "accepted": false,
+   "why": "unspecified"
+  },
+  {
+   "ip": "172.15.255.255",
+   "accepted": false,
+   "why": "just below 172.16/12: public"
+  },
+  {
+   "ip": "172.16.0.0",
+   "accepted": true,
+   "why": "172.16/12 lower end"
+  },
+  {
+   "ip": "172.31.255.255",
+   "accepted": true,
+   "why": "172.16/12 upper end"
+  },
+  {
+   "ip": "172.32.0.0",
+   "accepted": false,
+   "why": "just above 172.16/12: public"
+  },
+  {
+   "ip": "192.0.2.1",
+   "accepted": false,
+   "why": "TEST-NET-1: not local"
+  },
+  {
+   "ip": "100.64.0.0",
+   "accepted": true,
+   "why": "CGNAT lower end exactly"
+  },
+  {
+   "ip": "2002:808:808::1",
+   "accepted": false,
+   "why": "6to4 embedding 8.8.8.8: not local"
+  },
+  {
+   "ip": "64:ff9b::808:808",
+   "accepted": false,
+   "why": "NAT64 embedding 8.8.8.8: not local"
+  },
+  {
+   "ip": "255.255.255.255",
+   "accepted": false,
+   "why": "limited broadcast"
+  },
+  {
+   "ip": "224.0.0.1",
+   "accepted": false,
+   "why": "IPv4 multicast"
+  },
+  {
+   "ip": "ff02::1",
+   "accepted": false,
+   "why": "IPv6 multicast"
+  }
+ ]
+}

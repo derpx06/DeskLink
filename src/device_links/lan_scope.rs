@@ -26,6 +26,23 @@ pub(crate) fn is_private_or_link_local(ip: IpAddr) -> bool {
     }
 }
 
+/// 100.64.0.0/10, the shared address space of carriers and of mesh VPNs (Tailscale): not routable on the
+/// public internet, and what some phone hotspots hand out.
+fn is_cgnat(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(ip) if ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 0x40)
+}
+
+/// Whether a TCP connection from `ip` may reach the pairing and bootstrap code at all: the local network
+/// (private, link-local, unique-local), CGNAT/mesh-VPN space (what the phone app accepts too, so a hotspot or a
+/// Tailscale network keeps working) and loopback (this computer's own isolated test harness and the emulator's
+/// proxy). Everything else is dropped before a byte is read: a routable host must not be able to raise a pairing
+/// prompt, a "nearby device" card or use the unpaired slots. Mirrors `isPrivateAddress` in the phone's
+/// `NetworkHelper.kt`; both are pinned by `testdata/lan_source_vectors.json`.
+pub(crate) fn inbound_source_ok(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_loopback() || is_private_or_link_local(ip) || is_cgnat(ip)
+}
+
 /// Whether `ip` is within the first `prefix` bits of `net`.
 fn within(ip: IpAddr, net: IpAddr, prefix: u8) -> bool {
     match (ip, net) {
@@ -121,6 +138,34 @@ pub(crate) fn parse_candidate_ip(text: &str) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    /// The vector list's checksum. The phone's `LanSourceVectorsTest` asserts the same constant on its own copy of the
+    /// file: change the list in one repo and that repo's test fails until the constant (and so the other copy) follows.
+    const VECTORS_SHA256: &str = "9add4bf6d778fa1a963c71fe46b46fc0344354a1e4f2c85120419467ce4f7abb";
+
+    /// The same list is in the phone's tests (`LanSourceVectorsTest`): the two rules cannot drift. The list leaves out
+    /// fec0::/10 (deprecated site-local IPv6: the phone's Java `isSiteLocalAddress` accepts it, the desk refuses it) and
+    /// addresses with a scope id (`fe80::1%wlan0` does not parse into an `IpAddr`).
+    #[test]
+    fn a_tcp_source_is_local_exactly_as_the_phone_decides() {
+        let text = include_str!("../../testdata/lan_source_vectors.json");
+        let digest = openssl::sha::sha256(text.as_bytes());
+        assert_eq!(
+            digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            VECTORS_SHA256,
+            "the vector list changed: update VECTORS_SHA256 here and in the phone's LanSourceVectorsTest, and copy the file to both repos"
+        );
+        let vectors: serde_json::Value = serde_json::from_str(text).unwrap();
+        for case in vectors["cases"].as_array().unwrap() {
+            let ip: IpAddr = case["ip"].as_str().unwrap().parse().unwrap();
+            assert_eq!(
+                inbound_source_ok(ip),
+                case["accepted"].as_bool().unwrap(),
+                "{ip}: {}",
+                case["why"]
+            );
+        }
+    }
+
     use super::*;
 
     fn ip(text: &str) -> IpAddr {

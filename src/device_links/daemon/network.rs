@@ -258,6 +258,22 @@ impl Drop for HandshakeSlot {
     }
 }
 
+/// Whether a TCP connection from `source` may be served (see `lan_scope::inbound_source_ok`); a refusal is
+/// one rate-limited line, so a scan of the port does not fill the journal.
+pub(super) fn source_allowed(source: SocketAddr) -> bool {
+    if crate::device_links::lan_scope::inbound_source_ok(source.ip()) {
+        return true;
+    }
+    crate::device_links::limits::log_limited(
+        "tcp-source",
+        &format!(
+            "Dropped a connection from {}: not a local address",
+            source.ip()
+        ),
+    );
+    false
+}
+
 /// This computer's addresses, each with its interface, from `getifaddrs`
 /// (interfaces that are up only).
 pub(crate) fn local_interfaces() -> Vec<(String, IpAddr)> {
@@ -641,6 +657,40 @@ mod tests {
     }
 
     use super::*;
+
+    /// A routable source is dropped before anything reads from it; a local one is served.
+    #[test]
+    fn a_public_source_is_refused_and_a_local_one_served() {
+        let at = |text: &str| -> SocketAddr { text.parse().unwrap() };
+        assert!(!source_allowed(at("8.8.8.8:50000")));
+        assert!(!source_allowed(at("[2001:4860:4860::8888]:50000")));
+        assert!(source_allowed(at("192.168.1.5:50000")));
+        assert!(source_allowed(at("127.0.0.1:50000")));
+        assert!(source_allowed(at("100.64.0.9:50000")));
+    }
+
+    // Only `source_allowed` is exercised as behaviour (a connection from a public address cannot be made in a
+    // test); that the accept loop really asks first is checked by reading its source, which is weaker but
+    // fails when the guard is removed or disabled (revert-checked).
+    /// The accept loop asks before it claims a slot: nothing from a refused source gets a
+    /// slot, a thread or a read (and so no pairing prompt, card or unpaired session).
+    #[test]
+    fn the_accept_loop_checks_the_source_before_claiming_a_slot() {
+        let source = crate::source_scan::production(include_str!("connector.rs"));
+        // The whole-word guard: `if false && ...` or a removed `continue` no longer matches.
+        let check = source
+            .find("if !super::network::source_allowed(source) {")
+            .filter(|at| {
+                source[*at..].trim_start_matches(|c| c != '{')[1..]
+                    .trim_start()
+                    .starts_with("continue;")
+            })
+            .expect("the accept loop drops a refused source: the guard, then `continue`");
+        let claim = source
+            .find("HandshakeSlot::claim")
+            .expect("and claims a slot");
+        assert!(check < claim, "the source check must come first");
+    }
 
     #[test]
     fn the_qr_lists_only_addresses_a_phone_can_dial() {
