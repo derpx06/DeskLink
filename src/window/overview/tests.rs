@@ -593,3 +593,39 @@ fn the_other_pages_use_a_big_window() {
         window.close();
     });
 }
+
+/// Between the overlay (860sp) and 1000sp the sidebar is a rail: the page
+/// names are hidden and said in tooltips, the counts stay, and it goes back
+/// to the full list. (Needs a display.)
+#[test]
+fn the_sidebar_is_a_rail_on_a_middling_window() {
+    use adw::subclass::prelude::ObjectSubclassIsExt;
+    crate::test_display::run(|| {
+        let window = home_window("paired", 1280);
+        let imp = window.imp();
+        let names = || {
+            named_widgets(imp.nav_list.upcast_ref(), "")
+                .into_iter()
+                .filter(|w| w.has_css_class("nav-label"))
+                .collect::<Vec<_>>()
+        };
+        assert!(!names().is_empty());
+        imp.rail.set(true);
+        window.apply_layout();
+        assert!(
+            names().iter().all(|label| !label.is_visible()),
+            "names hidden"
+        );
+        let home = named_widgets(imp.nav_list.upcast_ref(), "home")
+            .into_iter()
+            .next()
+            .expect("the Home row");
+        assert_eq!(home.tooltip_text().as_deref(), Some("Home"));
+        assert!(imp.nav_list.has_css_class("rail"));
+        imp.rail.set(false);
+        window.apply_layout();
+        assert!(names().iter().all(|label| label.is_visible()), "names back");
+        assert_eq!(home.tooltip_text(), None);
+        window.close();
+    });
+}

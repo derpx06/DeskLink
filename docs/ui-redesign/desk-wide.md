@@ -80,3 +80,25 @@ Widget tests that the layout switches at its breakpoint and that every page fits
 `.tools/screenshots/p37-ui/`; gate; an independent review before merge.
 
 Screenshots (before/after per batch, with an INDEX.md) live in the workspace at `.tools/screenshots/p37-ui/`, not in this repo.
+
+## 6. Remaining set (design note, 2026-11-17)
+
+Order of user impact; each a small reviewed batch.
+
+```
+Sidebar, 860-1000 sp (rail)        Hero (kept)                      Files (later)
++----+--------------------+        phone art | name  [Send files]   [list|grid] toggle, remembered
+| o  | page               |        pill + detail   [Send clipboard]   grid = today's cards
+| #  |                    |        battery ring + words               list = one row per file
+| #4 |  (names in         |        Activity card first when busy
+| #  |   tooltips)        |
++----+--------------------+
+```
+
+| Item | Plan | Status |
+|---|---|---|
+| Compact sidebar | Below 1000sp and above the 860sp overlay the sidebar is a 76 px rail: icons, counts, the phone's dot; names in tooltips (batch 6) | done |
+| Hero | Already: phone silhouette, status pill, battery ring, one detail line, activity card right under it. A live screen thumbnail needs the Phone Screen frame path, which 3.4/3.6 still change: **skipped** | skipped |
+| Files grid/list toggle | History as one row per file, remembered | not done |
+| Transitions, loading states | Pages already crossfade (reduced motion respected by GTK); skeletons would add per-tick work: **skipped** | skipped |
+| Phone: Settings beside its list, tablet two-pane Home, onboarding polish | Needs the phone's tablet shells; Terminals grid done (832a956) | not done |

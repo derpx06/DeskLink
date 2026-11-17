@@ -84,6 +84,23 @@ fn row_label(device: &DeviceView, words: &Presentation, current: bool) -> String
     )
 }
 
+/// Every label under `widget`.
+fn labels_in(widget: &gtk::Widget) -> Vec<gtk::Label> {
+    let mut out = Vec::new();
+    let mut stack = vec![widget.clone()];
+    while let Some(next) = stack.pop() {
+        if let Some(label) = next.downcast_ref::<gtk::Label>() {
+            out.push(label.clone());
+        }
+        let mut child = next.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            stack.push(c);
+        }
+    }
+    out
+}
+
 impl Sidebar {
     pub(super) fn new(win: &DesklinkWindow) -> Self {
         let imp = win.imp();
@@ -214,6 +231,50 @@ impl Sidebar {
         }
     }
 
+    /// The sidebar as a rail (icons, counts and the phone's dot) or as the
+    /// full list: every name is hidden in a rail and said in the row's
+    /// tooltip instead (a row greyed for a reason keeps its own tooltip).
+    pub(super) fn set_rail(&self, win: &DesklinkWindow, rail: bool) {
+        let imp = win.imp();
+        for widget in [
+            imp.nav_list.upcast_ref::<gtk::Widget>(),
+            imp.footer_list.upcast_ref(),
+        ] {
+            if rail {
+                widget.add_css_class("rail");
+            } else {
+                widget.remove_css_class("rail");
+            }
+        }
+        for (page, row, _) in &self.rows {
+            let title = PAGES
+                .iter()
+                .find(|(name, _, _)| name == page)
+                .map_or("", |(_, title, _)| *title);
+            for label in labels_in(row.upcast_ref()) {
+                if label.has_css_class("nav-label") {
+                    label.set_visible(!rail);
+                }
+            }
+            if rail && row.tooltip_text().is_none() {
+                row.set_tooltip_text(Some(title));
+            } else if !rail && row.tooltip_text().as_deref() == Some(title) {
+                row.set_tooltip_text(None);
+            }
+        }
+        // The phone's card and the search: their words go, their glyphs stay.
+        for button in [
+            imp.device_card.upcast_ref::<gtk::Widget>(),
+            imp.sidebar_search.upcast_ref(),
+        ] {
+            for label in labels_in(button) {
+                label.set_visible(!rail);
+            }
+        }
+        imp.sidebar_search
+            .set_tooltip_text(Some("Find anything (Ctrl+K)"));
+    }
+
     /// Selects page `name`'s row, and no row in the other list.
     pub(super) fn select(&self, name: &str) {
         for (page, row, _) in &self.rows {
@@ -256,6 +317,8 @@ impl Sidebar {
                 .count()
         });
         self.update_rows(device, moving);
+        // The redrawn card and rows keep the rail's look.
+        self.set_rail(win, win.imp().rail.get());
         self.update_switcher(devices, device);
         self.update_live_text(win, devices, device);
     }

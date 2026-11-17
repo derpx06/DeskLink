@@ -45,6 +45,8 @@ pub struct DesklinkWindow {
     #[template_child]
     pub wide_breakpoint: TemplateChild<adw::Breakpoint>,
     #[template_child]
+    pub rail_breakpoint: TemplateChild<adw::Breakpoint>,
+    #[template_child]
     pub toast_overlay: TemplateChild<adw::ToastOverlay>,
     /// The window is phone-narrow: grids go one to a line.
     pub narrow: Cell<bool>,
@@ -53,6 +55,8 @@ pub struct DesklinkWindow {
     pub compact: Cell<bool>,
     /// The page area is 1200sp or wider: Home goes to two columns.
     pub wide: Cell<bool>,
+    /// The window is under 1000sp but not collapsed: the sidebar is a rail.
+    pub rail: Cell<bool>,
     pub daemon: RefCell<Option<DaemonHandle>>,
     pub selected_device_id: RefCell<Option<String>>,
     /// The device the person chose (or the remembered one); see
@@ -196,6 +200,20 @@ impl ObjectImpl for DesklinkWindow {
                 self.compact_breakpoint.connect_apply(changed);
             } else {
                 self.compact_breakpoint.connect_unapply(changed);
+            }
+        }
+        for rail in [true, false] {
+            let window = obj.downgrade();
+            let changed = move |_: &adw::Breakpoint| {
+                if let Some(window) = window.upgrade() {
+                    window.imp().rail.set(rail);
+                    window.apply_layout();
+                }
+            };
+            if rail {
+                self.rail_breakpoint.connect_apply(changed);
+            } else {
+                self.rail_breakpoint.connect_unapply(changed);
             }
         }
         for wide in [true, false] {
