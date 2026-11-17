@@ -156,6 +156,10 @@ impl DaemonWorker {
                         &self.errors,
                         format!("Could not create a pairing code: {error}"),
                     );
+                } else {
+                    // A scan is a pairing: an unpair still owed to a phone must
+                    // not decline it.
+                    super::pairing_commands::clear_all_owed_not_paired();
                 }
             }
             DaemonCommand::CancelQrPairing => crate::device_links::pairing_qr::cancel(),

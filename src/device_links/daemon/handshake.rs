@@ -487,7 +487,11 @@ pub(crate) fn attach_bootstrap_link(
 /// paired: a state report to it, never a state change here. Bounded in age
 /// and count (`pairing_commands::take_owed_not_paired`).
 pub(super) fn answer_owed_not_paired(binding: &SessionBinding, paired: bool) {
+    // Never while a QR code is live: a same-certificate phone re-pairing by
+    // scan sends its proof on this very link, and a `pair:false` ahead of it
+    // is what declines a pending pairing.
     if paired
+        || crate::device_links::pairing_qr::live_generation().is_some()
         || !super::pairing_commands::take_owed_not_paired(
             &binding.device_id,
             std::time::Instant::now(),
@@ -721,7 +725,10 @@ pub(super) fn begin_webrtc_after_accept(
 /// Both implementations use buffered identity readers during the secure
 /// handshake; signaling sent before those readers are retired can otherwise
 /// be prefetched and lost. A bounded retry is safe because each request is
-/// signed and replay-protected, and it stops as soon as an attempt is active.
+/// signed and replay-protected, and it stops as soon as an attempt is active
+/// or the device is no longer paired. It does not retry past the first attempt:
+/// an offer lost early is recovered by the worker's 10 s not-feature-ready
+/// rebuild, not by these retries.
 fn schedule_webrtc_bootstrap(
     binding: SessionBinding,
     sessions: Arc<DeviceManager>,
@@ -745,7 +752,13 @@ fn schedule_webrtc_bootstrap(
     thread::spawn(move || {
         for &delay in delays {
             thread::sleep(Duration::from_millis(delay));
-            if !sessions.is_current(&binding) {
+            if !sessions.is_current(&binding)
+                || !sessions
+                    .with_session(&binding, |session| {
+                        session.pairing.state == crate::device_links::pairing::PairState::Paired
+                    })
+                    .unwrap_or(false)
+            {
                 debug_log!(
                     "[DL-WRTC-BOOT] bootstrap scheduler stopped for stale generation {}",
                     binding.generation

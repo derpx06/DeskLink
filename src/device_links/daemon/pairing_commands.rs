@@ -91,15 +91,18 @@ pub(crate) struct PairingContext {
 
 impl PairingContext {
     pub(crate) fn send_pair_request(&self, device_id: &str) {
+        // The user starts a pairing: an unpair this desk still owes the
+        // device must not decline it on a link flap right after "Pair".
+        clear_owed_not_paired(device_id);
         let result = self.transition(device_id, |pairing| pairing.request_packet());
         let Some((binding, snapshot, _, state)) = self.finish(device_id, result) else {
             return;
         };
         if state == PairState::Paired {
-            // The peer had already accepted: this request was the acknowledgement.
-            if self.persist_trust(device_id, &binding, snapshot, state) {
-                update_pair_state(&self.devices, device_id, PairState::Paired, None);
-            }
+            // The peer had already asked: this request was the acceptance
+            // (`request_packet` in `RequestedByPeer`), the same transition as
+            // `accept_pair`, and it must do the same things.
+            self.complete_acceptance(device_id, &binding, snapshot, state);
             return;
         }
         let timestamp = self
@@ -112,6 +115,35 @@ impl PairingContext {
             state,
             Some(binding.link.verification_key(timestamp)),
         );
+    }
+
+    /// Every way this desk accepts a peer's pair request ends here (the
+    /// Accept button, and Pair pressed while the peer's request is pending):
+    /// persist trust, end any owed unpair, show Paired, and start the WebRTC
+    /// negotiation, which the peer's own `pair` packet starts only in the
+    /// orientation where this desk asked first. Whether trust was persisted.
+    fn complete_acceptance(
+        &self,
+        device_id: &str,
+        binding: &SessionBinding,
+        snapshot: PairingHandler,
+        state: PairState,
+    ) -> bool {
+        // Persisting trust can still fail. Revert rather than leave the
+        // session `Paired` against an empty trust store (see `persist_trust`).
+        if !self.persist_trust(device_id, binding, snapshot, state) {
+            return false;
+        }
+        clear_owed_not_paired(device_id);
+        update_pair_state(&self.devices, device_id, PairState::Paired, None);
+        super::handshake::begin_webrtc_after_accept(
+            binding,
+            &self.sessions,
+            &self.config,
+            &self.devices,
+            &self.events,
+        );
+        true
     }
 
     pub(crate) fn accept_pair(&self, device_id: &str, shown_key: Option<&str>) {
@@ -155,23 +187,7 @@ impl PairingContext {
         // time it sends anything — `notify_peer_not_paired` answers it with
         // `pair:false`. That is the same self-healing path a missed unpair
         // uses, which is why no queue is needed here either.
-        if self.persist_trust(device_id, &binding, snapshot, state) {
-            clear_owed_not_paired(device_id);
-            update_pair_state(&self.devices, device_id, PairState::Paired, None);
-            // The phone started this pairing and the user just accepted it
-            // here, so the peer's own "pair" packet that ends the other
-            // orientation (and starts the negotiation) never comes. When
-            // this desk is the deterministic initiator nothing else would
-            // ever send the offer: the phone waits for it, the link idles on
-            // heartbeats. Same bounded bootstrap a fresh paired link gets.
-            super::handshake::begin_webrtc_after_accept(
-                &binding,
-                &self.sessions,
-                &self.config,
-                &self.devices,
-                &self.events,
-            );
-        }
+        self.complete_acceptance(device_id, &binding, snapshot, state);
     }
 
     /// Advances the pairing state and builds its packet under the session
@@ -398,7 +414,15 @@ pub(crate) fn take_owed_not_paired(device_id: &str, now: std::time::Instant) -> 
     true
 }
 
+/// Memory only (lost when the desk restarts) and little more than
+/// `notify_peer_not_paired` already tells a device that sends a feature.
 /// A pairing (any way) ends the debt: the device is paired again.
+pub(crate) fn clear_all_owed_not_paired() {
+    if let Ok(mut owed) = owed_not_paired().lock() {
+        owed.clear();
+    }
+}
+
 pub(crate) fn clear_owed_not_paired(device_id: &str) {
     if let Ok(mut owed) = owed_not_paired().lock() {
         owed.remove(device_id);

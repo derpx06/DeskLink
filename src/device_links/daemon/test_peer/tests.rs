@@ -2216,3 +2216,201 @@ fn a_paired_link_is_not_told_it_is_unpaired() {
     assert!(waiting_types(&phone).is_empty());
     super::super::pairing_commands::clear_owed_not_paired(&desktop.peer_id());
 }
+
+/// The production attach path for a fresh link of `desk`'s phone: what a
+/// reconnecting phone goes through (`paired` as the trust store says).
+fn attach_fresh_link(desk: &mut TestPeer, net: &Arc<TestNetwork>) {
+    net.reconnect(desk.end);
+    let transport: Arc<dyn crate::device_links::core::LinkTransport> = Arc::new(net.end(desk.end));
+    let link = SessionLink::new(
+        Arc::clone(&transport),
+        desk.peer_certificate_pem.clone(),
+        desk.local_public_der.clone(),
+        desk.remote_public_der.clone(),
+        desk.info.clone(),
+    );
+    super::super::handshake::attach_bootstrap_link(
+        &desk.peer_id(),
+        link,
+        transport,
+        desk.is_trusted(),
+        false,
+        Arc::clone(&desk.config),
+        Arc::clone(&desk.devices),
+        Arc::clone(&desk.sessions),
+        Arc::clone(&desk.events),
+    )
+    .unwrap();
+    desk.binding = desk.sessions.current_binding(&desk.peer_id()).unwrap();
+}
+
+fn desk_attempt(desk: &TestPeer) -> bool {
+    desk.sessions
+        .active_webrtc_attempt(&desk.binding)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// The owed `pair:false` through the PRODUCTION wiring (`attach_bootstrap_link`
+/// on the device's next link), not a hand call.
+#[test]
+fn the_owed_unpair_is_answered_by_the_production_attach_path() {
+    let net = TestNetwork::new();
+    let (mut desktop, mut phone) = paired_pair(&net);
+    desktop.drop_link();
+    desktop.unpair();
+    phone.drop_link();
+    phone.relink();
+    attach_fresh_link(&mut desktop, &net);
+    net.advance(0);
+    phone.pump();
+    assert!(!phone.is_trusted(), "told on its next identity");
+}
+
+/// A live QR code: a same-certificate phone re-pairing by scan sends its proof
+/// on the link, and a `pair:false` ahead of it would decline the pairing.
+#[test]
+fn an_owed_unpair_is_not_sent_while_a_qr_code_is_live() {
+    use crate::device_links::pairing_qr;
+    let net = TestNetwork::new();
+    let (mut desktop, mut phone) = paired_pair(&net);
+    desktop.drop_link();
+    desktop.unpair();
+    phone.drop_link();
+    phone.relink();
+    let der = desktop
+        .config
+        .lock()
+        .unwrap()
+        .certificate()
+        .to_der()
+        .unwrap();
+    let id = desktop.local_id();
+    pairing_qr::start(&id, &der, None, &[], 1716).unwrap();
+    attach_fresh_link(&mut desktop, &net);
+    net.advance(0);
+    phone.pump();
+    pairing_qr::cancel();
+    assert!(phone.is_trusted(), "nothing declined the scan");
+    // Starting a code (the command) also ends every debt.
+    super::super::pairing_commands::owe_not_paired(&desktop.peer_id());
+    super::super::pairing_commands::clear_all_owed_not_paired();
+    assert!(!super::super::pairing_commands::take_owed_not_paired(
+        &desktop.peer_id(),
+        std::time::Instant::now()
+    ));
+}
+
+/// Starting a pairing here ends the debt: a link flap right after "Pair"
+/// must not decline the phone's pending request.
+#[test]
+fn pressing_pair_ends_the_owed_unpair() {
+    let net = TestNetwork::new();
+    let (desktop, _phone) = peer_pair(&net, "owed-pair-d", "owed-pair-p");
+    super::super::pairing_commands::owe_not_paired(&desktop.peer_id());
+    desktop.request_pair();
+    assert!(!super::super::pairing_commands::take_owed_not_paired(
+        &desktop.peer_id(),
+        std::time::Instant::now()
+    ));
+}
+
+/// The sibling orientation of F-QA2-1: the phone asked, and the desk USER
+/// presses Pair (not Accept) while the request is pending. `request_packet`
+/// in `RequestedByPeer` is an acceptance and must start the negotiation too.
+#[test]
+fn pressing_pair_on_a_pending_phone_request_starts_the_negotiation() {
+    let net = TestNetwork::new();
+    let (mut desk, phone) = pair_by_roles(&net, true);
+    phone.request_pair();
+    net.advance(0);
+    desk.pump();
+    assert_eq!(desk.pair_state(), PairState::RequestedByPeer);
+    desk.request_pair();
+    assert!(desk.is_trusted());
+    assert!(
+        wait_for(std::time::Duration::from_secs(5), || desk_attempt(&desk)),
+        "the desk never offered"
+    );
+}
+
+/// A second Accept finds no request: it errors and spawns nothing more.
+#[test]
+fn a_double_accept_starts_one_negotiation() {
+    let net = TestNetwork::new();
+    let (mut desk, phone) = pair_by_roles(&net, true);
+    phone.request_pair();
+    net.advance(0);
+    desk.pump();
+    desk.accept();
+    assert!(wait_for(
+        std::time::Duration::from_secs(5),
+        || desk_attempt(&desk)
+    ));
+    let first = desk.sessions.active_webrtc_attempt(&desk.binding).unwrap();
+    let before = desk.errors.lock().unwrap().len();
+    desk.accept();
+    assert!(
+        desk.errors.lock().unwrap().len() > before,
+        "no request to accept"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    assert_eq!(
+        desk.sessions.active_webrtc_attempt(&desk.binding).unwrap(),
+        first,
+        "one attempt"
+    );
+}
+
+/// Desk-started pairing, both orientations: the phone accepts and the desk
+/// negotiates (initiator) or asks the phone to (responder).
+#[test]
+fn a_desk_started_pairing_reaches_the_negotiation_in_both_orientations() {
+    for lower_is_desk in [true, false] {
+        let net = TestNetwork::new();
+        let (mut desk, mut phone) = pair_by_roles(&net, lower_is_desk);
+        desk.request_pair();
+        net.advance(0);
+        phone.pump();
+        phone.accept();
+        net.advance(0);
+        desk.pump();
+        assert!(desk.is_trusted());
+        if lower_is_desk {
+            assert!(
+                wait_for(std::time::Duration::from_secs(5), || desk_attempt(&desk)),
+                "the initiating desk offered"
+            );
+        } else {
+            // The phone is the initiator: its own acceptance starts it.
+            assert!(
+                wait_for(std::time::Duration::from_secs(5), || {
+                    net.advance(0);
+                    phone
+                        .sessions
+                        .active_webrtc_attempt(&phone.binding)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                }),
+                "the initiating phone offered"
+            );
+        }
+    }
+}
+
+/// An unpair right after the accept: the scheduled retries see the device is
+/// no longer paired and offer nothing.
+#[test]
+fn an_unpair_right_after_the_accept_stops_the_scheduled_offer() {
+    let net = TestNetwork::new();
+    let (mut desk, phone) = pair_by_roles(&net, true);
+    phone.request_pair();
+    net.advance(0);
+    desk.pump();
+    desk.accept();
+    desk.unpair();
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    assert!(!desk_attempt(&desk), "no offer for an unpaired phone");
+}
