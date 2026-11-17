@@ -87,14 +87,10 @@ Edit `config.toml`:
   `turn_backend = "coturn"` (step 8), or `"none"`.
 - Keep `listen = "127.0.0.1:8080"` and the default `trusted_proxies`.
 
-Create `.env` beside `docker-compose.yml` (never commit it):
+Create `.env` beside `docker-compose.yml` from the tracked template (never commit `.env`):
 
 ```sh
-cat > .env <<'EOF'
-RELAY_DOMAIN=relay.example.com
-DESKLINK_RELAY_CF_TOKEN=<Cloudflare API token from step 5>
-DESKLINK_RELAY_TURN_SECRET=
-EOF
+cp .env.example .env     # RELAY_DOMAIN, DESKLINK_RELAY_CF_TOKEN, DESKLINK_RELAY_TURN_SECRET (empty until step 8)
 chmod 600 .env
 ```
 
@@ -120,8 +116,10 @@ curl -fsS http://127.0.0.1:8080/metrics            # on the droplet only
 Use this instead of, or as a fallback to, Cloudflare.
 
 1. Generate the shared secret. It lives only in the untracked `.env`; both
-   the relay and coturn (via `--static-auth-secret` in `docker-compose.yml`)
-   read it from there, so it never enters the tracked `turnserver.conf`:
+   the relay and coturn read it from there (coturn through `env_file: .env`: its
+   start line expands `$DESKLINK_RELAY_TURN_SECRET`, so the secret is not on a
+   command line or in `docker inspect`'s arguments), and it never enters the
+   tracked `turnserver.conf`:
 
    ```sh
    SECRET=$(openssl rand -hex 32)
@@ -189,7 +187,7 @@ desktop and Android apps after changing it.
   pings a dead-man's-switch URL only on success:
 
   ```sh
-  */15 * * * * . /root/desklink/relay/deploy/.env && docker run --rm --network host coturn/coturn:4 turnutils_uclient -y -n 3 -m 1 -W "$DESKLINK_RELAY_TURN_SECRET" -u probe relay.example.com >/dev/null 2>&1 && curl -fsS -m 10 https://hc-ping.com/<your-check-uuid> >/dev/null
+  */15 * * * * . /root/desklink/relay/deploy/.env && docker run --rm --network host coturn/coturn:4.6.2 turnutils_uclient -y -n 3 -m 1 -W "$DESKLINK_RELAY_TURN_SECRET" -u probe relay.example.com >/dev/null 2>&1 && curl -fsS -m 10 https://hc-ping.com/<your-check-uuid> >/dev/null
   ```
 
 - **Egress at 70 %:** the $6 droplet includes 1 TB/month of outbound

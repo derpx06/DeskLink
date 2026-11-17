@@ -143,3 +143,24 @@ the Shell1 sender gate is right and PropertiesChanged is sent only on change.
 ## For other phases
 
 - Screen (3.4): nothing reliability-relevant on the desk side.
+
+## Security audit (1.3, SEC-1 to SEC-6)
+
+- **SEC-1 fixed** (own branch): the TCP listener serves local sources only (`lan_scope::inbound_source_ok`, pinned with the phone by `testdata/lan_source_vectors.json`).
+- **SEC-2 fixed, partly**: unpaired links are counted per /24 or /64 as well as per address (six per network). Not done: reserving
+  slots for a link that presents a live QR proof (it needs the QR admission path to claim a slot before the check: listed).
+- **SEC-3** (`--talk-name=org.freedesktop.Flatpak`): needed, shared terminals start the user's shell on the host with
+  `flatpak-spawn --host`. Kept, and said plainly in SECURITY.md ("The Flatpak is not a sandbox"), `flatpak/README.md`, and enforced by
+  `flatpak/check-manifest.py` (every finish-arg is justified in SECURITY.md). A store build would have to drop terminals.
+- **SEC-4** (documentation only, by the "no migration of pairing records" invariant): the phone's private key is in plain app-private
+  SharedPreferences, not the Keystore; the desk's vault key sits beside the sealed data, so sealing is not encryption at rest. In SECURITY.md.
+  A versioned Keystore / Secret Service migration is a follow-up.
+- **SEC-5**: JitPack is limited to its two groups (the phone's `settings.gradle.kts`), the Gradle wrapper has `distributionSha256Sum`,
+  the relay's images are pinned to releases (`rust:1.93.0-bookworm`, `debian:12.11-slim`, `caddy:2.9.1`, `coturn/coturn:4.6.2`;
+  all four tags exist on Docker Hub, and coturn's start line was run: `turnserver` is at /usr/bin and the secret expands from the
+  environment; the base images do not refresh themselves: bump the tags on purpose and `docker compose build --pull`) and coturn's secret is read from its environment, not passed on its command line. **Not
+  done**: Gradle `verification-metadata.xml` (a large generated file: `./gradlew --write-verification-metadata sha256`, then review it).
+- **SEC-6 listed**: `media_art.rs` resolves the host once to check it and `souphttpsrc` resolves it again, a DNS-rebinding window
+  for one blind GET to a LAN address (the answer is not readable by the page). Connecting to the checked IP would break TLS name
+  verification for https art (most art), so it is not a simple change: it needs a resolver hook or a pinned-address GIO socket client.
+

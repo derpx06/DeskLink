@@ -68,14 +68,40 @@ pub(super) fn should_throttle_connection(
 /// opening 42 sessions under made-up ids kept every real phone out of pairing.
 const MAX_UNPAIRED_PER_ADDRESS: usize = 2;
 
+/// Unpaired links one network (a /24 for IPv4, a /64 for IPv6) may hold at once: a host with IP aliases
+/// on its subnet got 2 links per alias, so 21 aliases filled all 42 slots and no real phone could pair.
+const MAX_UNPAIRED_PER_NETWORK: usize = 6;
+
+/// The network `address` (an address, or an `address:port`) belongs to: its /24 or /64 prefix, else the text itself.
+fn network_of(address: &str) -> String {
+    use std::net::IpAddr;
+    let ip = address
+        .parse::<SocketAddr>()
+        .map(|socket| socket.ip())
+        .or_else(|_| address.parse::<IpAddr>());
+    match ip.map(|ip| ip.to_canonical()) {
+        Ok(IpAddr::V4(ip)) => {
+            let [a, b, c, _] = ip.octets();
+            format!("{a}.{b}.{c}")
+        }
+        Ok(IpAddr::V6(ip)) => format!("{:x?}", &ip.octets()[..8]),
+        Err(_) => address.to_string(),
+    }
+}
+
 /// Whether `address` already holds its share of the unpaired links, given the
-/// addresses of the other unpaired links.
+/// addresses of the other unpaired links: 2 for the address itself, 6 for its network.
 pub(super) fn address_is_full(other_unpaired_addresses: &[String], address: &str) -> bool {
-    other_unpaired_addresses
+    let own = other_unpaired_addresses
         .iter()
         .filter(|held| held.as_str() == address)
-        .count()
-        >= MAX_UNPAIRED_PER_ADDRESS
+        .count();
+    let network = network_of(address);
+    let on_network = other_unpaired_addresses
+        .iter()
+        .filter(|held| network_of(held) == network)
+        .count();
+    own >= MAX_UNPAIRED_PER_ADDRESS || on_network >= MAX_UNPAIRED_PER_NETWORK
 }
 
 pub(super) fn enforce_unpaired_link_limit(
@@ -241,6 +267,34 @@ mod per_address_tests {
             &held(&["192.168.1.9", "192.168.1.9"]),
             "192.168.1.20"
         ));
+    }
+
+    /// A host with IP aliases on its subnet cannot fill the table: a /24 (a /64 for IPv6) holds six.
+    #[test]
+    fn a_host_with_aliases_cannot_fill_the_unpaired_slots() {
+        // 21 aliases of one /24, two links each: after six links on the network nothing more from it.
+        let mut held: Vec<String> = Vec::new();
+        let mut accepted = 0;
+        for alias in 10..31 {
+            let address = format!("192.168.1.{alias}");
+            for _ in 0..2 {
+                if !address_is_full(&held, &address) {
+                    held.push(address.clone());
+                    accepted += 1;
+                }
+            }
+        }
+        assert_eq!(accepted, MAX_UNPAIRED_PER_NETWORK, "{held:?}");
+        // The rest of the table stays for others: another /24, and a different network of IPv6.
+        assert!(!address_is_full(&held, "192.168.2.5"));
+        assert!(!address_is_full(&held, "10.0.0.7:50000"));
+        let v6: Vec<String> = (0..6)
+            .map(|n| format!("[fd12:3456:789a:1::{n:x}]:50000"))
+            .collect();
+        assert!(address_is_full(&v6, "fd12:3456:789a:1::ff"), "same /64");
+        assert!(!address_is_full(&v6, "fd12:3456:789a:2::1"), "another /64");
+        // An address:port counts with its address.
+        assert!(address_is_full(&held, "192.168.1.99:41234"));
     }
 }
 

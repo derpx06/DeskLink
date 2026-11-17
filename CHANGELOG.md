@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Security: the listener serves local network sources only (and caps unpaired links per network); SECURITY.md
+  now says where the secrets are kept and that the Flatpak build is not a sandbox (shared terminals need host
+  access); the relay's images are pinned and its TURN secret no longer sits on a command line.
 - The desk's New terminal starts a shell; its Claude Code and Codex entries are gone. The phone can
   still start them, and running ones keep their names and badges.
 - "Find anything" on the desk (Ctrl+K, the search buttons, Ctrl+F off the Terminals page): one search over

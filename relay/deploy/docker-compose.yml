@@ -8,7 +8,7 @@
 
 services:
   caddy:
-    image: caddy:2
+    image: caddy:2.9.1
     restart: unless-stopped
     network_mode: host
     environment:
@@ -36,15 +36,16 @@ services:
 
   coturn:
     profiles: ["coturn"]
-    image: coturn/coturn:4
+    image: coturn/coturn:4.6.2
     restart: unless-stopped
     network_mode: host
-    # The secret comes from .env so it never sits in the tracked conf. It is
-    # visible in the host's process list; the droplet has no other users.
+    # The secret is read from the environment by the container's own start line (a shell expansion at run time),
+    # not passed in the compose `command`: it is not in `docker inspect`'s Args and not in this file. It is
+    # still in the container's environment (`docker inspect` Env, /proc/<pid>/environ, root on the host only).
+    env_file: .env
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - "-c"
-      - "/etc/coturn/turnserver.conf"
-      - "--static-auth-secret=${DESKLINK_RELAY_TURN_SECRET:-}"
+      - 'exec turnserver -c /etc/coturn/turnserver.conf "--static-auth-secret=$$DESKLINK_RELAY_TURN_SECRET"'
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
       - ./coturn-certs:/etc/coturn/certs:ro

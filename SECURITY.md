@@ -29,6 +29,34 @@ ready, and the advisory is published once users can update.
   desktop prompt. An optional session password additionally guards screen
   viewing, control and terminals.
 
+## Where connections may come from
+
+DeskLink's listener (TCP 1716-1764) serves **local sources only**: private (RFC 1918), link-local, IPv6
+unique-local and loopback addresses, and carrier-grade/mesh-VPN space (100.64.0.0/10, so a phone hotspot or
+Tailscale keeps working: the phone app accepts the same range). A connection from any other address is dropped
+before a byte is read, so a host that can route to this computer (a port forward, a routed VPN, a hotel
+network) cannot raise a pairing prompt or use the unpaired slots. The rule is the same on the phone and pinned
+on both sides by a shared list of addresses. Two consequences are worth knowing. **CGNAT space (100.64.0.0/10) is accepted** because Tailscale and some phone
+hotspots use it and the phone app accepts the same range; the downside is that anyone else on such a network
+(a tailnet member, including a node shared in, or a neighbour when this computer sits directly on a carrier-NAT
+interface such as a cellular tether) can reach the listener, where they still need the pairing code you confirm.
+**Loopback is accepted in release builds** (the phone emulator's proxy and local tests use it): a tunnel that
+terminates on this computer, such as an SSH port forward, appears local. Unpaired links are also capped per network (six per /24, or per /64
+for IPv6) as well as per address, so one host with IP aliases cannot fill the table and keep a real phone out of
+pairing.
+
+## Where the secrets are kept (read this before relying on "encrypted at rest")
+
+- The **phone's** private key is kept in the app's private storage (SharedPreferences), not in the Android
+  Keystore; backup is disabled and the app's data is excluded from device transfers. Root, a debuggable build
+  or a forensic copy of an unlocked phone can read it. Moving it into the Keystore would change the key type the
+  pairing certificate was made with, which pairing records must survive: it needs an explicit, versioned
+  migration, and is a follow-up.
+- The **desk's** notes, snippets and contacts are sealed with AES-256-GCM, but the random key sits beside the
+  sealed files (`<dir>/key`, 0600). Any backup of that directory (rsync of your home, a cloud-synced folder, a disk
+  image) carries both. The sealing protects against casual reading and against damaged files; it is **not**
+  encryption at rest. Use full-disk encryption for that.
+
 ## The Flatpak is not a sandbox
 
 The Flatpak build asks for `--talk-name=org.freedesktop.Flatpak` because

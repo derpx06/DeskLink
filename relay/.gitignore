@@ -4,3 +4,4 @@
 /deploy/config.toml
 /deploy/coturn-certs/
 state.json*
+!/deploy/.env.example
