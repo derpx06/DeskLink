@@ -73,7 +73,9 @@ pub(super) fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-pub(super) const KNOWN_BUILDS: [&str; 29] = [
+pub(super) const KNOWN_BUILDS: [&str; 30] = [
+    // One quiet update row and a dot (ShowUpdate), the narrower Checking... subtitle.
+    "b02adfa5665f98d43b86b4356180c3b80e7f2d8804f1f314e4873a3fe89d0e2a",
     // Checking connection...: a ready but quiet phone says so, its tiles grey out.
     "325ddf89e082f4d55b0864c03d11ea563df2e86a81c465e81f7ae33b0d951fef",
     // Batch 2: old-app safe, offline glyph, short-screen order, tiles note, wrapped header.
