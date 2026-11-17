@@ -99,14 +99,21 @@ impl FeatureTransport {
     /// No answer: [`NOT_REACHABLE`], and nothing is sent or queued. A dozing
     /// phone is never held up (it cannot answer; its own rules judge it).
     pub(crate) fn preflight(&self) -> Result<(), String> {
+        use crate::device_links::webrtc::coordinator::is_dozing;
+        if !self.is_ready() || is_dozing(&self.snapshot.binding.device_id) {
+            return Ok(());
+        }
+        self.preflight_by_silence()
+    }
+
+    /// The silence half of [`Self::preflight`] (separate so a test can set
+    /// the clocks without a live WebRTC peer).
+    fn preflight_by_silence(&self) -> Result<(), String> {
         use crate::device_links::webrtc::coordinator::{
-            await_proof, is_dozing, note_preflight_failed, preflight_failed_recently, probe_asap,
+            await_proof, note_preflight_failed, preflight_failed_recently, probe_asap,
             DESK_PROBE_AFTER, PREFLIGHT_WAIT,
         };
         let id = &self.snapshot.binding.device_id;
-        if !self.is_ready() || is_dozing(id) {
-            return Ok(());
-        }
         if self
             .silence()
             .is_none_or(|silence| silence <= DESK_PROBE_AFTER)
@@ -416,6 +423,82 @@ mod tests {
             Err(NOT_REACHABLE.to_string())
         );
         assert!(sessions.take_pending_features(&binding).is_empty());
+    }
+
+    /// A ready session whose LAN and data paths were last heard `silent_for`
+    /// ago (the clocks moved into the past, never slept on).
+    fn ready_session(
+        id: &str,
+        silent_for: std::time::Duration,
+    ) -> (Arc<DeviceManager>, FeatureTransport) {
+        use crate::device_links::webrtc::{HandoverRuntime, WebRtcWireBinding};
+        let sessions = Arc::new(DeviceManager::new());
+        let mut link = SessionLink::test_placeholder(id);
+        link.info.incoming_capabilities = vec![PACKET_TYPE_PING.to_string()];
+        sessions.register_link(id.to_string(), link, true).unwrap();
+        let binding = sessions.current_binding(id).unwrap();
+        sessions
+            .with_session(&binding, |session| {
+                let wire = WebRtcWireBinding::from_attempt(
+                    "desktop",
+                    id,
+                    "01234567-89ab-cdef-0123-456789abcdef",
+                )
+                .unwrap();
+                let mut handover = HandoverRuntime::new("attempt".to_string(), wire);
+                handover.record_offer("offer".into()).unwrap();
+                handover.record_answer("answer".into()).unwrap();
+                handover.mark_local_authenticated().unwrap();
+                handover.mark_remote_authenticated().unwrap();
+                handover.mark_local_capabilities_confirmed().unwrap();
+                handover.mark_remote_capabilities_confirmed().unwrap();
+                handover.mark_local_feature_ready().unwrap();
+                handover.mark_remote_feature_ready().unwrap();
+                session.webrtc_handover = Some(handover);
+                session.last_inbound_at = std::time::Instant::now() - silent_for;
+            })
+            .unwrap();
+        crate::device_links::webrtc::coordinator::forget_liveness(id);
+        crate::device_links::webrtc::coordinator::note_data_inbound_ago(id, silent_for);
+        let transport = FeatureTransport::for_device(&sessions, id).unwrap();
+        (sessions, transport)
+    }
+
+    /// The click preflight, by silence: 1 s (inside a probe's budget) and a
+    /// healthy link proceed at once; 2.5 s on a dead peer fails with the
+    /// "Can't reach" error inside about 1.5 s, asks the phone, and a second
+    /// click straight after fails at once (the command thread is not held again).
+    #[test]
+    fn the_click_preflight_by_silence() {
+        use std::time::{Duration, Instant};
+        for silent in [Duration::ZERO, Duration::from_secs(1)] {
+            let (_s, transport) = ready_session("preflight-ok-phone", silent);
+            let started = Instant::now();
+            assert_eq!(transport.preflight_by_silence(), Ok(()));
+            assert!(
+                started.elapsed() < Duration::from_millis(200),
+                "no extra latency"
+            );
+        }
+        let (_s, transport) = ready_session("preflight-dead-phone", Duration::from_millis(2_500));
+        let started = Instant::now();
+        assert_eq!(
+            transport.preflight_by_silence(),
+            Err(NOT_REACHABLE.to_string())
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(1_400) && took < Duration::from_millis(2_500),
+            "{took:?}"
+        );
+        let again = Instant::now();
+        assert_eq!(
+            transport.preflight_by_silence(),
+            Err(NOT_REACHABLE.to_string())
+        );
+        assert!(again.elapsed() < Duration::from_millis(300), "remembered");
+        // And nothing was queued or sent for it by the preflight itself.
+        crate::device_links::webrtc::coordinator::forget_liveness("preflight-dead-phone");
     }
 
     /// A click on a phone that does not answer is told, never swallowed as

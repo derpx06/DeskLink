@@ -153,15 +153,18 @@ impl DesklinkWindow {
             .map(|device| device.name)
             .unwrap_or_default();
         let (command, message) = match action {
-            QuickAction::Ring => (DaemonCommand::SendFindPhone(id), format!("Ringing {name}")),
+            QuickAction::Ring => (
+                DaemonCommand::SendFindPhone(id),
+                format!("Asking {name} to ring"),
+            ),
             QuickAction::Lock => (
                 DaemonCommand::SendLockRequest(id, true),
-                format!("Locking {name}"),
+                format!("Asking {name} to lock"),
             ),
-            QuickAction::Ping => (DaemonCommand::SendPing(id), "Nudge sent".to_string()),
+            QuickAction::Ping => (DaemonCommand::SendPing(id), format!("Nudging {name}")),
             QuickAction::Clipboard => (
                 DaemonCommand::SendClipboard(id),
-                format!("Clipboard sent to {name}"),
+                format!("Sending the clipboard to {name}"),
             ),
         };
         daemon.send(command);

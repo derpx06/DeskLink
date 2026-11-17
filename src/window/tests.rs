@@ -854,3 +854,15 @@ fn the_banner_shows_every_sentence_whole_at_420_px() {
         }
     });
 }
+
+/// The answer to a click on a phone that does not answer reaches the person in
+/// its own words (no jargon fallback), as a message that goes away by itself.
+#[test]
+fn the_unreachable_answer_to_a_click_is_shown_as_written() {
+    let raw = crate::device_links::transport::NOT_REACHABLE;
+    let (words, lasting) = friendly_error(raw);
+    assert_eq!(words, raw);
+    assert!(!lasting);
+    let named = "Can't reach Pixel 9. Check that it's on and on your network.";
+    assert_eq!(friendly_error(named).0, named);
+}
