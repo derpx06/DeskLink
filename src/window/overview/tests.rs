@@ -814,6 +814,8 @@ fn a_half_typed_note_survives_a_redraw_unselected() {
         assert!(focused(&second), "the focus is back in the entry");
         assert_eq!(second.selection_bounds(), None, "nothing is selected");
         assert_eq!(second.position(), 10, "the cursor is at the end");
+        // The draft is a process-wide thing: leave none for other tests.
+        second.set_text("");
         window.close();
     });
 }
