@@ -114,7 +114,7 @@ const fn row(group: usize, title: &'static str, phone: bool, words: &'static str
 
 /// Every setting, group by group: the same titles as
 /// `testdata/settings_rows.json` (a test keeps the two in step).
-pub(in crate::window) const ROWS: [SettingRow; 34] = [
+pub(in crate::window) const ROWS: [SettingRow; 35] = [
     row(0, "Keep this computer awake while a phone is connected", false, "sleep suspend lid closed battery power stay awake caffeine"),
     row(0, "Let this phone keep the computer awake", true, "sleep suspend lid battery power stay awake allow"),
     row(0, "Start at login", false, "startup start at login autostart boot launch open automatically restart"),
@@ -135,6 +135,7 @@ pub(in crate::window) const ROWS: [SettingRow; 34] = [
     row(5, "Let the phone control mouse and keyboard", true, "remote control share screen screen sharing mouse keyboard trackpad touchpad approve allow permissions"),
     row(6, "Bucket with {phone}", true, "shared folder files sync drop share"),
     row(6, "Downloads folder", true, "download location save where files go received folder open"),
+    row(6, "Show Send to phone in the file manager", true, "right click context menu files nautilus dolphin nemo thunar send to open with"),
     row(6, "Accept photos and screenshots from {phone}", true, "photos pictures images gallery camera screenshots automatic files"),
     row(7, "Ask before terminal and screen access", false, "password session password pin lock secure protect screen sharing terminal privacy"),
     row(7, "Terminal access", true, "terminal shell command line console allow permissions"),

@@ -230,6 +230,57 @@ pub(super) fn downloads_row() -> adw::ActionRow {
     row
 }
 
+/// The script a Flatpak user saves for their file manager (the sandbox cannot
+/// write the host's menus itself).
+pub(super) const FLATPAK_SCRIPT: &str =
+    "#!/bin/sh\nexec flatpak run derx06.desklink.com --send-files -- \"$@\"\n";
+
+/// "Show Send to phone in the file manager": a switch; in a Flatpak (which
+/// cannot write the host's menus) a row that shows the commands to copy.
+pub(super) fn file_manager_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::PreferencesRow {
+    if crate::device_links::pty::host::in_flatpak() {
+        let row = adw::ActionRow::builder()
+            .title("Show Send to phone in the file manager")
+            .subtitle("This Flatpak can't add it to your file manager. Copy the commands to add it yourself.")
+            .subtitle_lines(0)
+            .build();
+        with_icon(&row, "document-send-symbolic");
+        let button = gtk::Button::builder()
+            .label("Copy the commands…")
+            .valign(gtk::Align::Center)
+            .build();
+        button.connect_clicked(|button| {
+            let body = format!(
+                "Run this to send files: flatpak run derx06.desklink.com --send-files -- FILES\n\nFor Files (Nautilus): save this as an executable file named \"Send to phone\" in ~/.local/share/nautilus/scripts (Nemo: ~/.local/share/nemo/scripts; Dolphin: a service menu running the same command):\n\n{FLATPAK_SCRIPT}"
+            );
+            let dialog = adw::AlertDialog::new(Some("Send to phone from a Flatpak"), Some(&body));
+            dialog.add_responses(&[("close", "_Close"), ("copy", "_Copy the script")]);
+            dialog.set_close_response("close");
+            dialog.connect_response(Some("copy"), |_, _| {
+                if let Some(display) = gtk::gdk::Display::default() {
+                    display.clipboard().set_text(FLATPAK_SCRIPT);
+                }
+            });
+            dialog.present(Some(button));
+        });
+        row.add_suffix(&button);
+        return row.upcast();
+    }
+    let row = adw::SwitchRow::builder()
+        .title("Show Send to phone in the file manager")
+        .subtitle("Adds Send to phone to the right-click menu of Files, Dolphin, Nemo and Thunar. In Files, restart it once (nautilus -q) after turning this on. Turning it off removes every entry. \"Open With\" entries follow this switch.")
+        .subtitle_lines(0)
+        .active(settings.file_manager_send)
+        .build();
+    with_icon(&row, "document-send-symbolic");
+    let daemon = daemon.clone();
+    toggled(&row, move |row| {
+        daemon.send(DaemonCommand::SetFileManagerSend(row.is_active()))
+    });
+    follow(&row, |settings, _| settings.file_manager_send);
+    row.upcast()
+}
+
 /// "Connection history": the log of connections and sessions, in a dialog.
 pub(super) fn history_row() -> adw::ActionRow {
     let row = adw::ActionRow::builder()

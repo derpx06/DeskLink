@@ -7,7 +7,7 @@
     {"title": "Calls", "rows": ["Pause music during calls", "Show calls on this computer", "Show caller names on the lock screen", "Ring on this computer", "Name callers from {phone}'s contacts"], "deskOnlyRows": ["Show calls on this computer", "Show caller names on the lock screen", "Ring on this computer"]},
     {"title": "Sound", "rows": ["Phones may hear this computer's microphone"]},
     {"title": "Control", "rows": ["Glide onto {phone}", "Let the phone control mouse and keyboard"]},
-    {"title": "Files", "rows": ["Bucket with {phone}", "Downloads folder", "Accept photos and screenshots from {phone}"]},
+    {"title": "Files", "rows": ["Bucket with {phone}", "Downloads folder", "Show Send to phone in the file manager", "Accept photos and screenshots from {phone}"], "deskOnlyRows": ["Show Send to phone in the file manager"]},
     {"title": "Privacy & security", "rows": ["Ask before terminal and screen access", "Terminal access", "Unlock with {phone} nearby", "Lock when I walk away with {phone}", "Unpair {phone}…"]},
     {"title": "Appearance", "rows": ["Style", "Tray icon"], "gnomeRows": ["GNOME extension", "Phone in the top bar"]},
     {"title": "Advanced", "rows": ["Connection history", "System check", "Crash reports", "About"], "deskOnlyRows": ["Connection history", "System check"]}

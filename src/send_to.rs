@@ -19,6 +19,9 @@ use gtk::prelude::*;
 
 use crate::application::DesklinkApplication;
 
+mod file_manager;
+pub use file_manager::run_remove_cli;
+
 const APP_ID: &str = "derx06.desklink.com";
 const APP_PATH: &str = "/derx06/desklink/com";
 /// Marks a script DeskLink wrote, with the phone it is for.
@@ -62,12 +65,26 @@ const BUCKET_SCRIPT_MARK: &str = "# desklink-bucket";
 pub(crate) struct Request {
     pub(crate) device: Option<String>,
     pub(crate) paths: Vec<PathBuf>,
+    /// Locations that are not files on this computer (smb://, trash://, …)
+    /// and could not be resolved to one.
+    pub(crate) remote: usize,
+}
+
+/// `scheme://…`: a URI, as opposed to a path that happens to hold `://`.
+fn is_uri(text: &str) -> bool {
+    text.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
 }
 
 /// Parses what follows `--send-files`. Relative paths are taken from `cwd`.
 pub(crate) fn parse(args: &[String], cwd: &Path) -> Request {
     let mut device = None;
     let mut paths = Vec::new();
+    let mut remote = 0;
     let mut options = true;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -75,15 +92,16 @@ pub(crate) fn parse(args: &[String], cwd: &Path) -> Request {
             "--" if options => options = false,
             "--to" if options => device = rest.next().cloned(),
             path => {
-                // Files may hand over URIs (`%U`); local ones only.
-                let path = if path.starts_with("file://") {
+                // Files may hand over URIs (`%U`). A remote one counts when
+                // GVfs has it as a local (FUSE) path; else it is refused.
+                let path = if is_uri(path) {
                     match gio::File::for_uri(path).path() {
                         Some(path) => path,
-                        None => continue,
+                        None => {
+                            remote += 1;
+                            continue;
+                        }
                     }
-                } else if path.contains("://") {
-                    // A remote location (smb://, sftp://): not a local file.
-                    continue;
                 } else {
                     PathBuf::from(path)
                 };
@@ -95,22 +113,38 @@ pub(crate) fn parse(args: &[String], cwd: &Path) -> Request {
             }
         }
     }
-    Request { device, paths }
+    Request {
+        device,
+        paths,
+        remote,
+    }
 }
 
 /// `desklink --send-files …`: hands the files to the running DeskLink.
+/// Every refusal is said on stderr and, with no terminal (a file manager
+/// started this), as a desktop notification.
 pub fn run_cli(args: &[String]) -> glib::ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let request = parse(args, &cwd);
-    let paths: Vec<String> = request
-        .paths
-        .iter()
-        .filter(|path| path.is_file())
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect();
-    if paths.is_empty() {
-        eprintln!("desklink --send-files: no files to send (folders are not sent)");
+    let title = "Can't send to phone";
+    if request.paths.len() + request.remote > file_manager::MAX_ENTRIES {
+        file_manager::tell(
+            title,
+            &file_manager::too_many_message(request.paths.len() + request.remote),
+        );
         return glib::ExitCode::FAILURE;
+    }
+    let (paths, mut skipped) = file_manager::classify(&request.paths);
+    skipped.remote = request.remote;
+    if paths.is_empty() {
+        let body = skipped
+            .message()
+            .unwrap_or_else(|| "Select one or more files to send.".into());
+        file_manager::tell(title, &body);
+        return glib::ExitCode::FAILURE;
+    }
+    if let Some(body) = skipped.message() {
+        file_manager::tell("Some items weren't sent", &body);
     }
     let parameter = (request.device.unwrap_or_default(), paths).to_variant();
     activate_running("send-files", parameter, "--send-files")
@@ -639,15 +673,39 @@ fn to_bucket(app: &DesklinkApplication, device: &str, paths: Vec<PathBuf>) {
     app.send_notification(Some("bucket"), &notification);
 }
 
+thread_local! {
+    static BURST: std::cell::RefCell<file_manager::Burst> = std::cell::RefCell::default();
+}
+
+/// The `send-files` action's work: capped, rate limited, every path checked
+/// again here (the action is reachable by any process of this user's
+/// session), then queued, and always announced.
 fn send(app: &DesklinkApplication, device: &str, paths: &[String]) {
     let Some(daemon) = app.daemon_handle() else {
         return;
     };
+    if paths.len() > file_manager::MAX_ENTRIES {
+        say(app, "Can't send to phone", &file_manager::too_many_message(paths.len()));
+        return;
+    }
+    if !BURST.with(|burst| burst.borrow_mut().allow(std::time::Instant::now())) {
+        say(app, "Too many send requests", "Wait a few seconds and try again.");
+        return;
+    }
+    let requested: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let (paths, skipped) = file_manager::classify(&requested);
+    if paths.is_empty() {
+        let body = skipped
+            .message()
+            .unwrap_or_else(|| "Select one or more files to send.".into());
+        say(app, "Can't send to phone", &body);
+        return;
+    }
     let devices = daemon.devices();
     let target = choose_phone(&devices, device);
     let notification = match target {
         Some(phone) => {
-            for path in paths {
+            for path in &paths {
                 daemon.send(crate::device_links::daemon::DaemonCommand::SendFile(
                     phone.id.clone(),
                     PathBuf::from(path),
@@ -661,17 +719,27 @@ fn send(app: &DesklinkApplication, device: &str, paths: &[String]) {
                 count => format!("{count} files"),
             };
             let notification = gio::Notification::new(&format!("Sending {what} to {}", phone.name));
+            let mut body = Vec::new();
             if !phone.feature_transport_ready {
-                notification.set_body(Some(&format!(
-                    "Waiting for {}: it is sent as soon as the phone is connected.",
+                body.push(format!(
+                    "{} isn't connected. Your files are waiting and will be sent when it connects.",
                     phone.name
-                )));
+                ));
+            }
+            body.extend(skipped.message());
+            if !body.is_empty() {
+                notification.set_body(Some(&body.join(" ")));
             }
             notification
         }
         None => {
             let notification = gio::Notification::new("No phone to send to");
-            notification.set_body(Some("Pair a phone in DeskLink first."));
+            let body = if device.is_empty() {
+                "Pair a phone in DeskLink first."
+            } else {
+                "That phone isn't paired with this computer."
+            };
+            notification.set_body(Some(body));
             notification
         }
     };
@@ -786,13 +854,18 @@ fn script_folders(
     if nautilus_wanted(current_desktop, installed("nautilus")) {
         folders.push((Base::Data, "nautilus/scripts"));
     }
-    if has_desktop(current_desktop, &["X-Cinnamon", "Cinnamon"]) || installed("nemo") {
+    if nemo_wanted(current_desktop, &installed) {
         folders.push((Base::Data, "nemo/scripts"));
     }
     if has_desktop(current_desktop, &["MATE"]) || installed("caja") {
         folders.push((Base::Config, "caja/scripts"));
     }
     folders
+}
+
+/// Whether Nemo is the file manager here.
+fn nemo_wanted(current_desktop: &str, installed: &dyn Fn(&str) -> bool) -> bool {
+    has_desktop(current_desktop, &["X-Cinnamon", "Cinnamon"]) || installed("nemo")
 }
 
 /// Whether `program` is on `$PATH`.
@@ -808,11 +881,11 @@ pub(crate) fn dolphin_menu(exe: &Path, phones: &[(String, String)]) -> String {
         .map(|index| format!("phone{index}"))
         .collect();
     let mut menu = format!(
-        "[Desktop Entry]\nType=Service\nMimeType=application/octet-stream;\nActions={};\nX-KDE-Priority=TopLevel\nX-KDE-Submenu=Send to Phone\n",
+        "[Desktop Entry]\nType=Service\nMimeType=application/octet-stream;inode/directory;\nX-KDE-Protocols=file\nActions={};\nX-KDE-Priority=TopLevel\nX-KDE-Submenu=Send to Phone\n",
         ids.join(";")
     );
     for ((id, name), action) in phones.iter().zip(&ids) {
-        let name: String = name.chars().filter(|c| !c.is_control()).collect();
+        let name = file_manager::keyfile_value(&file_manager::clean_name(name));
         menu.push_str(&format!(
             "\n[Desktop Action {action}]\nName=Send to {name}\nIcon=derx06.desklink.com\nExec={exe} --send-files --to {id} -- %F\n"
         ));
@@ -1071,7 +1144,7 @@ fn sync_scripts(dir: &Path, exe: &Path, phones: &[(String, String)]) -> std::io:
 /// Thunar's "Send To" entry for a phone (`$XDG_DATA_HOME/Thunar/sendto`):
 /// a desktop file outside `applications/`, so it shows in no app menu.
 pub(crate) fn thunar_sendto(exe: &Path, device_id: &str, phone: &str) -> String {
-    let name: String = phone.chars().filter(|c| !c.is_control()).collect();
+    let name = file_manager::keyfile_value(&file_manager::clean_name(phone));
     format!(
         "[Desktop Entry]\n# Written by DeskLink; removed when this phone is unpaired.\n{SCRIPT_MARK}{device_id}\nType=Application\nVersion=1.0\nName={name}\nIcon=derx06.desklink.com\nExec={} --send-files --to {device_id} -- %F\n",
         desktop_exec_quoted(exe),
@@ -1130,7 +1203,8 @@ fn writes_host_integration(in_flatpak: bool) -> bool {
     !in_flatpak
 }
 
-/// Keeps the scripts in step with the paired phones while the app runs.
+/// Keeps the file-manager integration in step with the paired phones and the
+/// "Show Send to phone in the file manager" switch while the app runs.
 pub fn start(app: &DesklinkApplication) {
     // Inside a Flatpak these files would land in the app's private data
     // directory, which the host's file managers never read, with an `Exec=`
@@ -1141,42 +1215,26 @@ pub fn start(app: &DesklinkApplication) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let data = glib::user_data_dir();
-    // Off the UI thread: file IO, the MIME database and a child process.
-    let (open_data, open_config, open_exe) = (data.clone(), glib::user_config_dir(), exe.clone());
-    std::thread::spawn(move || {
-        // Only a default some mimeapps.list pins. One that is merely the
-        // first application found (Debian's Plasma, Xfce and others ship no
-        // defaults) loses to anything in ~/.local/share/applications, which
-        // is where these entries go: listing the type made DeskLink's
-        // Bucket the default for text, images and PDFs there.
-        let lists = default_lists();
-        let default_for_type = |mime: &str| {
-            gio::AppInfo::default_for_type(mime, false)
-                .and_then(|app| app.id())
-                .map(|id| id.to_string())
-                .filter(|id| pinned_defaults(&lists, mime).contains(id))
-        };
-        if refresh_open_with(&open_data, &open_config, &open_exe, default_for_type) {
-            update_desktop_database(&open_data.join("applications"));
-        }
-    });
-    let service_menu = data.join("kio").join("servicemenus").join(SERVICE_MENU);
-    let thunar = data.join("Thunar").join("sendto");
-    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    // Each file manager's extra only where it is used. Nemo (Cinnamon) and
-    // Caja (MATE) run Nautilus-style scripts from their own folders.
-    let script_dirs: Vec<PathBuf> = script_folders(&desktop, on_path)
-        .into_iter()
-        .map(|(base, path)| match base {
-            Base::Data => data.join(path),
-            Base::Config => glib::user_config_dir().join(path),
-        })
-        .collect();
-    let dolphin = crate::kde::is_kde(&desktop) || on_path("dolphin");
-    let thunar_wanted = has_desktop(&desktop, &["XFCE"]) || on_path("thunar");
-    // The paired phones the scripts were last written for.
-    let last = std::cell::RefCell::new(None::<Vec<(String, String)>>);
+    let dirs = file_manager::Dirs {
+        data: glib::user_data_dir(),
+        config: glib::user_config_dir(),
+    };
+    // nautilus-python is looked for once, off the UI thread (a child process).
+    let python = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let python = python.clone();
+        std::thread::spawn(move || {
+            let found = file_manager::python_nautilus_present(
+                &file_manager::extension_dirs(),
+                file_manager::python_loads_nautilus,
+            );
+            python.store(found, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+    // What the files were last written for: the phones, the switch, python.
+    type Written = (Vec<(String, String)>, bool, bool);
+    let last = std::cell::RefCell::new(None::<Written>);
+    let opened = std::cell::Cell::new(false);
     let weak = app.downgrade();
     crate::ticker::every_tick(move || {
         let Some(app) = weak.upgrade().filter(|app| !app.is_remote()) else {
@@ -1185,6 +1243,7 @@ pub fn start(app: &DesklinkApplication) {
         let Some(daemon) = app.daemon_handle() else {
             return glib::ControlFlow::Continue;
         };
+        let enabled = crate::device_links::config::app_settings().file_manager_send;
         let mut phones: Vec<(String, String)> = daemon
             .devices()
             .into_iter()
@@ -1192,42 +1251,49 @@ pub fn start(app: &DesklinkApplication) {
             .map(|device| (device.id, device.name))
             .collect();
         phones.sort();
-        if last.borrow().as_ref() != Some(&phones) {
-            for scripts in &script_dirs {
-                if let Err(error) = sync_scripts(scripts, &exe, &phones) {
-                    eprintln!("[DeskLink] Could not update the Files scripts: {error}");
-                }
-                // F8b: "Add to DeskLink Bucket", while a phone is paired.
-                let bucket = scripts.join(BUCKET_SCRIPT);
-                let _ = if phones.is_empty() {
-                    std::fs::remove_file(&bucket)
-                } else {
-                    write_if_changed(&bucket, &bucket_script(&exe), true)
-                };
-            }
-            if thunar_wanted {
-                let written = sync_per_phone(&thunar, &phones, ".desktop", false, |id, name| {
-                    thunar_sendto(&exe, id, name)
-                });
-                if let Err(error) = written {
-                    eprintln!("[DeskLink] Could not update Thunar's Send To menu: {error}");
-                }
-            }
-            if dolphin {
-                let written = if phones.is_empty() {
-                    match std::fs::remove_file(&service_menu) {
-                        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-                        _ => Ok(()),
-                    }
-                } else {
-                    write_if_changed(&service_menu, &dolphin_menu(&exe, &phones), true)
-                };
-                if let Err(error) = written {
-                    eprintln!("[DeskLink] Could not update the Dolphin menu: {error}");
-                }
-            }
-            last.replace(Some(phones));
+        let python = python.load(std::sync::atomic::Ordering::Relaxed);
+        let now = (phones, enabled, python);
+        if last.borrow().as_ref() == Some(&now) {
+            return glib::ControlFlow::Continue;
         }
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        let env = file_manager::Env {
+            desktop: &desktop,
+            installed: &on_path,
+            python_nautilus: python,
+        };
+        for error in file_manager::sync(&dirs, &exe, &now.0, enabled, &env) {
+            eprintln!("[DeskLink] Could not update the file-manager integration: {error}");
+        }
+        // "Open With" helpers: off with the switch.
+        let (data, config, open_exe) = (dirs.data.clone(), dirs.config.clone(), exe.clone());
+        if enabled && !opened.replace(true) {
+            // Off the UI thread: file IO, the MIME database and a child process.
+            std::thread::spawn(move || {
+                // Only a default some mimeapps.list pins. One that is merely
+                // the first application found (Debian's Plasma, Xfce and
+                // others ship no defaults) loses to anything in
+                // ~/.local/share/applications, which is where these entries
+                // go: listing the type made DeskLink's Bucket the default for
+                // text, images and PDFs there.
+                let lists = default_lists();
+                let default_for_type = |mime: &str| {
+                    gio::AppInfo::default_for_type(mime, false)
+                        .and_then(|app| app.id())
+                        .map(|id| id.to_string())
+                        .filter(|id| pinned_defaults(&lists, mime).contains(id))
+                };
+                if refresh_open_with(&data, &config, &open_exe, default_for_type) {
+                    update_desktop_database(&data.join("applications"));
+                }
+            });
+        } else if !enabled {
+            opened.set(false);
+            for error in file_manager::remove_open_with(&data.join("applications")) {
+                eprintln!("[DeskLink] Could not remove the Open With entries: {error}");
+            }
+        }
+        last.replace(Some(now));
         glib::ControlFlow::Continue
     });
 }

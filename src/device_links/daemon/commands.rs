@@ -44,6 +44,7 @@ pub enum DaemonCommand {
     SendClipboard(String),
     /// Show the phone as its own top-bar item too.
     SetTopBarPill(bool),
+    SetFileManagerSend(bool),
     /// A call request (T2): the phone ("" = the connected one that can
     /// call), the action, and the number to dial.
     Telephony(String, String, Option<String>),
@@ -205,6 +206,9 @@ impl DaemonWorker {
             DaemonCommand::SendClipboard(id) => self.send_clipboard(&id),
             DaemonCommand::SetTopBarPill(on) => {
                 self.update_settings(|settings| settings.top_bar_pill = on)
+            }
+            DaemonCommand::SetFileManagerSend(on) => {
+                self.update_settings(|settings| settings.file_manager_send = on)
             }
             DaemonCommand::Telephony(id, action, number) => {
                 self.send_telephony(&id, &action, number.as_deref())

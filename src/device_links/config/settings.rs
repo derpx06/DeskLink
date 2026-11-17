@@ -111,6 +111,9 @@ pub struct AppSettings {
     pub update_check: bool,
     /// "beta", "stable" or "" (the default for the line: beta below 1.0).
     pub update_channel: String,
+    /// Write "Send to phone" into the file managers' menus (on by default;
+    /// off removes every file written for it).
+    pub file_manager_send: bool,
 }
 
 impl Default for AppSettings {
@@ -146,6 +149,7 @@ impl Default for AppSettings {
             ring_on_computer: true,
             update_check: true,
             update_channel: String::new(),
+            file_manager_send: true,
         }
     }
 }

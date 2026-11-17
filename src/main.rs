@@ -123,7 +123,11 @@ use gtk::{gio, glib};
 fn main() -> glib::ExitCode {
     // `desklink --attach-terminal <id>`: the client a desk terminal window
     // runs to show a shared session. No GTK, no second app instance.
-    let args: Vec<String> = std::env::args().collect();
+    // Lossy: a file name that is not valid text must reach `--send-files` to
+    // be refused out loud, not abort the program.
+    let args: Vec<String> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     if let Some((id, embedded)) = device_links::pty::desk::attach_args(&args) {
         let status = device_links::pty::desk::run_client(id, embedded);
         return glib::ExitCode::from(status.clamp(0, 255));
@@ -136,6 +140,11 @@ fn main() -> glib::ExitCode {
     // scripts and Open With entry. Hands the files to the running app.
     if args.get(1).is_some_and(|arg| arg == "--send-files") {
         return send_to::run_cli(&args[2..]);
+    }
+    // `desklink --remove-integration`: removes every file-manager entry
+    // DeskLink wrote under the user's directories (for a package's hook).
+    if args.len() == 2 && args[1] == "--remove-integration" {
+        return send_to::run_remove_cli();
     }
     // `desklink --bucket [--to <phone>] <files…>`: into the Bucket (F8b).
     if args.get(1).is_some_and(|arg| arg == "--bucket") {

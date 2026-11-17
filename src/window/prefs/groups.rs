@@ -55,6 +55,7 @@ pub(super) fn groups(
     let files = group(GROUPS[6]);
     files.add(&bucket_row(device));
     files.add(&downloads_row());
+    files.add(&file_manager_row(daemon, settings));
     files.add(&gallery_row(daemon, settings, device));
     phone_step_rows(&files, device, &["photos"]);
 
