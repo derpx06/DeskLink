@@ -65,7 +65,7 @@
         </child>
         <child>
           <object class="AdwShortcutsItem">
-            <property name="title" translatable="yes" context="shortcut window">Search everything</property>
+            <property name="title" translatable="yes" context="shortcut window">Find anything</property>
             <property name="subtitle" translatable="yes" context="shortcut window">Actions, pages, phones, files, notes, settings</property>
             <property name="action-name">win.palette</property>
           </object>

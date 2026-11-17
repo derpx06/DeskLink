@@ -365,7 +365,7 @@ impl DesklinkApplication {
             ("Notifications, Terminals, Contacts", "Ctrl+4 to 6"),
             ("Pair another phone", "Ctrl+N"),
             ("Send files", "Ctrl+O"),
-            ("Search everything", "Ctrl+K"),
+            ("Find anything", "Ctrl+K"),
             ("Search this page", "Ctrl+F"),
             ("Connection history", "Ctrl+H"),
             ("Settings", "Ctrl+,"),
