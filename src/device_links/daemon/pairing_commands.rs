@@ -91,13 +91,14 @@ pub(crate) struct PairingContext {
 
 impl PairingContext {
     pub(crate) fn send_pair_request(&self, device_id: &str) {
-        // The user starts a pairing: an unpair this desk still owes the
-        // device must not decline it on a link flap right after "Pair".
-        clear_owed_not_paired(device_id);
         let result = self.transition(device_id, |pairing| pairing.request_packet());
         let Some((binding, snapshot, _, state)) = self.finish(device_id, result) else {
             return;
         };
+        // The user started a pairing (and it was sent): an unpair this desk
+        // still owed the device must not decline it on a link flap right
+        // after "Pair".
+        clear_owed_not_paired(device_id);
         if state == PairState::Paired {
             // The peer had already asked: this request was the acceptance
             // (`request_packet` in `RequestedByPeer`), the same transition as

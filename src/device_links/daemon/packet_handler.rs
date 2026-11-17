@@ -545,6 +545,11 @@ pub(super) fn apply_lan_packet(
                 crate::device_links::peers::forget_peer(&device_id);
             }
             update_pair_state(&devices, &device_id, state, verification_key);
+            if state == PairState::RequestedByPeer {
+                // The device is asking to pair again: whatever unpair this desk
+                // still owed it is moot (a stranger cancelling it is harmless).
+                super::pairing_commands::clear_owed_not_paired(&device_id);
+            }
             if pairing_just_completed(previous_state, state) {
                 super::pairing_commands::note_proven_pairing(&device_id);
                 // Pairing by code ends like pairing by QR: the dialog closes,

@@ -726,9 +726,12 @@ pub(super) fn begin_webrtc_after_accept(
 /// handshake; signaling sent before those readers are retired can otherwise
 /// be prefetched and lost. A bounded retry is safe because each request is
 /// signed and replay-protected, and it stops as soon as an attempt is active
-/// or the device is no longer paired. It does not retry past the first attempt:
+/// or the device is no longer paired. In the offer orientation it retries
+/// (250, 1000, 2000, 4000 ms) only while no attempt is active; once one exists
 /// an offer lost early is recovered by the worker's 10 s not-feature-ready
-/// rebuild, not by these retries.
+/// rebuild, not by these retries. (Also: a debt-holding phone gets no owed
+/// answer while a QR code is live; its debt is not consumed and expires after
+/// 10 min, with `notify_peer_not_paired` as the fallback.)
 fn schedule_webrtc_bootstrap(
     binding: SessionBinding,
     sessions: Arc<DeviceManager>,

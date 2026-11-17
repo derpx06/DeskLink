@@ -2143,6 +2143,9 @@ fn accepting_a_phone_that_takes_no_webrtc_starts_nothing() {
 /// a `pair:false` and answers on its next IDENTITY, not on heartbeats.
 #[test]
 fn an_unpair_nobody_heard_is_answered_on_the_devices_next_identity() {
+    let _one_code = crate::device_links::pairing_qr::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     use crate::device_links::packet::PACKET_TYPE_HEARTBEAT;
     let net = TestNetwork::new();
     let (mut desktop, mut phone) = paired_pair(&net);
@@ -2256,6 +2259,9 @@ fn desk_attempt(desk: &TestPeer) -> bool {
 /// on the device's next link), not a hand call.
 #[test]
 fn the_owed_unpair_is_answered_by_the_production_attach_path() {
+    let _one_code = crate::device_links::pairing_qr::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let net = TestNetwork::new();
     let (mut desktop, mut phone) = paired_pair(&net);
     desktop.drop_link();
@@ -2272,6 +2278,9 @@ fn the_owed_unpair_is_answered_by_the_production_attach_path() {
 /// on the link, and a `pair:false` ahead of it would decline the pairing.
 #[test]
 fn an_owed_unpair_is_not_sent_while_a_qr_code_is_live() {
+    let _one_code = crate::device_links::pairing_qr::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     use crate::device_links::pairing_qr;
     let net = TestNetwork::new();
     let (mut desktop, mut phone) = paired_pair(&net);
