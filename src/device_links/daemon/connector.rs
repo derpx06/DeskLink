@@ -219,3 +219,89 @@ fn accept_incoming_device(
     )
     .map(|_| ())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::{IpAddr, SocketAddr};
+
+    /// Leak detection (F-QA3-4): however a pre-auth connection from one
+    /// address ends (closed at once, garbage, a valid identity then silence,
+    /// a half-sent line), its handshake slot comes back, so the address can
+    /// still be served afterwards. A leaked slot refuses every later
+    /// connection from that address silently (no log line, no card).
+    #[test]
+    fn aborted_handshakes_from_one_address_leak_no_slot() {
+        let dir = std::env::temp_dir().join(format!("desklink-slots-{}", uuid::Uuid::new_v4()));
+        let config = Arc::new(Mutex::new(Config::load_from_dir(dir).expect("config")));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let (devices, errors, events) = (
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let sessions = Arc::new(DeviceManager::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let accept = {
+            let (config, devices, sessions, errors, events, shutdown) = (
+                Arc::clone(&config),
+                Arc::clone(&devices),
+                Arc::clone(&sessions),
+                Arc::clone(&errors),
+                Arc::clone(&events),
+                Arc::clone(&shutdown),
+            );
+            thread::spawn(move || {
+                incoming_tcp_loop(
+                    listener, config, devices, sessions, errors, events, shutdown,
+                )
+            })
+        };
+        // 127.0.0.2: no other test claims slots for it.
+        let host: IpAddr = "127.0.0.2".parse().unwrap();
+        let dial = || {
+            let socket = std::net::TcpStream::connect_timeout(
+                &SocketAddr::new("127.0.0.1".parse().unwrap(), port),
+                Duration::from_secs(2),
+            );
+            socket.ok()
+        };
+        let identity = br#"{"id":1,"type":"kdeconnect.identity","body":{"deviceId":"zzz","deviceName":"x","deviceType":"phone","protocolVersion":8,"tcpPort":1716}}"#;
+        let mut keep = Vec::new();
+        for round in 0..40 {
+            let Some(mut socket) = dial() else { continue };
+            match round % 4 {
+                0 => drop(socket),
+                1 => {
+                    let _ = socket.write_all(b"not json\n");
+                    drop(socket);
+                }
+                2 => {
+                    let _ = socket.write_all(identity);
+                    let _ = socket.write_all(b"\n");
+                    drop(socket);
+                }
+                _ => {
+                    let _ = socket.write_all(b"{\"half\":");
+                    keep.push(socket); // silent, closed at the end
+                }
+            }
+        }
+        // Everything (the silent ones too) ends within the read timeout.
+        drop(keep);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        // The loopback source of every dial is 127.0.0.1.
+        let source: IpAddr = "127.0.0.1".parse().unwrap();
+        while super::super::network::slots_held(source) > 0 && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(100));
+        }
+        let held = super::super::network::slots_held(source);
+        shutdown.store(true, Ordering::Release);
+        let _ = accept.join();
+        assert_eq!(held, 0, "slots leaked for {host}: {held}");
+    }
+}

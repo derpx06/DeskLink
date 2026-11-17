@@ -244,6 +244,16 @@ impl HandshakeSlot {
     }
 }
 
+/// Slots held for `host` (tests: leak detection).
+#[cfg(test)]
+pub(super) fn slots_held(host: IpAddr) -> usize {
+    PREAUTH_BY_HOST.lock().map_or(0, |held| {
+        held.iter()
+            .find(|(ip, _)| *ip == host)
+            .map_or(0, |(_, n)| *n)
+    })
+}
+
 impl Drop for HandshakeSlot {
     fn drop(&mut self) {
         PREAUTH_HANDSHAKES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
