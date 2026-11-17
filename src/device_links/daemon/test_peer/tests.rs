@@ -2003,3 +2003,216 @@ fn a_qr_only_link_survives_an_address_refresh_and_still_pairs() {
     }
     pairing_qr::cancel();
 }
+
+/// Two peers whose identities advertise WebRTC signaling, the first being
+/// the one whose device id sorts LOWER (`lower_is_desk`: the desk is then the
+/// deterministic WebRTC initiator) or HIGHER. Returns `(desk, phone)`.
+fn pair_by_roles(net: &Arc<TestNetwork>, lower_is_desk: bool) -> (TestPeer, TestPeer) {
+    let (a, b) = super::peer_pair_with(
+        net,
+        "desk-role",
+        "phone-role",
+        &[crate::device_links::packet::PACKET_TYPE_WEBRTC_SIGNAL_V1],
+    );
+    let a_lower = a.local_id() < b.local_id();
+    if a_lower == lower_is_desk {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// The packet types waiting on `peer`'s end of the wire, read raw (nothing is
+/// applied: the phone side of these tests is Android, which reacts to nothing
+/// a desktop test peer would).
+fn waiting_types(peer: &TestPeer) -> Vec<String> {
+    use crate::device_links::core::ReadOutcome;
+    let mut line = Vec::new();
+    let mut types = Vec::new();
+    while let Ok(ReadOutcome::Byte(byte)) = peer.binding.link.read_byte() {
+        line.push(byte);
+        if byte == b'\n' {
+            if let Ok(packet) = NetworkPacket::deserialize(&line) {
+                types.push(packet.packet_type);
+            }
+            line.clear();
+        }
+    }
+    types
+}
+
+fn wait_for(within: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+    let until = std::time::Instant::now() + within;
+    while std::time::Instant::now() < until {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    done()
+}
+
+/// F-QA2-1: pairing STARTED FROM THE PHONE, the desk accepts, and the desk is
+/// the deterministic initiator (its id sorts lower). The phone then waits for
+/// an offer that nothing ever sent (it started nothing: Android's side of the
+/// phone-started pairing only offers when IT is the initiator), the link idled
+/// on heartbeats until the phone app restarted. Accepting must start the
+/// negotiation, with no reconnect.
+#[test]
+fn a_phone_started_pairing_the_desk_accepts_starts_the_negotiation_when_the_desk_initiates() {
+    let net = TestNetwork::new();
+    let (mut desk, phone) = pair_by_roles(&net, true);
+    assert!(desk.local_id() < phone.local_id());
+    phone.request_pair();
+    net.advance(0);
+    desk.pump();
+    desk.accept();
+    assert!(desk.is_trusted());
+    assert!(
+        wait_for(std::time::Duration::from_secs(5), || desk
+            .sessions
+            .active_webrtc_attempt(&desk.binding)
+            .ok()
+            .flatten()
+            .is_some()),
+        "the desk never offered: the connection waits for a reconnect"
+    );
+}
+
+/// The mirror: the phone's id sorts lower, so it offers by itself; the desk
+/// (the responder) asks once after 3 s if nothing arrived, as for any fresh
+/// link. Accepting still schedules that, and it is the only thing asked.
+#[test]
+fn a_phone_started_pairing_the_desk_accepts_asks_the_phone_to_offer_when_the_phone_initiates() {
+    let net = TestNetwork::new();
+    let (mut desk, phone) = pair_by_roles(&net, false);
+    assert!(desk.local_id() > phone.local_id());
+    phone.request_pair();
+    net.advance(0);
+    desk.pump();
+    desk.accept();
+    assert!(desk.is_trusted());
+    let signal = crate::device_links::packet::PACKET_TYPE_WEBRTC_SIGNAL_V1;
+    let mut seen = Vec::new();
+    assert!(
+        wait_for(std::time::Duration::from_secs(6), || {
+            net.advance(0);
+            seen.extend(waiting_types(&phone));
+            seen.iter().any(|kind| kind == signal)
+        }),
+        "no restart request reached the phone: {seen:?}"
+    );
+    assert!(
+        desk.sessions
+            .active_webrtc_attempt(&desk.binding)
+            .ok()
+            .flatten()
+            .is_none(),
+        "the responder never offers"
+    );
+}
+
+/// A phone whose identity does not take WebRTC signaling is not pushed into a
+/// negotiation it cannot have (the capability is the link's identity).
+#[test]
+fn accepting_a_phone_that_takes_no_webrtc_starts_nothing() {
+    let net = TestNetwork::new();
+    let (a, b) = peer_pair(&net, "desk-nocap", "phone-nocap");
+    let (mut desk, phone) = if a.local_id() < b.local_id() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    phone.request_pair();
+    net.advance(0);
+    desk.pump();
+    desk.accept();
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    assert!(desk
+        .sessions
+        .active_webrtc_attempt(&desk.binding)
+        .ok()
+        .flatten()
+        .is_none());
+}
+
+/// F-QA2-4: the desk unpaired a phone it could not tell (the link was gone).
+/// The phone, unpaired for the desk but not for itself, only heartbeats on its
+/// next link, and the desk ignores an unpaired session's heartbeats on
+/// purpose: it was left on "Connecting..." for minutes. The desk now owes it
+/// a `pair:false` and answers on its next IDENTITY, not on heartbeats.
+#[test]
+fn an_unpair_nobody_heard_is_answered_on_the_devices_next_identity() {
+    use crate::device_links::packet::PACKET_TYPE_HEARTBEAT;
+    let net = TestNetwork::new();
+    let (mut desktop, mut phone) = paired_pair(&net);
+    desktop.drop_link();
+    desktop.unpair();
+    assert!(!desktop.is_trusted());
+    phone.drop_link();
+    net.advance(0);
+    desktop.relink();
+    phone.relink();
+    assert!(phone.is_trusted(), "the phone never heard");
+    // Heartbeats on the new link are not the answer.
+    let mut beat = NetworkPacket::new(PACKET_TYPE_HEARTBEAT);
+    beat.set("dozing", false);
+    phone.binding.link.send_packet(&beat).expect("sends");
+    net.advance(0);
+    desktop.pump();
+    phone.pump();
+    assert!(phone.is_trusted(), "a heartbeat does not answer it");
+    // The identity does.
+    super::super::handshake::answer_owed_not_paired(&desktop.binding, false);
+    net.advance(0);
+    phone.pump();
+    assert!(!phone.is_trusted(), "told on the next identity");
+}
+
+/// An unpair that was delivered owes nothing; the debt is bounded in count
+/// and age, and a pairing clears it.
+#[test]
+fn the_owed_unpair_is_bounded_and_cleared_by_a_pairing() {
+    use super::super::pairing_commands::{
+        clear_owed_not_paired, owe_not_paired, take_owed_not_paired, OWED_MAX_AGE, OWED_MAX_ANSWERS,
+    };
+    let now = std::time::Instant::now();
+    let id = "owed-bounds-phone";
+    assert!(!take_owed_not_paired(id, now), "nothing owed");
+    owe_not_paired(id);
+    for _ in 0..OWED_MAX_ANSWERS {
+        assert!(take_owed_not_paired(id, now));
+    }
+    assert!(
+        !take_owed_not_paired(id, now),
+        "answered at most {OWED_MAX_ANSWERS} times"
+    );
+    owe_not_paired(id);
+    assert!(
+        !take_owed_not_paired(id, now + OWED_MAX_AGE + std::time::Duration::from_secs(1)),
+        "too old"
+    );
+    owe_not_paired(id);
+    clear_owed_not_paired(id);
+    assert!(!take_owed_not_paired(id, now), "a pairing ends the debt");
+
+    // A delivered unpair (link up) owes nothing.
+    let net = TestNetwork::new();
+    let (desktop, _phone) = paired_pair(&net);
+    desktop.unpair();
+    assert!(!take_owed_not_paired(&desktop.peer_id(), now));
+}
+
+/// A paired link is never sent the answer (it is for unpaired identities).
+#[test]
+fn a_paired_link_is_not_told_it_is_unpaired() {
+    use super::super::pairing_commands::owe_not_paired;
+    let net = TestNetwork::new();
+    let (desktop, phone) = paired_pair(&net);
+    owe_not_paired(&desktop.peer_id());
+    super::super::handshake::answer_owed_not_paired(&desktop.binding, true);
+    net.advance(0);
+    assert!(phone.is_trusted());
+    assert!(waiting_types(&phone).is_empty());
+    super::super::pairing_commands::clear_owed_not_paired(&desktop.peer_id());
+}

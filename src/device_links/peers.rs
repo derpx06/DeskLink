@@ -114,6 +114,10 @@ mod tests {
             "device_links/webrtc/transfer_board.rs:BOARD",
         ];
         const KEPT: &[&str] = &[
+            // An unpair nobody heard: answered on the device's next identity,
+            // bounded in age and count, cleared by a pairing. `forget_peer`
+            // runs inside the unpair that records it, so it must outlive it.
+            "device_links/daemon/pairing_commands.rs:OWED",
             // Windows and widgets (they close with their device's page).
             "remote_control.rs:OPEN_WINDOWS",
             "shell_dbus/model.rs:LIVE_SINCE",

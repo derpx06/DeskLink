@@ -385,6 +385,7 @@ impl DaemonWorker {
     /// a `DaemonWorker`, and therefore without sockets.
     fn pairing(&self) -> PairingContext {
         PairingContext {
+            events: Arc::clone(&self.events),
             sessions: Arc::clone(&self.sessions),
             devices: Arc::clone(&self.devices),
             config: Arc::clone(&self.config),

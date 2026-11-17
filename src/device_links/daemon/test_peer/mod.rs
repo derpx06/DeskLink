@@ -65,6 +65,18 @@ pub(crate) fn peer_pair(
     left_label: &str,
     right_label: &str,
 ) -> (TestPeer, TestPeer) {
+    peer_pair_with(net, left_label, right_label, &[])
+}
+
+/// [`peer_pair`] where each peer's identity advertises `capabilities` (a
+/// phone that takes WebRTC signaling, say): what a link's identity says, as
+/// production reads it.
+pub(crate) fn peer_pair_with(
+    net: &Arc<TestNetwork>,
+    left_label: &str,
+    right_label: &str,
+    capabilities: &[&str],
+) -> (TestPeer, TestPeer) {
     let left_dir = temp_dir(left_label);
     let right_dir = temp_dir(right_label);
     let left_config = Config::load_from_dir(left_dir.clone()).expect("left config");
@@ -94,6 +106,7 @@ pub(crate) fn peer_pair(
         left_der.clone(),
         right_der.clone(),
         right_pem,
+        capabilities,
     );
     let right = TestPeer::new(
         right_config,
@@ -104,6 +117,7 @@ pub(crate) fn peer_pair(
         right_der,
         left_der,
         left_pem,
+        capabilities,
     );
     (left, right)
 }
@@ -126,6 +140,7 @@ impl TestPeer {
         local_public_der: Vec<u8>,
         remote_public_der: Vec<u8>,
         peer_certificate_pem: String,
+        capabilities: &[&str],
     ) -> Self {
         let link = net.end(end);
         let sessions = Arc::new(DeviceManager::new());
@@ -136,7 +151,7 @@ impl TestPeer {
             name: peer_id.to_string(),
             device_type: "phone".to_string(),
             protocol_version: PROTOCOL_VERSION,
-            incoming_capabilities: Vec::new(),
+            incoming_capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
             app_version: None,
@@ -262,6 +277,7 @@ impl TestPeer {
 
     pub(crate) fn commands(&self) -> PairingContext {
         PairingContext {
+            events: Arc::clone(&self.events),
             sessions: Arc::clone(&self.sessions),
             devices: Arc::clone(&self.devices),
             config: Arc::clone(&self.config),

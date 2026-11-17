@@ -86,6 +86,7 @@ pub(crate) struct PairingContext {
     pub(crate) devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     pub(crate) config: Arc<Mutex<Config>>,
     pub(crate) errors: Arc<Mutex<Vec<String>>>,
+    pub(crate) events: Arc<Mutex<Vec<super::handle::DaemonEvent>>>,
 }
 
 impl PairingContext {
@@ -155,7 +156,21 @@ impl PairingContext {
         // `pair:false`. That is the same self-healing path a missed unpair
         // uses, which is why no queue is needed here either.
         if self.persist_trust(device_id, &binding, snapshot, state) {
+            clear_owed_not_paired(device_id);
             update_pair_state(&self.devices, device_id, PairState::Paired, None);
+            // The phone started this pairing and the user just accepted it
+            // here, so the peer's own "pair" packet that ends the other
+            // orientation (and starts the negotiation) never comes. When
+            // this desk is the deterministic initiator nothing else would
+            // ever send the offer: the phone waits for it, the link idles on
+            // heartbeats. Same bounded bootstrap a fresh paired link gets.
+            super::handshake::begin_webrtc_after_accept(
+                &binding,
+                &self.sessions,
+                &self.config,
+                &self.devices,
+                &self.events,
+            );
         }
     }
 
@@ -301,7 +316,12 @@ impl PairingContext {
             crate::device_links::peers::forget_peer(device_id);
         }
         // Unpairing a device that is not connected succeeded: it is told the
-        // next time it reaches us (it gets pair:false for its signaling).
+        // next time it reaches us. An unpaired device only heartbeats (which
+        // the desk ignores on purpose), so it is owed the `pair:false` on its
+        // next IDENTITY instead (F-QA2-4); a delivered one owes nothing.
+        if remove_trust && (offline || result.is_err()) {
+            owe_not_paired(device_id);
+        }
         if let Err(error) = if offline { Ok(()) } else { result } {
             report(&self.devices, &self.errors, device_id, error);
         }
@@ -320,6 +340,68 @@ fn proven_pairings() -> &'static Mutex<std::collections::HashSet<String>> {
 pub(super) fn note_proven_pairing(device_id: &str) {
     if let Ok(mut proven) = proven_pairings().lock() {
         proven.insert(device_id.to_string());
+    }
+    clear_owed_not_paired(device_id);
+}
+
+/// How long, and how many times, an unpair that could not be delivered is
+/// still answered (F-QA2-4). Bounded so a stranger who connects first with a
+/// phone's id cannot make it permanent, nor consume it for the real phone in
+/// one try.
+pub(crate) const OWED_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+pub(crate) const OWED_MAX_ANSWERS: u8 = 3;
+const OWED_MAX_DEVICES: usize = 16;
+
+/// Devices this desk unpaired without being able to tell them (the link was
+/// gone or the write failed), with when and how many times they were answered.
+fn owed_not_paired() -> &'static Mutex<HashMap<String, (std::time::Instant, u8)>> {
+    static OWED: std::sync::OnceLock<Mutex<HashMap<String, (std::time::Instant, u8)>>> =
+        std::sync::OnceLock::new();
+    OWED.get_or_init(Default::default)
+}
+
+/// Records that `device_id` was unpaired here and never heard it.
+pub(crate) fn owe_not_paired(device_id: &str) {
+    if let Ok(mut owed) = owed_not_paired().lock() {
+        if owed.len() >= OWED_MAX_DEVICES && !owed.contains_key(device_id) {
+            // The oldest makes room.
+            if let Some(oldest) = owed
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(id, _)| id.clone())
+            {
+                owed.remove(&oldest);
+            }
+        }
+        owed.insert(device_id.to_string(), (std::time::Instant::now(), 0));
+    }
+}
+
+/// Whether `device_id` is owed a `pair:false` at `now` (counting this answer).
+/// Asked on a new link's IDENTITY only, never on heartbeats, and only for a
+/// device that is not paired.
+pub(crate) fn take_owed_not_paired(device_id: &str, now: std::time::Instant) -> bool {
+    let Ok(mut owed) = owed_not_paired().lock() else {
+        return false;
+    };
+    let Some((at, answered)) = owed.get_mut(device_id) else {
+        return false;
+    };
+    if now.saturating_duration_since(*at) >= OWED_MAX_AGE {
+        owed.remove(device_id);
+        return false;
+    }
+    *answered += 1;
+    if *answered >= OWED_MAX_ANSWERS {
+        owed.remove(device_id);
+    }
+    true
+}
+
+/// A pairing (any way) ends the debt: the device is paired again.
+pub(crate) fn clear_owed_not_paired(device_id: &str) {
+    if let Ok(mut owed) = owed_not_paired().lock() {
+        owed.remove(device_id);
     }
 }
 

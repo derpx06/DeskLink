@@ -434,6 +434,7 @@ pub(crate) fn attach_bootstrap_link(
     }
 
     let binding = registration.binding;
+    answer_owed_not_paired(&binding, paired);
     debug_log!(
         "[DL-WRTC-BOOT] secure bootstrap link ready for {} (session {}, generation {})",
         binding.device_id,
@@ -478,6 +479,27 @@ pub(crate) fn attach_bootstrap_link(
         );
     }
     Ok(())
+}
+
+/// A device this desk unpaired while it could not be told: its identity on a
+/// new link is the moment to say so (it only heartbeats otherwise, and an
+/// unpaired session ignores those on purpose). Only for a link that is not
+/// paired: a state report to it, never a state change here. Bounded in age
+/// and count (`pairing_commands::take_owed_not_paired`).
+pub(super) fn answer_owed_not_paired(binding: &SessionBinding, paired: bool) {
+    if paired
+        || !super::pairing_commands::take_owed_not_paired(
+            &binding.device_id,
+            std::time::Instant::now(),
+        )
+    {
+        return;
+    }
+    let mut packet = crate::device_links::packet::NetworkPacket::new(
+        crate::device_links::packet::PACKET_TYPE_PAIR,
+    );
+    packet.set("pair", false);
+    let _ = binding.link.send_packet(&packet);
 }
 
 /// What a QR-only link needs to become the phone's link.
@@ -665,6 +687,34 @@ pub(crate) fn promote_qr_link(
         },
     );
     Ok(())
+}
+
+/// The bounded bootstrap for a link that just became paired by this desk's
+/// own acceptance (see `accept_pair`). The capability comes from the link's
+/// identity, not from the pairing state the link was registered with
+/// (unpaired then, which is why registration did not schedule it).
+pub(super) fn begin_webrtc_after_accept(
+    binding: &SessionBinding,
+    sessions: &Arc<DeviceManager>,
+    config: &Arc<Mutex<Config>>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
+) {
+    let supports = binding
+        .link
+        .info
+        .incoming_capabilities
+        .iter()
+        .any(|capability| capability == PACKET_TYPE_WEBRTC_SIGNAL_V1);
+    if supports {
+        schedule_webrtc_bootstrap(
+            binding.clone(),
+            Arc::clone(sessions),
+            Arc::clone(config),
+            Arc::clone(devices),
+            Arc::clone(events),
+        );
+    }
 }
 
 /// Start SDP/ICE only after the normal packet reader owns the TLS stream.
