@@ -1111,6 +1111,10 @@ fn ctrl_f_searches_the_page_on_screen() {
         ] {
             assert!(window.show_page(page), "{page}");
             spin();
+            // Settings remembers an open subpage across windows (another
+            // test may have left one): its search is on the list.
+            super::super::prefs::debug_open("list", "");
+            spin();
             wait_until(|| page_search_showing(&window));
             ctrl_f(&window);
             wait_until(|| focused_search(&window).is_some());
@@ -1265,6 +1269,8 @@ fn ctrl_f_is_never_dead_on_a_narrow_window_or_a_settings_subpage() {
         super::super::prefs::debug_open("1", "");
         spin();
         never_dead(&window, "a Settings subpage");
+        super::super::prefs::debug_open("list", "");
+        spin();
         window.close();
     });
 }
