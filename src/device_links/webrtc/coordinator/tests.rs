@@ -759,10 +759,18 @@ fn transfer_through_cuts(
                 );
                 resumed_checked = true;
             }
-            let cut_now = match when {
-                CutWhen::Every(every) => round.elapsed() >= every,
-                CutWhen::AfterBlocks(blocks) => verified >= held_at_cut + blocks,
-            };
+            // Never once every block is verified: the file is then whole at the
+            // receiver and only the sender's "complete" is on its way. A cut there
+            // is a restart in that millisecond (this rig's managers are new, and
+            // what a receiver remembers of finished transfers is in memory), and
+            // the re-offer is received again from block 1 (audit X9, listed): the
+            // flaky "resumed at block 1, below the 48 verified" under load.
+            let all_in = verified >= size.div_ceil(1 << 20);
+            let cut_now = !all_in
+                && match when {
+                    CutWhen::Every(every) => round.elapsed() >= every,
+                    CutWhen::AfterBlocks(blocks) => verified >= held_at_cut + blocks,
+                };
             if cut_now {
                 break Ok(verified);
             }
