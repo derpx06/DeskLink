@@ -193,10 +193,10 @@ pub(crate) const PAGE_ACCELS: [(&str, &str); 6] = [
     ("contacts", "<control>6"),
 ];
 
-/// Ctrl+K opens "Find anything" (`win.palette`); Ctrl+F searches the page on screen (`find`), and does the same as
-/// Ctrl+K on a page without a search box of its own. Shown in the shortcuts dialog, on
-/// the search buttons, as key caps in the sidebar's search field and next to
-/// nothing else.
+/// Ctrl+K opens "Find anything" (`win.palette`). Ctrl+F searches the page on
+/// screen ([`find`]) and does the same as Ctrl+K on a page without a search
+/// box of its own. Ctrl+K is shown in the shortcuts dialog, on the search
+/// buttons and as key caps in the sidebar's search field.
 pub(crate) const PALETTE_ACCEL: &str = "<control>k";
 
 /// How many of [`PAGES`] are in the sidebar's main list; Settings is the

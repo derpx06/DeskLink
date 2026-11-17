@@ -1150,3 +1150,126 @@ fn ctrl_f_in_the_note_editor_is_left_to_the_text() {
         window.close();
     });
 }
+
+/// Ctrl+F over a dialog does nothing (the palette is one: Ctrl+K closes it).
+/// (Needs a display.)
+#[test]
+fn ctrl_f_over_a_dialog_does_nothing() {
+    crate::test_display::run(|| {
+        let window = home_window("paired", 1280);
+        assert!(window.show_page("notes"));
+        spin();
+        let dialog = adw::AlertDialog::new(Some("A question"), None);
+        dialog.add_response("ok", "_OK");
+        dialog.present(Some(&window));
+        spin();
+        ctrl_f(&window);
+        assert!(
+            !super::super::palette::is_open(),
+            "no palette over a dialog"
+        );
+        assert!(
+            focused_search(&window).is_none(),
+            "the page's box stays out of it"
+        );
+        dialog.close();
+        spin();
+        window.close();
+    });
+}
+
+/// Pages that have no search box of their own (the Snippets and Clipboard
+/// tabs) fall back to the global search: the key is never dead. (Needs a
+/// display.)
+#[test]
+fn ctrl_f_on_the_snippets_and_clipboard_tabs_opens_the_global_search() {
+    crate::test_display::run(|| {
+        let window = home_window("paired", 1280);
+        for page in ["snippets", "clipboard"] {
+            assert!(window.show_page(page), "{page}");
+            spin();
+            ctrl_f(&window);
+            assert!(
+                super::super::palette::is_open(),
+                "{page}: falls back to Find anything"
+            );
+            gtk::prelude::ActionGroupExt::activate_action(&window, "palette", None);
+            spin();
+        }
+        window.close();
+    });
+}
+
+/// On a narrow window, and on a Settings page with its search scrolled out
+/// of sight, Ctrl+F either reaches a search box or opens the global search:
+/// never nothing. (Needs a display.)
+#[test]
+fn ctrl_f_is_never_dead_on_a_narrow_window_or_a_settings_subpage() {
+    crate::test_display::run(|| {
+        let never_dead = |window: &super::super::DesklinkWindow, what: &str| {
+            ctrl_f(window);
+            let open = super::super::palette::is_open();
+            assert!(
+                open || focused_search(window).is_some(),
+                "{what}: the key did something"
+            );
+            if open {
+                gtk::prelude::ActionGroupExt::activate_action(window, "palette", None);
+                spin();
+            }
+        };
+        let window = home_window("paired", 420);
+        assert!(window.show_page("notes"));
+        spin();
+        never_dead(&window, "narrow Notes");
+        assert!(window.show_page("settings"));
+        spin();
+        super::super::prefs::debug_open("1", "");
+        spin();
+        never_dead(&window, "a Settings subpage");
+        window.close();
+    });
+}
+
+/// Escape in the page's box: it is cleared, the focus leaves it, and the
+/// window stays. An empty box does the same. (Needs a display.)
+#[test]
+fn escape_in_a_page_search_clears_it_and_leaves_without_closing_anything() {
+    crate::test_display::run(|| {
+        let window = home_window("paired", 1280);
+        assert!(window.show_page("notes"));
+        spin();
+        ctrl_f(&window);
+        let entry = focused_search(&window).expect("the search is focused");
+        entry.set_text("abc");
+        entry.emit_by_name::<()>("stop-search", &[]);
+        spin();
+        assert_eq!(entry.text(), "");
+        assert!(focused_search(&window).is_none(), "the focus left the box");
+        // Empty already: it still leaves, and nothing is closed.
+        ctrl_f(&window);
+        assert!(focused_search(&window).is_some());
+        entry.emit_by_name::<()>("stop-search", &[]);
+        spin();
+        assert!(focused_search(&window).is_none());
+        assert!(window.is_visible(), "the window stays");
+        assert!(window.visible_dialog().is_none(), "no dialog opened");
+        window.close();
+    });
+}
+
+/// The Phone Screen forwards keys to the phone: it is an `adw::Window`, not a
+/// `GtkApplicationWindow`, so it has no `win.` actions and the Ctrl+F
+/// accelerator does not exist there.
+#[test]
+fn the_phone_screen_window_has_no_page_search_accelerator() {
+    crate::test_display::run(|| {
+        assert!(!adw::Window::new().is::<gtk::ApplicationWindow>());
+        let production = crate::source_scan::production(include_str!("../../remote_control.rs"));
+        assert!(production.contains("adw::Window::builder()"));
+        assert!(
+            !production.contains("toggle-search"),
+            "it never binds Ctrl+F"
+        );
+    });
+}

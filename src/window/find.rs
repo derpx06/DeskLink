@@ -5,8 +5,14 @@
 //! that is the clean fallback, because the person asked to search and the
 //! global search is the only search left. Where the focus is in text that is
 //! not the page's own box (the note editor, a field), Ctrl+F stays the
-//! text's; terminal and Phone Screen windows are windows of their own, so the
-//! window's accelerator never sees their keys.
+//! text's. A terminal is embedded in the Terminals page: Ctrl+F reaches its
+//! program (readline's forward-char) only because the window's capture-phase
+//! key controller for terminals (`terminal_view::hand_keys_to_terminals`)
+//! sends every Ctrl key but Ctrl+Shift+C/V/K and Ctrl+Tab to the focused
+//! terminal and stops it (`key_route`; pinned by
+//! `ctrl_keys_are_the_terminals_but_for_copy_paste_and_the_palette`). The
+//! Phone Screen is a window of its own (an `adw::Window`, no `win.` actions),
+//! so this accelerator does not exist there and its keys go to the phone.
 //!
 //! Sibling edges: none (the window's helpers).
 
@@ -43,20 +49,8 @@ pub(super) fn search_this_page(window: &DesklinkWindow) {
         return;
     }
     let imp = window.imp();
-    // The Terminals page: its search also leaves an open terminal.
-    if imp.page.borrow().as_str() == "terminals"
-        && imp.main_stack.visible_child_name().as_deref() == Some("devices")
-    {
-        if let Some(page) = imp.terminals.borrow().as_ref() {
-            page.focus_search();
-            if let Some(entry) = visible_page_search(window) {
-                entry.select_region(0, -1);
-            }
-            return;
-        }
-    }
-    let page_search = visible_page_search(window);
     let focus = gtk::prelude::GtkWindowExt::focus(window);
+    let page_search = visible_page_search(window);
     // In the page's own box already: select what is there.
     if let (Some(entry), Some(focus)) = (&page_search, &focus) {
         if focus.is_ancestor(entry) || focus == entry.upcast_ref::<gtk::Widget>() {
@@ -68,6 +62,18 @@ pub(super) fn search_this_page(window: &DesklinkWindow) {
     if palette::typing_in(window) {
         return;
     }
+    // The Terminals page: its search also leaves an open terminal (whose box
+    // is then showing); if it cannot be reached the key falls through.
+    let page_search = if imp.page.borrow().as_str() == "terminals"
+        && imp.main_stack.visible_child_name().as_deref() == Some("devices")
+    {
+        if let Some(page) = imp.terminals.borrow().as_ref() {
+            page.focus_search();
+        }
+        visible_page_search(window)
+    } else {
+        page_search
+    };
     match page_search {
         Some(entry) => {
             entry.grab_focus();
