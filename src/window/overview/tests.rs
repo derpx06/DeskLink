@@ -821,8 +821,9 @@ fn a_half_typed_note_survives_a_redraw_unselected() {
 }
 
 /// A populated wide Home: its two columns end near each other (the owner's
-/// right column was nearly empty beside a long left), and every card is
-/// there once. (Needs a display.)
+/// right column was nearly empty beside a long left; placed the old way the
+/// columns here differ by 105 px, balanced by 17: the bound is about 68),
+/// and every card is there once. (Needs a display.)
 #[test]
 fn the_wide_homes_columns_are_balanced_and_every_card_is_there_once() {
     use adw::subclass::prelude::ObjectSubclassIsExt;
@@ -850,8 +851,9 @@ fn the_wide_homes_columns_are_balanced_and_every_card_is_there_once() {
             let right = split.last_child().expect("the right column");
             let (left_height, right_height) = (left.height(), right.height());
             let total = left_height + right_height;
+            eprintln!("wide Home {width}: columns {left_height} / {right_height}");
             assert!(
-                (left_height - right_height).abs() <= (total / 4).max(300),
+                (left_height - right_height).abs() <= (total / 16).max(40),
                 "{width}: the columns end {left_height} and {right_height} px down"
             );
             let all = named_widgets(window.upcast_ref(), "");
@@ -865,5 +867,68 @@ fn the_wide_homes_columns_are_balanced_and_every_card_is_there_once() {
             }
             window.close();
         }
+    });
+}
+
+/// The Notes card changes column on a rebuild (the cards are placed by
+/// height): the quick-note entry that has the focus keeps it, with its text
+/// and cursor, and no other widget (a Reply button, New note) takes it.
+/// (Needs a display.)
+#[test]
+fn the_quick_note_entry_keeps_the_focus_when_its_card_changes_column() {
+    use adw::subclass::prelude::ObjectSubclassIsExt;
+    let _shelf = fresh_notes();
+    crate::test_display::run(|| {
+        let window = home_window("paired", 1920);
+        let imp = window.imp();
+        imp.compact.set(false);
+        imp.wide.set(true);
+        window.show_page("home");
+        let id = imp.fake_devices.borrow()[0].id.clone();
+        let rebuild = |note: &str| {
+            crate::device_links::notes::new_note(note).unwrap();
+            window.refresh_devices();
+            spin();
+            spin();
+        };
+        let entry = || {
+            shown(&window, "home-note-entry")
+                .and_downcast::<gtk::Entry>()
+                .expect("the quick entry")
+        };
+        // Which column of Home's split the entry is in.
+        let column = |entry: &gtk::Entry| {
+            let split = shown(&window, "home-split").expect("Home's columns");
+            let mut widget = entry.clone().upcast::<gtk::Widget>();
+            while let Some(parent) = widget.parent() {
+                if parent == split {
+                    return split.first_child().is_some_and(|left| left == widget);
+                }
+                widget = parent;
+            }
+            panic!("the entry is not under Home's columns");
+        };
+        let focused = |entry: &gtk::Entry| {
+            gtk::prelude::RootExt::focus(&window).is_some_and(|focus| focus.is_ancestor(entry))
+        };
+        super::balance::pin(&id, &["notifications", "files", "terminals"]);
+        rebuild("first");
+        let before = entry();
+        let was_left = column(&before);
+        gtk::prelude::GtkWindowExt::set_focus(&window, Some(&before));
+        before.set_text("half typed");
+        before.set_position(4);
+        assert!(focused(&before));
+        super::balance::pin(&id, &["notes", "notifications", "files"]);
+        rebuild("second");
+        let after = entry();
+        assert_ne!(before, after, "Home was rebuilt");
+        assert_ne!(column(&after), was_left, "the Notes card changed column");
+        assert!(focused(&after), "the entry has the focus again");
+        assert_eq!(after.text(), "half typed");
+        assert_eq!(after.selection_bounds(), None, "nothing is selected");
+        assert_eq!(after.position(), 4, "the cursor is where it was");
+        after.set_text("");
+        window.close();
     });
 }

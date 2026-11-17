@@ -113,8 +113,10 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         settings.shows_notifications(&device.id),
         crate::device_links::folders::bucket_on(&device.id),
         gliding_onto(&device.id),
-        // Crossing the wide breakpoint places the cards again.
+        // Crossing the wide breakpoint, or a resize of the content, places the
+        // cards again (in 160 px steps; never on a tick).
         imp.wide.get(),
+        balance::content_width(win) / 160,
         // The Notes card shows what is stored here (or sent by the phone).
         crate::device_links::notes::generation(),
     ))

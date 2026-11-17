@@ -947,19 +947,28 @@ pub(super) fn section(daemon: &DaemonHandle, device: &DeviceView, rows: &[Row]) 
             Some((count, block))
         })
         .collect();
-    let split = split_at(&blocks.iter().map(|(count, _)| *count).collect::<Vec<_>>());
+    // By height at about a wide column's width: a row with a state and a
+    // button is taller than a plain one.
+    let heights: Vec<usize> = blocks
+        .iter()
+        .map(|(_, block)| block.measure(gtk::Orientation::Vertical, 760).1.max(1) as usize)
+        .collect();
+    let split = split_at(&heights);
     for (at, (_, block)) in blocks.iter().enumerate() {
         columns[usize::from(at >= split)].append(block);
     }
     for column in &columns {
-        groups_box.append(column);
+        // An empty second column adds a gap in the one-column layout.
+        if column.first_child().is_some() {
+            groups_box.append(column);
+        }
     }
     section.append(&groups_box);
     section
 }
 
-/// How many of the groups (their row counts, in order) go in the first
-/// column so the two columns hold about the same number of rows.
+/// How many of the groups (their heights, in order) go in the first column
+/// so the two columns end about even.
 pub(super) fn split_at(counts: &[usize]) -> usize {
     let total: usize = counts.iter().sum();
     let mut best = (usize::MAX, 0);

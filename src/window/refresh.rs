@@ -557,6 +557,14 @@ impl DesklinkWindow {
         let body_widget = body.clone().upcast::<gtk::Widget>();
         let focus_path =
             gtk::prelude::RootExt::focus(self).and_then(|focus| widget_path(&body_widget, &focus));
+        // The quick-note entry keeps the focus by name, not by its place in
+        // the tree: the cards change column, so the place is not stable and
+        // Enter must never land on another card's button.
+        let note_entry = gtk::prelude::RootExt::focus(self)
+            .and_then(|focus| focus.ancestor(gtk::Entry::static_type()))
+            .filter(|entry| entry.widget_name() == "home-note-entry")
+            .and_then(|entry| entry.downcast::<gtk::Entry>().ok())
+            .map(|entry| entry.position());
         let adjustment = scroll.vadjustment();
         let offset = adjustment.value();
         while let Some(child) = body.first_child() {
@@ -571,7 +579,20 @@ impl DesklinkWindow {
             let Some(body) = body.upgrade() else {
                 return;
             };
-            if let Some(widget) = focus_path.and_then(|path| widget_at(body.upcast_ref(), &path)) {
+            if let Some(position) = note_entry {
+                if let Some(entry) = named_widgets(body.upcast_ref(), "home-note-entry")
+                    .into_iter()
+                    .next()
+                    .and_downcast::<gtk::Entry>()
+                {
+                    entry.grab_focus();
+                    // Focusing selects all of an entry's text: the cursor goes
+                    // back where it was once that is done.
+                    glib::idle_add_local_once(move || entry.select_region(position, position));
+                }
+            } else if let Some(widget) =
+                focus_path.and_then(|path| widget_at(body.upcast_ref(), &path))
+            {
                 widget.grab_focus();
             }
         });

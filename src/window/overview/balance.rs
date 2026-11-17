@@ -2,7 +2,9 @@
 //! same height. Placed when Home is built (and again on a resize across the
 //! wide breakpoint or a card appearing or going), never on a tick; a card
 //! keeps its column from one build to the next unless the columns are then
-//! clearly out of balance.
+//! clearly out of balance (so a card can still change column on a rebuild
+//! when the imbalance is large: that is the balance working, not a bug; the
+//! focused quick-note entry is found again by name, `replace_body`).
 //!
 //! Sibling edges: none (the parent builds the cards).
 
@@ -14,6 +16,36 @@ use super::*;
 /// The columns may differ by this much (px) before a remembered placement is
 /// given up: a notification arriving must not move a card under the pointer.
 const KEEP_WITHIN: i32 = 160;
+
+/// The width Home's content area really has (the page stack), or, before its
+/// first allocation, a guess from the window's. The Home key holds this in
+/// 160 px steps, so the cards are placed again once the real width is known
+/// and when a resize changes it.
+pub(super) fn content_width(win: &DesklinkWindow) -> i32 {
+    use adw::subclass::prelude::ObjectSubclassIsExt;
+    match win.imp().page_stack.width() {
+        0 => (win.width().max(1280) - 310).min(super::HOME_WIDE_WIDTH),
+        width => width.min(super::HOME_WIDE_WIDTH),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: keep the remembered placement whatever the balance.
+    static PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: put exactly `left_ids` on the left at the next build.
+#[cfg(test)]
+pub(super) fn pin(device_id: &str, left_ids: &[&str]) {
+    REMEMBERED.with(|map| {
+        map.borrow_mut().insert(
+            device_id.to_string(),
+            left_ids.iter().map(|id| id.to_string()).collect(),
+        )
+    });
+    PINNED.with(|pinned| pinned.set(true));
+}
 
 thread_local! {
     /// Per phone: the ids that sat on the left at the last wide build.
@@ -42,6 +74,12 @@ pub(super) fn assign(
         }
         (left, right)
     };
+    #[cfg(test)]
+    if PINNED.with(|pinned| pinned.get()) {
+        if let Some(left_ids) = remembered {
+            return cards.iter().map(|(id, _)| left_ids.contains(id)).collect();
+        }
+    }
     if let Some(left_ids) = remembered {
         let placed: Vec<bool> = cards.iter().map(|(id, _)| left_ids.contains(id)).collect();
         let (left, right) = heights(&placed);
@@ -78,8 +116,7 @@ pub(super) fn place(
     use adw::subclass::prelude::ObjectSubclassIsExt;
     let wide = win.imp().wide.get();
     let goes_left: Vec<bool> = if wide {
-        let width = (win.width().max(1280) - 310).min(super::HOME_WIDE_WIDTH);
-        let column = ((width - 24) / 2).max(300);
+        let column = ((content_width(win) - 24) / 2).max(300);
         let height_of = |widget: &gtk::Widget| widget.measure(gtk::Orientation::Vertical, column).1;
         let measured: Vec<(String, i32)> = cards
             .iter()
@@ -141,7 +178,7 @@ mod tests {
     #[test]
     fn a_card_keeps_its_column_unless_the_balance_is_clearly_off() {
         let remembered = vec!["c0".to_string()];
-        // c0 left (300), c1 right (350): 650 vs 366, 284 apart of 1016: kept? total/6 = 169, 160 -> 284 > 169: rebalanced.
+        // c0 left, c1 right: 250 px apart of about 1000.
         let moved = assign(&cards(&[300, 350]), 300, 0, Some(&remembered));
         assert_ne!(moved, [true, false], "clearly off: placed afresh");
         // Near: kept.
