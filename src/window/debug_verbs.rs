@@ -812,6 +812,10 @@ pub(super) fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &st
             _ => adw::ColorScheme::Default,
         }),
         "open-pair" => win.show_discovery_dialog(true),
+        // "update-popup STATE [SOURCE]": the update popup with a made-up
+        // offer (`available`, `required`, `guide`; `debian`, `arch`,
+        // `fedora`, `flatpak`, `appimage`, `manual`).
+        "update-popup" => updates::debug_show(win, id, if arg.is_empty() { "debian" } else { arg }),
         // "guide [scroll N|end]": the Get started guide, open or scrolled.
         "guide" if id == "scroll" => {
             if let Some(dialog) = win.visible_dialog() {

@@ -71,6 +71,10 @@ pub enum DaemonCommand {
     SetCallsOnComputer(bool),
     SetCallerOnLockScreen(bool),
     SetRingOnComputer(bool),
+    /// Settings -> Updates: ask the update server once a day.
+    SetUpdateCheck(bool),
+    /// Settings -> Updates: "beta" or "stable".
+    SetUpdateChannel(String),
     /// Show a phone's notifications here (device id, shown).
     SetShowNotifications(String, bool),
     /// The user answered "Not now" to the top-bar extension offer.
@@ -337,6 +341,18 @@ impl DaemonWorker {
             }
             DaemonCommand::SetCallsOnComputer(on) => {
                 self.update_settings(|settings| settings.calls_on_computer = on)
+            }
+            DaemonCommand::SetUpdateCheck(on) => {
+                self.update_settings(|settings| settings.update_check = on)
+            }
+            DaemonCommand::SetUpdateChannel(channel) => {
+                // Only the two names; anything else means "the default".
+                let channel = if matches!(channel.as_str(), "beta" | "stable") {
+                    channel
+                } else {
+                    String::new()
+                };
+                self.update_settings(|settings| settings.update_channel = channel)
             }
             DaemonCommand::SetRingOnComputer(on) => {
                 self.update_settings(|settings| settings.ring_on_computer = on)

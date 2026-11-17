@@ -6,7 +6,7 @@ The first public release. It works and is still being shaped: expect rough
 edges and please report them. LAN only: the away-from-home relay is built but
 switched off.
 
-- Update check core (`src/update/`): a signed-manifest check that can tell the app when a newer DeskLink exists. It never downloads or installs anything and sends no identifier; it does nothing in a build without an update address. Top-bar interface 11 adds the read-only `update_available`, `update_version`, `update_required` and `ShowUpdate()`.
+- Update check (`src/update/`, `src/window/updates/`): once a day DeskLink fetches one signed manifest to learn whether a newer version exists and shows a popup when you open it, with how to update for the way you installed it (a command to copy, or the download page). It never downloads or installs anything and sends no identifier; it does nothing in a build without an update address. Settings, Advanced has Check for updates, Check automatically, the channel and Skipped with Undo. Top-bar interface 11 adds the read-only `update_available`, `update_version`, `update_required` and `ShowUpdate()`.
 
 **What it does**
 

@@ -63,13 +63,6 @@ pub(crate) enum Channel {
 }
 
 impl Channel {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Channel::Beta => "beta",
-            Channel::Stable => "stable",
-        }
-    }
-
     /// The stored choice, else the line's default: beta for 0.x, stable from 1.0.
     pub(crate) fn chosen(stored: &str, installed: Version) -> Channel {
         match stored {

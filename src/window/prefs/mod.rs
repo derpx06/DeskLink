@@ -834,7 +834,7 @@ fn icon_square(icon: &str, _size: i32, _class: &str) -> gtk::CenterBox {
     ui_kit::icon_square(name, tone)
 }
 
-fn with_icon(row: &impl IsA<adw::ActionRow>, icon: &str) {
+pub(in crate::window) fn with_icon(row: &impl IsA<adw::ActionRow>, icon: &str) {
     row.add_prefix(&icon_square(icon, 30, "row-icon"));
 }
 

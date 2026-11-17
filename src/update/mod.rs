@@ -22,9 +22,6 @@
 //! properties) and `window::updates` (the popup and the Settings rows).
 //! Nothing here knows a phone, a pairing or an identity.
 
-// Phase 1 ships the model before its UI; `window::updates` uses the rest.
-#![allow(dead_code)]
-
 mod engine;
 mod fetch;
 mod install_source;

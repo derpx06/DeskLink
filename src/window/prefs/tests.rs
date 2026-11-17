@@ -210,6 +210,8 @@ fn each_settings_group_holds_the_rows_the_contract_lists() {
             // a setting, so the contract does not list it.
             let mut shown_rows = row_titles(group);
             shown_rows.retain(|row| row != "Away from home");
+            // The update controls are desk-only and not part of the contract.
+            shown_rows.retain(|row| !crate::window::updates::is_update_row(row));
             assert_eq!(&shown_rows, rows, "rows of {title}");
         }
     });

@@ -24,7 +24,11 @@ pub(super) fn call(
         "ShowUpdate" => {
             // No arguments, nothing read from the caller, nothing started:
             // it only brings DeskLink's window (and its update popup) up.
-            let _ = main_window(app);
+            // With no update on offer (or no update service in this build)
+            // it only brings the window up. One request keeps one wait.
+            if let Some(window) = main_window(app).and_downcast::<crate::DesklinkWindow>() {
+                crate::window::show_requested(&window);
+            }
             Ok(())
         }
         "SeekMedia" => {

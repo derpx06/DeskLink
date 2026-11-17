@@ -67,6 +67,10 @@ pub(super) fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gt
         .valign(gtk::Align::Center)
         .build();
     info.append(&hero_name(&device.name));
+    // One muted line when the phone runs a different DeskLink (informational).
+    if let Some(line) = crate::window::updates::skew_line(device) {
+        info.append(&text(&line, &["dl-secondary", "dl-caption"]));
+    }
     // The pill and its detail. The round trip changes every reading and is
     // set in place (`show_round_trip`), so it is not part of the detail.
     let steady = DeviceView {

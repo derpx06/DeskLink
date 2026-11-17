@@ -21,7 +21,6 @@ mod sim;
 mod strict;
 
 pub(super) const NOW: u64 = 1_795_003_600;
-pub(super) const HOST: &str = "desklink-updates.web.app";
 
 pub(super) fn fixture_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/update")

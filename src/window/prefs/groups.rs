@@ -77,6 +77,11 @@ pub(super) fn groups(
     advanced.add(&system_check_row());
     advanced.add(&logs_row());
     advanced.add(&about_row());
+    for row in
+        crate::window::updates::updates_rows(daemon, settings, crate::window::updates::main_window)
+    {
+        advanced.add(&row);
+    }
 
     // The group titles are fixed (see GROUPS); calls and sound build theirs.
     calls.set_title(&glib::markup_escape_text(GROUPS[3]));
@@ -181,6 +186,11 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>, daemon: &DaemonHandle)
     advanced.add(&system_check_row());
     advanced.add(&logs_row());
     advanced.add(&about_row());
+    for row in
+        crate::window::updates::updates_rows(daemon, &settings, crate::window::updates::main_window)
+    {
+        advanced.add(&row);
+    }
     page.add(&advanced);
     dialog.add(&page);
     dialog.present(Some(parent));

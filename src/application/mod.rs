@@ -774,7 +774,22 @@ fn present_window(window: &impl IsA<gtk::Window>) {
     if let Some(token) = take_activation_token(std::time::Instant::now()) {
         window.set_startup_id(&token);
     }
+    // A window shown after it was hidden (or for the first time) is an
+    // "open": the update popup may show (never on a mere focus change). Every
+    // way the window comes up passes here (launcher, tray, a notification
+    // click, a `tel:` link, D-Bus activation), so all count as opening
+    // DeskLink; the login service (`--gapplication-service`) never presents
+    // the window and so never does. See `window::updates::coordinator`.
+    let opened = !gtk::prelude::WidgetExt::is_visible(window.upcast_ref::<gtk::Window>());
     window.present();
+    if opened {
+        if let Some(main) = window
+            .upcast_ref::<gtk::Window>()
+            .downcast_ref::<DesklinkWindow>()
+        {
+            crate::window::on_window_presented(main);
+        }
+    }
 }
 
 /// Keeps the notification server's `ActivationToken` (sent just before its

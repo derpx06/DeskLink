@@ -871,6 +871,8 @@ window.unfocused .ob-scene * { animation: none; }
    under the name (the line that says what to do) below 4.5:1. */
 :not(row).dl-unavailable > *, row.dl-unavailable .title, row.dl-unavailable .dl-icon-square { opacity: 0.45; }
 row.dl-unavailable .subtitle { opacity: 1; color: @dl_text_dim; }
+/* The note under the update controls: smaller than a row's own line. */
+row.dl-update-note .subtitle { font-size: 0.87em; }
 /* A filled or tonal button dims as a whole: dimming only its words left the
    accent fill reading as ready. */
 .dl-btn.dl-unavailable { opacity: 0.45; }

@@ -294,6 +294,7 @@ impl<F: Fetch> Engine<F> {
         self.installed
     }
 
+    #[cfg(test)]
     pub(super) fn set_installed(&mut self, version: Version) {
         self.installed = version;
         self.tidy();

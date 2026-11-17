@@ -81,12 +81,4 @@ impl Url {
     pub(super) fn is_loopback(&self) -> bool {
         self.host == "localhost" || self.host == "127.0.0.1"
     }
-
-    pub(super) fn text(&self) -> String {
-        let scheme = if self.https { "https" } else { "http" };
-        match self.port {
-            Some(port) => format!("{scheme}://{}:{port}{}", self.host, self.target),
-            None => format!("{scheme}://{}{}", self.host, self.target),
-        }
-    }
 }
