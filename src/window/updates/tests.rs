@@ -371,18 +371,6 @@ mod open_state {
     }
 
     #[test]
-    fn the_same_open_asked_again_does_nothing() {
-        let mut state = State::default();
-        let fresh = snapshot(Status::Idle, Decision::Available(offer()), Some(10));
-        let (id, _) = state.open(&fresh, false);
-        assert_eq!(
-            state.again(id, &fresh, false),
-            Step::Nothing,
-            "claimed before it was planned"
-        );
-    }
-
-    #[test]
     fn a_hidden_window_or_a_busy_screen_or_a_late_answer_show_nothing() {
         let mut state = State::default();
         let stale = snapshot(Status::Idle, Decision::UpToDate, Some(999_999));
@@ -453,12 +441,13 @@ mod open_state {
 // ---- the buttons, on a real dialog (needs a display) -----------------------
 
 mod clicks {
-    use super::super::coordinator::{blocked, present_popup};
+    use super::super::coordinator::{blocked, present_popup, presented_with, Ports};
     use super::super::dialog::Sink;
     use super::super::model::popup;
     use crate::update::{Command, Component, Family, Source, Version};
     use crate::window::DesklinkWindow;
     use adw::prelude::*;
+    use adw::subclass::prelude::ObjectSubclassIsExt;
     use gtk::{gio, glib};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -483,6 +472,21 @@ mod clicks {
             while context.iteration(false) {}
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// Runs the main loop until `condition` holds (or 8 s pass): a closing
+    /// dialog animates, so a fixed number of iterations is a flake.
+    fn until(condition: impl Fn() -> bool) -> bool {
+        let context = glib::MainContext::default();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < end {
+            while context.iteration(false) {}
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        condition()
     }
 
     fn walk(widget: &gtk::Widget, found: &mut Vec<gtk::Widget>) {
@@ -517,6 +521,40 @@ mod clicks {
             .cloned()
     }
 
+    static CRITICALS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Counts GTK and libadwaita criticals and warnings (an invalid
+    /// accessible role, a bad property) while a test runs.
+    fn watch_criticals() -> Vec<(String, glib::LogHandlerId)> {
+        CRITICALS.lock().unwrap().clear();
+        ["Gtk", "Adwaita", "Gdk"]
+            .iter()
+            .map(|domain| {
+                let id = glib::log_set_handler(
+                    Some(domain),
+                    glib::LogLevels::LEVEL_CRITICAL | glib::LogLevels::LEVEL_WARNING,
+                    false,
+                    false,
+                    |domain, _, message| {
+                        CRITICALS
+                            .lock()
+                            .unwrap()
+                            .push(format!("{domain:?}: {message}"));
+                    },
+                );
+                (domain.to_string(), id)
+            })
+            .collect()
+    }
+
+    fn assert_no_criticals(handlers: Vec<(String, glib::LogHandlerId)>) {
+        for (domain, id) in handlers {
+            glib::log_remove_handler(Some(&domain), id);
+        }
+        let seen = CRITICALS.lock().unwrap().clone();
+        assert!(seen.is_empty(), "GTK complained: {seen:?}");
+    }
+
     fn setup() -> (
         DesklinkWindow,
         adw::Application,
@@ -528,7 +566,11 @@ mod clicks {
         let app = adw::Application::builder()
             .application_id("derx06.desklink.com.test")
             .build();
+        // Started, so a window may be added to it.
+        let _ = app.register(gio::Cancellable::NONE);
         let window = DesklinkWindow::new(&app);
+        // The first-run tour is decided: nothing here waits for it.
+        window.imp().onboarding_decided.set(true);
         window.present();
         pump();
         let sent: Rc<RefCell<Vec<Command>>> = Rc::default();
@@ -550,6 +592,7 @@ mod clicks {
     #[test]
     fn remind_me_and_escape_snooze_and_skip_does_not() {
         crate::test_display::run(|| {
+            let watching = watch_criticals();
             let (window, _app, sent, sink) = setup();
             // Remind me tomorrow.
             let dialog = present_popup(&window, model(false), sink.clone());
@@ -569,7 +612,11 @@ mod clicks {
             let dialog = present_popup(&window, model(false), sink.clone());
             pump();
             dialog.close();
-            pump();
+            drop(dialog);
+            assert!(
+                until(|| !blocked(&window)),
+                "Escape left the screen blocked"
+            );
             assert!(matches!(sent.borrow().as_slice(), [Command::Snooze(_)]));
             // Skip: exactly one Skip, and no snooze behind it.
             sent.borrow_mut().clear();
@@ -582,12 +629,14 @@ mod clicks {
                 "{:?}",
                 sent.borrow()
             );
+            assert_no_criticals(watching);
         });
     }
 
     #[test]
     fn the_required_popup_has_one_button_no_cross_and_closes_silently() {
         crate::test_display::run(|| {
+            let watching = watch_criticals();
             let (window, _app, sent, sink) = setup();
             let dialog = present_popup(&window, model(true), sink);
             pump();
@@ -603,14 +652,20 @@ mod clicks {
             assert!(!bar.shows_end_title_buttons(), "no close cross");
             // Escape still leaves, for this open only: nothing is sent.
             dialog.close();
-            pump();
+            drop(dialog);
+            assert!(
+                until(|| !blocked(&window)),
+                "Escape on Required left the screen blocked"
+            );
             assert!(sent.borrow().is_empty(), "{:?}", sent.borrow());
+            assert_no_criticals(watching);
         });
     }
 
     #[test]
     fn copy_puts_exactly_the_static_command_on_the_clipboard() {
         crate::test_display::run(|| {
+            let watching = watch_criticals();
             let (window, _app, _sent, sink) = setup();
             let dialog = present_popup(&window, model(false), sink);
             pump();
@@ -625,7 +680,107 @@ mod clicks {
                 value.get::<String>().unwrap(),
                 "sudo apt update && sudo apt install --only-upgrade desklink"
             );
-            assert!(button(&dialog, "Done").is_some());
+            // Done after the guidance closes it, snoozes, and frees the screen.
+            let done = button(&dialog, "Done").unwrap();
+            done.emit_clicked();
+            drop(done);
+            drop(dialog);
+            assert!(until(|| !blocked(&window)), "Done left the screen blocked");
+            assert_no_criticals(watching);
+        });
+    }
+
+    fn fake_ports(sink: Sink) -> Ports {
+        use crate::update::{Channel, Decision, Snapshot, Status};
+        let snapshot = Snapshot {
+            status: Status::Idle,
+            last_check: Status::Idle,
+            decision: Decision::Available(offer()),
+            manual_decision: Decision::Available(offer()),
+            installed: Version(0, 3, 0),
+            channel: Channel::Beta,
+            last_checked: 1,
+            cache_age: Some(10),
+            skipped: None,
+            generation: 0,
+        };
+        Ports {
+            snapshot: Rc::new(move || Some(snapshot.clone())),
+            sink,
+        }
+    }
+
+    fn dialogs(window: &DesklinkWindow) -> u32 {
+        window.dialogs().n_items()
+    }
+
+    /// The real path: an open shows one popup; a second open while it is up
+    /// shows none; after Remind me the next open shows one again; and two
+    /// opens before the first popup is put up show one popup, not two.
+    #[test]
+    fn each_open_shows_one_popup_and_never_a_second_on_top() {
+        crate::test_display::run(|| {
+            let watching = watch_criticals();
+            let (window, _app, sent, sink) = setup();
+            let ports = fake_ports(sink);
+            presented_with(&window, &ports);
+            assert!(until(|| blocked(&window)), "the open showed no popup");
+            assert_eq!(dialogs(&window), 1);
+            // A second open while it is up: nothing stacks on it.
+            presented_with(&window, &ports);
+            for _ in 0..20 {
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(dialogs(&window), 1, "a popup landed on a popup");
+            // Remind me tomorrow, then the next open shows again.
+            let dialog = {
+                let mut all = Vec::new();
+                walk(window.upcast_ref(), &mut all);
+                all.iter()
+                    .find_map(|w| w.downcast_ref::<adw::Dialog>().cloned())
+                    .expect("the popup")
+            };
+            button(&dialog, "Remind me tomorrow")
+                .unwrap()
+                .emit_clicked();
+            drop(dialog);
+            assert!(
+                until(|| !blocked(&window)),
+                "Remind me left the screen blocked"
+            );
+            assert!(matches!(sent.borrow().as_slice(), [Command::Snooze(_)]));
+            presented_with(&window, &ports);
+            assert!(
+                until(|| blocked(&window)),
+                "the next open showed nothing after a dismissal"
+            );
+            // Two opens in one go (hide and show at once): one popup.
+            if let Some(dialog) = window.visible_dialog() {
+                dialog.close();
+            }
+            assert!(until(|| !blocked(&window)));
+            presented_with(&window, &ports);
+            presented_with(&window, &ports);
+            assert!(until(|| blocked(&window)));
+            for _ in 0..30 {
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(dialogs(&window), 1, "a stale open showed a second popup");
+            // A window hidden before the popup is due gets none.
+            if let Some(dialog) = window.visible_dialog() {
+                dialog.close();
+            }
+            assert!(until(|| !blocked(&window)));
+            presented_with(&window, &ports);
+            window.set_visible(false);
+            for _ in 0..30 {
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(dialogs(&window), 0, "a hidden window got a popup");
+            assert_no_criticals(watching);
         });
     }
 }

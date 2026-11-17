@@ -27,6 +27,7 @@ use crate::update::{
     OpenInput, OpenPlan, Snapshot, Status, FORCED_WAIT_SECS, OPEN_BUDGET_MS,
 };
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// What an open does next.
@@ -91,25 +92,6 @@ impl State {
         self.current == id
     }
 
-    /// The same open asked again: nothing (the id was claimed already).
-    #[cfg(test)]
-    pub(super) fn again(&self, id: u64, snapshot: &Snapshot, blocked: bool) -> Step {
-        let input = OpenInput {
-            open_id: id,
-            decided_open: self.guard.decided(),
-            active: true,
-            cached: snapshot.decision.clone(),
-            cache_age: snapshot.cache_age,
-            blocked,
-            forced: false,
-        };
-        match plan_open(&input) {
-            OpenPlan::Show { required } => Step::Show { required },
-            OpenPlan::Refresh => Step::Refresh,
-            _ => Step::Nothing,
-        }
-    }
-
     /// The refresh of open `id` ended: `answered_ms` is when its answer came
     /// (`None` when it failed). A stale open, a hidden window or a busy
     /// screen show nothing.
@@ -138,17 +120,57 @@ thread_local! {
     static REQUEST: Cell<u64> = const { Cell::new(0) };
 }
 
+/// Where the coordinator reads the update state and sends its commands: the
+/// update service in the app, fakes in the tests.
+#[derive(Clone)]
+pub(super) struct Ports {
+    pub(super) snapshot: Rc<dyn Fn() -> Option<Snapshot>>,
+    pub(super) sink: Sink,
+}
+
+fn app_ports() -> Option<Ports> {
+    handle()?;
+    Some(Ports {
+        snapshot: Rc::new(|| handle().map(|h| h.snapshot())),
+        sink: dialog::app_sink(),
+    })
+}
+
+/// Whether this popup is up now (not merely not yet freed).
+fn popup_showing() -> bool {
+    SHOWING.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|d| d.upgrade())
+            .is_some_and(|d| d.is_mapped() || d.parent().is_some())
+    })
+}
+
 /// Whether the screen is not free: another dialog (a pairing or transfer
 /// prompt, a permission dialog, Settings...), the first-run tour, or this
 /// popup already.
 pub(super) fn blocked(window: &DesklinkWindow) -> bool {
     window.visible_dialog().is_some()
         || window.imp().onboarding.borrow().is_some()
-        || SHOWING.with(|s| s.borrow().as_ref().and_then(|d| d.upgrade()).is_some())
+        || popup_showing()
+}
+
+/// Puts the popup up and remembers it, so nothing stacks on it; forgotten
+/// again the moment it closes.
+pub(super) fn present_popup(
+    window: &DesklinkWindow,
+    model: super::model::Popup,
+    sink: Sink,
+) -> adw::Dialog {
+    let dialog = dialog::present(window, model, sink);
+    SHOWING.with(|s| *s.borrow_mut() = Some(dialog.downgrade()));
+    dialog.connect_closed(|_| SHOWING.with(|s| *s.borrow_mut() = None));
+    dialog
 }
 
 fn show_decision(
     window: &DesklinkWindow,
+    ports: &Ports,
     snapshot: &Snapshot,
     decision: &Decision,
     required: bool,
@@ -158,52 +180,82 @@ fn show_decision(
     };
     let source = detect_source(&Env::detect());
     let beta = snapshot.channel == Channel::Beta;
-    let model = popup_model(component, snapshot.installed, beta, required, source);
-    present_popup(window, model, dialog::app_sink());
+    present_popup(
+        window,
+        popup_model(component, snapshot.installed, beta, required, source),
+        ports.sink.clone(),
+    );
 }
 
-/// Puts the popup up and remembers it, so nothing stacks on it.
-pub(super) fn present_popup(
+/// Shows the popup of open `open_id` once the screen is ready: on a cold
+/// start the first-run tour is decided a moment after the window comes up,
+/// so this waits (up to 5 s) for that decision rather than landing over the
+/// tour. It shows nothing if a newer open began, the window was hidden again
+/// or the screen is busy.
+fn show_when_ready(
     window: &DesklinkWindow,
-    model: super::model::Popup,
-    sink: Sink,
-) -> adw::Dialog {
-    let dialog = dialog::present(window, model, sink);
-    SHOWING.with(|s| *s.borrow_mut() = Some(dialog.downgrade()));
-    dialog
+    ports: &Ports,
+    open_id: u64,
+    snapshot: Snapshot,
+    decision: Decision,
+    required: bool,
+) {
+    let window = window.clone();
+    let ports = ports.clone();
+    let mut waited = 0u64;
+    let attempt = move || {
+        if !STATE.with(|s| s.borrow().is_current(open_id)) || !window.is_visible() {
+            return glib::ControlFlow::Break;
+        }
+        if !window.imp().onboarding_decided.get() && waited < 5_000 {
+            waited += 100;
+            return glib::ControlFlow::Continue;
+        }
+        if !blocked(&window) {
+            show_decision(&window, &ports, &snapshot, &decision, required);
+        }
+        glib::ControlFlow::Break
+    };
+    glib::idle_add_local_once({
+        let mut attempt = attempt;
+        move || {
+            if let glib::ControlFlow::Continue = attempt() {
+                glib::timeout_add_local(Duration::from_millis(100), attempt);
+            }
+        }
+    });
 }
 
 /// The window was shown after being hidden, or for the first time: an open.
 pub(crate) fn on_window_presented(window: &DesklinkWindow) {
-    let Some(update) = handle() else { return };
-    let snapshot = update.snapshot();
+    if let Some(ports) = app_ports() {
+        presented_with(window, &ports);
+    }
+}
+
+pub(super) fn presented_with(window: &DesklinkWindow, ports: &Ports) {
+    let Some(snapshot) = (ports.snapshot)() else {
+        return;
+    };
     let (open_id, step) = STATE.with(|s| s.borrow_mut().open(&snapshot, blocked(window)));
     match step {
         Step::Nothing => {}
         Step::Show { required } => {
-            // After the window has been put up, so the popup lands over it.
-            let window = window.clone();
-            glib::idle_add_local_once(move || {
-                let current = STATE.with(|s| s.borrow().is_current(open_id));
-                if current && window.is_visible() && !blocked(&window) {
-                    show_decision(&window, &snapshot, &snapshot.decision.clone(), required);
-                }
-            });
+            let decision = snapshot.decision.clone();
+            show_when_ready(window, ports, open_id, snapshot, decision, required);
         }
         Step::Refresh => {
             let before = snapshot.generation;
-            let sink: Sink = dialog::app_sink();
-            sink(Command::Check { manual: false });
+            (ports.sink)(Command::Check { manual: false });
             let started = Instant::now();
-            let window = window.clone();
+            let (window, ports) = (window.clone(), ports.clone());
             glib::timeout_add_local(Duration::from_millis(100), move || {
                 if !STATE.with(|s| s.borrow().is_current(open_id)) || !window.is_visible() {
                     return glib::ControlFlow::Break;
                 }
-                let Some(update) = handle() else {
+                let Some(now) = (ports.snapshot)() else {
                     return glib::ControlFlow::Break;
                 };
-                let now = update.snapshot();
                 let waited = started.elapsed().as_millis() as u64;
                 if now.generation == before && waited <= OPEN_BUDGET_MS {
                     return glib::ControlFlow::Continue;
@@ -227,7 +279,8 @@ pub(crate) fn on_window_presented(window: &DesklinkWindow) {
                     )
                 });
                 if let Step::Show { required } = step {
-                    show_decision(&window, &now, &now.decision.clone(), required);
+                    let decision = now.decision.clone();
+                    show_when_ready(&window, &ports, open_id, now, decision, required);
                 }
                 glib::ControlFlow::Break
             });
@@ -238,10 +291,17 @@ pub(crate) fn on_window_presented(window: &DesklinkWindow) {
 /// An explicit request: the top bar's row, or a manual check that found
 /// something. Shows now (as a manual check reads the cache), never over
 /// another dialog: it waits for that one for up to 30 s. A newer request
-/// retires the older one's wait, so there is only ever one. With no update
-/// service (or nothing on offer) it does nothing.
+/// retires the older one's wait, so there is only ever one; a popup that is
+/// already up satisfies the request. With no update service (or nothing on
+/// offer) it does nothing.
 pub(crate) fn show_requested(window: &DesklinkWindow) {
-    if handle().is_none() {
+    if let Some(ports) = app_ports() {
+        requested_with(window, &ports);
+    }
+}
+
+pub(super) fn requested_with(window: &DesklinkWindow, ports: &Ports) {
+    if popup_showing() {
         return;
     }
     let token = REQUEST.with(|r| {
@@ -249,15 +309,14 @@ pub(crate) fn show_requested(window: &DesklinkWindow) {
         r.get()
     });
     let started = Instant::now();
-    let window = window.clone();
+    let (window, ports) = (window.clone(), ports.clone());
     let attempt = move || {
-        if REQUEST.with(Cell::get) != token {
+        if REQUEST.with(Cell::get) != token || popup_showing() {
             return glib::ControlFlow::Break;
         }
-        let Some(update) = handle() else {
+        let Some(snapshot) = (ports.snapshot)() else {
             return glib::ControlFlow::Break;
         };
-        let snapshot = update.snapshot();
         let input = OpenInput {
             open_id: 0,
             decided_open: None,
@@ -271,6 +330,7 @@ pub(crate) fn show_requested(window: &DesklinkWindow) {
             OpenPlan::Show { required } => {
                 show_decision(
                     &window,
+                    &ports,
                     &snapshot,
                     &snapshot.manual_decision.clone(),
                     required,

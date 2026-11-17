@@ -214,11 +214,7 @@ fn channel_row(
                 "beta"
             };
             daemon.send(DaemonCommand::SetUpdateChannel(name.to_string()));
-            glib::timeout_add_local_once(Duration::from_millis(400), || {
-                if let Some(update) = crate::update::handle() {
-                    update.send(Command::Settings);
-                }
-            });
+            poke_when_saved(move |settings| settings.update_channel == name);
         });
     }
     row

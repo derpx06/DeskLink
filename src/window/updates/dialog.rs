@@ -144,10 +144,12 @@ fn guidance_panel(
             Some("desklink-content-copy-symbolic"),
         );
         copy.set_halign(gtk::Align::Start);
-        let (toasts, command) = (toasts.clone(), command.to_string());
+        let (toasts, command) = (toasts.downgrade(), command.to_string());
         copy.connect_clicked(move |button| {
             button.clipboard().set_text(&command);
-            toasts.add_toast(ui_kit::toast(super::words::COMMAND_COPIED));
+            if let Some(toasts) = toasts.upgrade() {
+                toasts.add_toast(ui_kit::toast(super::words::COMMAND_COPIED));
+            }
             button.update_property(&[gtk::accessible::Property::Label(&format!(
                 "{}. {}",
                 super::words::COPY_COMMAND,
@@ -258,18 +260,24 @@ pub(super) fn present(window: &DesklinkWindow, model: Popup, sink: Sink) -> adw:
         let later_row = gtk::Box::builder().spacing(8).homogeneous(true).build();
         let later = ui_kit::button(ButtonKind::Tonal, super::words::REMIND_TOMORROW, None);
         let skip = ui_kit::button(ButtonKind::Text, super::words::SKIP_VERSION, None);
+        // Handlers hold the dialog weakly: a strong reference from a child
+        // widget to its own dialog is a cycle that keeps a closed popup alive.
         later.connect_clicked({
-            let dialog = dialog.clone();
+            let dialog = dialog.downgrade();
             move |_| {
-                dialog.close();
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
             }
         });
         skip.connect_clicked({
-            let (dialog, acted, sink) = (dialog.clone(), acted.clone(), sink.clone());
+            let (dialog, acted, sink) = (dialog.downgrade(), acted.clone(), sink.clone());
             move |_| {
                 acted.set(true);
                 sink(Command::Skip(version));
-                dialog.close();
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
             }
         });
         later_row.append(&later);
@@ -278,17 +286,27 @@ pub(super) fn present(window: &DesklinkWindow, model: Popup, sink: Sink) -> adw:
     }
     stack.add_named(&main, Some("main"));
     let (panel, after_swap) = guidance_panel(&model, &plan, &toasts, {
-        let dialog = dialog.clone();
+        let dialog = dialog.downgrade();
         move || {
-            dialog.close();
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
         }
     });
     stack.add_named(&panel, Some("how"));
     how.connect_clicked({
-        let (stack, dialog) = (stack.clone(), dialog.clone());
+        let (stack, dialog, after_swap) = (
+            stack.downgrade(),
+            dialog.downgrade(),
+            after_swap.downgrade(),
+        );
         move |_| {
-            stack.set_visible_child_name("how");
-            dialog.set_focus(Some(&after_swap));
+            if let (Some(stack), Some(dialog), Some(after_swap)) =
+                (stack.upgrade(), dialog.upgrade(), after_swap.upgrade())
+            {
+                stack.set_visible_child_name("how");
+                dialog.set_focus(Some(&after_swap));
+            }
         }
     });
     content.append(&stack);
