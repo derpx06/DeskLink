@@ -733,26 +733,41 @@ fn a_stale_leaving_report_does_not_survive_a_new_link() {
     let _ = phone;
 }
 
-/// CONC-3: the send after the preflight takes a fresh snapshot (the session
-/// may have been replaced while the preflight waited). Pinned by the source:
-/// the preflight line is followed by a new `for_device`, and a transfer's
-/// `queue_send` reassigns its transport after the preflight.
+/// CONC-3: the send after the preflight takes a fresh snapshot: the session is
+/// replaced INSIDE the preflight (the phone reconnected while it waited), and
+/// the send must see the current binding, not the one from before the wait.
 #[test]
-fn the_send_after_the_preflight_uses_a_fresh_snapshot() {
-    let commands = include_str!("../commands.rs");
-    let at = commands.find("transport.preflight()?;").expect("preflight");
-    assert!(
-        commands[at..].contains("FeatureTransport::for_device(&self.sessions, device_id)")
-            && commands[at..].find("FeatureTransport::for_device").unwrap()
-                < commands[at..].find("f(&fresh)").unwrap()
-            || commands[at..].contains(".and_then(|fresh| f(&fresh))"),
-        "with_feature_transport re-takes the snapshot after the wait"
+fn the_send_after_the_preflight_sees_the_session_replaced_during_it() {
+    use crate::device_links::core::SessionLink;
+    let sessions = Arc::new(crate::device_links::core::DeviceManager::new());
+    let register = || {
+        sessions
+            .register_link(
+                "phone-x".into(),
+                SessionLink::test_placeholder("phone-x"),
+                true,
+            )
+            .unwrap()
+            .binding
+    };
+    let first = register();
+    let mut seen = None;
+    let result = super::super::commands::run_on_fresh_transport_for_test(
+        &sessions,
+        "phone-x",
+        |_| {
+            register();
+            Ok(())
+        },
+        |transport| {
+            seen = Some(transport.binding().generation);
+            Ok(())
+        },
     );
-    let files = include_str!("../file_transfer.rs");
-    let at = files.find("transport.preflight()").expect("preflight");
+    assert_eq!(result, Ok(()));
     assert!(
-        files[at..].contains("transport = fresh"),
-        "queue_send re-takes it too"
+        seen.unwrap() > first.generation,
+        "the send ran on the old snapshot"
     );
 }
 

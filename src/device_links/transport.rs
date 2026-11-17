@@ -37,6 +37,11 @@ pub(crate) fn should_surface_send_error(error: &str) -> bool {
 pub(crate) const NOT_REACHABLE: &str =
     "Can't reach the phone. Check that it's on and on your network.";
 
+/// Serialises ready sends against queue flushes (see [`FeatureTransport::send`]
+/// and [`FeatureTransport::flush_queue`]): global, held only for a check and a
+/// channel write.
+static SEND_ORDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// What a send on a feature-ready link does.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReadySend {
@@ -50,11 +55,35 @@ pub(crate) enum ReadySend {
 }
 
 pub(crate) fn ready_send_plan(quiet: bool, queue_waiting: bool, has_payload: bool) -> ReadySend {
-    match (quiet || queue_waiting, has_payload) {
-        (false, _) => ReadySend::Now,
-        (true, false) => ReadySend::Queue,
-        (true, true) => ReadySend::Refuse,
+    match (quiet, queue_waiting, has_payload) {
+        // A quiet link: a feature waits, a file payload is refused (its own path).
+        (true, _, false) => ReadySend::Queue,
+        (true, _, true) => ReadySend::Refuse,
+        // A queue still draining on a healthy link: a feature goes behind it
+        // (order); a payload is not part of that order and goes now.
+        (false, true, false) => ReadySend::Queue,
+        (false, _, _) => ReadySend::Now,
     }
+}
+
+/// Sends `queued` in order through `send` while the link is not `quiet`;
+/// from the first quiet check or failed send on, the rest are returned with
+/// their original times (nothing is sent past a gap, nothing is lost).
+pub(crate) fn drain_in_order<T>(
+    queued: Vec<(std::time::Instant, T)>,
+    mut quiet: impl FnMut() -> bool,
+    mut send: impl FnMut(&T) -> Result<(), String>,
+) -> Vec<(std::time::Instant, T)> {
+    let mut left = Vec::new();
+    let mut stopped = false;
+    for (at, packet) in queued {
+        if !stopped && !quiet() && send(&packet).is_ok() {
+            continue;
+        }
+        stopped = true;
+        left.push((at, packet));
+    }
+    left
 }
 
 /// Whether the click preflight does not apply: a peer that is not ready is the
@@ -162,6 +191,42 @@ impl FeatureTransport {
         }
     }
 
+    /// The binding this handle sends on.
+    pub(crate) fn binding(&self) -> &SessionBinding {
+        &self.snapshot.binding
+    }
+
+    /// Sends what was queued (during the handover, or while the link was
+    /// quiet), in order, under the same lock as ready sends so nothing
+    /// overtakes it; what cannot go (the link went quiet again, a write
+    /// failed) goes back to the front with its original time.
+    pub(crate) fn flush_queue(&self) {
+        let _order = SEND_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let queued = self
+            .sessions
+            .take_pending_features_stamped(&self.snapshot.binding);
+        if queued.is_empty() {
+            return;
+        }
+        let left = drain_in_order(
+            queued,
+            || self.is_quiet(),
+            |packet| {
+                crate::device_links::webrtc::coordinator::send_feature_packet(
+                    &self.sessions,
+                    &self.snapshot,
+                    packet,
+                )
+                .inspect_err(|error| {
+                    eprintln!("[DeskLink] Queued {} not sent: {error}", packet.packet_type);
+                })
+            },
+        );
+        if !left.is_empty() {
+            let _ = self.sessions.requeue_front(&self.snapshot.binding, left);
+        }
+    }
+
     pub(crate) fn is_ready(&self) -> bool {
         self.snapshot.web_rtc_ready && self.sessions.is_current(&self.snapshot.binding)
     }
@@ -179,6 +244,9 @@ impl FeatureTransport {
             // order) and goes out when the phone answers again. A user's click
             // never gets here quiet: its preflight failed first. Packets with a
             // payload (files) have their own path and are refused.
+            // One order for every ready send and every flush: a send that checks
+            // for a waiting queue and a flush that drains it cannot interleave.
+            let _order = SEND_ORDER.lock().unwrap_or_else(|e| e.into_inner());
             let waiting = self
                 .sessions
                 .has_pending_features(&self.snapshot.binding)
@@ -583,6 +651,85 @@ mod tests {
         );
         assert_eq!(ready_send_plan(true, false, true), ReadySend::Refuse);
         assert_eq!(ready_send_plan(false, false, true), ReadySend::Now);
+    }
+
+    /// The flush, with a fake clock: nothing is sent past the first quiet
+    /// check or failed send; what is left comes back in order with its
+    /// original times, so the 30 s bound counts from the first queueing.
+    #[test]
+    fn a_flush_stops_at_the_first_gap_and_keeps_the_original_times() {
+        let base = std::time::Instant::now();
+        let at = |s: u64| base + std::time::Duration::from_secs(s);
+        let queued = vec![(at(0), "a"), (at(1), "b"), (at(2), "c"), (at(3), "d")];
+        let mut sent = Vec::new();
+        let mut checks = 0;
+        // Quiet from the third check on (the link went quiet again).
+        let left = drain_in_order(
+            queued.clone(),
+            || {
+                checks += 1;
+                checks >= 3
+            },
+            |packet| {
+                sent.push(*packet);
+                Ok(())
+            },
+        );
+        assert_eq!(sent, vec!["a", "b"]);
+        assert_eq!(left, vec![(at(2), "c"), (at(3), "d")]);
+        // A failed write stops it the same way (the failed one stays queued).
+        let mut sent = Vec::new();
+        let left = drain_in_order(
+            queued,
+            || false,
+            |packet| {
+                sent.push(*packet);
+                if *packet == "b" {
+                    Err("write failed".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(sent, vec!["a", "b"]);
+        assert_eq!(
+            left.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+            vec!["b", "c", "d"]
+        );
+        assert_eq!(left[0].0, at(1));
+        // Everything fine: nothing left.
+        assert!(drain_in_order(vec![(at(0), "x")], || false, |_| Ok(())).is_empty());
+    }
+
+    /// Requeued entries go back to the FRONT with their original times; the
+    /// 64 bound holds (the newest go first), the stamped drain keeps the times.
+    #[test]
+    fn requeued_entries_keep_their_place_and_their_time() {
+        let sessions = Arc::new(DeviceManager::new());
+        sessions
+            .register_link(
+                "phone-1".into(),
+                SessionLink::test_placeholder("phone-1"),
+                true,
+            )
+            .unwrap();
+        let binding = sessions.current_binding("phone-1").unwrap();
+        let early = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        let mut late = NetworkPacket::new(PACKET_TYPE_PING);
+        late.set("n", 2_i64);
+        sessions.queue_feature_while_quiet(&binding, late).unwrap();
+        let mut first = NetworkPacket::new(PACKET_TYPE_PING);
+        first.set("n", 1_i64);
+        sessions
+            .requeue_front(&binding, vec![(early, first)])
+            .unwrap();
+        let drained = sessions.take_pending_features_stamped(&binding);
+        let numbers: Vec<i64> = drained
+            .iter()
+            .map(|(_, p)| p.get_i64("n").unwrap())
+            .collect();
+        assert_eq!(numbers, vec![1, 2], "the requeued one stays in front");
+        assert_eq!(drained[0].0, early, "its first queueing time is kept");
     }
 
     /// The quiet queue is the handover queue: bounded to 64 (oldest out),

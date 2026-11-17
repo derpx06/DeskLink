@@ -846,16 +846,14 @@ impl DaemonWorker {
         device_id: &str,
         f: impl FnOnce(&FeatureTransport) -> Result<(), String>,
     ) -> bool {
-        let result =
-            FeatureTransport::for_device(&self.sessions, device_id).and_then(|transport| {
-                // Runs on the command thread, which may wait a moment for proof
-                // of life; the window's thread never does.
-                transport.preflight()?;
-                // The session may have been replaced while the preflight waited
-                // (the phone reconnected): the send takes a fresh snapshot, not
-                // the one from before the wait.
-                FeatureTransport::for_device(&self.sessions, device_id).and_then(|fresh| f(&fresh))
-            });
+        let result = run_on_fresh_transport(
+            &self.sessions,
+            device_id,
+            // Runs on the command thread, which may wait a moment for proof
+            // of life; the window's thread never does.
+            |transport| transport.preflight(),
+            f,
+        );
         let Err(error) = result else {
             return true;
         };
@@ -890,6 +888,32 @@ impl DaemonWorker {
         }
         false
     }
+}
+
+/// Takes a transport for `device_id`, runs `preflight` on it (it may wait),
+/// then runs `f` on a FRESH one: the session may have been replaced during
+/// the wait (the phone reconnected), and the old snapshot would fail the
+/// click as a recovery with no word.
+fn run_on_fresh_transport(
+    sessions: &Arc<crate::device_links::core::DeviceManager>,
+    device_id: &str,
+    preflight: impl FnOnce(&FeatureTransport) -> Result<(), String>,
+    f: impl FnOnce(&FeatureTransport) -> Result<(), String>,
+) -> Result<(), String> {
+    let transport = FeatureTransport::for_device(sessions, device_id)?;
+    preflight(&transport)?;
+    let fresh = FeatureTransport::for_device(sessions, device_id)?;
+    f(&fresh)
+}
+
+#[cfg(test)]
+pub(crate) fn run_on_fresh_transport_for_test(
+    sessions: &Arc<crate::device_links::core::DeviceManager>,
+    device_id: &str,
+    preflight: impl FnOnce(&FeatureTransport) -> Result<(), String>,
+    f: impl FnOnce(&FeatureTransport) -> Result<(), String>,
+) -> Result<(), String> {
+    run_on_fresh_transport(sessions, device_id, preflight, f)
 }
 
 /// How a failed user command is reported.

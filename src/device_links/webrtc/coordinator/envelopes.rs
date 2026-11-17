@@ -8,20 +8,11 @@
 
 use super::*;
 
-/// Sends, in order, the features queued while WebRTC was not ready.
+/// Sends, in order, the features queued while WebRTC was not ready or the
+/// link was quiet.
 pub(crate) fn flush_pending_features(binding: &SessionBinding, sessions: &Arc<DeviceManager>) {
-    let pending = sessions.take_pending_features(binding);
-    if pending.is_empty() {
-        return;
-    }
     match crate::device_links::transport::FeatureTransport::for_binding(sessions, binding) {
-        Ok(transport) => {
-            for packet in pending {
-                if let Err(error) = transport.send(&packet) {
-                    eprintln!("[DeskLink] Queued {} not sent: {error}", packet.packet_type);
-                }
-            }
-        }
+        Ok(transport) => transport.flush_queue(),
         Err(error) => eprintln!("[DeskLink] Queued features not sent: {error}"),
     }
 }

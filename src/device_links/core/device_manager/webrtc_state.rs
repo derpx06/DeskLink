@@ -203,12 +203,7 @@ impl DeviceManager {
             {
                 return false;
             }
-            if session.pending_features.len()
-                >= crate::device_links::core::device_session::PENDING_FEATURE_LIMIT
-            {
-                session.pending_features.pop_front();
-            }
-            session.pending_features.push_back((Instant::now(), packet));
+            push_pending(session, Instant::now(), packet);
             true
         })
     }
@@ -223,12 +218,27 @@ impl DeviceManager {
         packet: crate::device_links::packet::NetworkPacket,
     ) -> Result<(), SessionError> {
         self.with_session(binding, |session| {
-            if session.pending_features.len()
-                >= crate::device_links::core::device_session::PENDING_FEATURE_LIMIT
-            {
-                session.pending_features.pop_front();
+            push_pending(session, Instant::now(), packet);
+        })
+    }
+
+    /// Puts entries a flush could not send back at the FRONT, in order, with
+    /// their original times (the 30 s bound counts from the first queueing).
+    pub fn requeue_front(
+        &self,
+        binding: &SessionBinding,
+        entries: Vec<(Instant, crate::device_links::packet::NetworkPacket)>,
+    ) -> Result<(), SessionError> {
+        self.with_session(binding, |session| {
+            for entry in entries.into_iter().rev() {
+                session.pending_features.push_front(entry);
+                if session.pending_features.len()
+                    > crate::device_links::core::device_session::PENDING_FEATURE_LIMIT
+                {
+                    // Newer entries are the ones that go (the flush's entries are older).
+                    session.pending_features.pop_back();
+                }
             }
-            session.pending_features.push_back((Instant::now(), packet));
         })
     }
 
@@ -256,11 +266,23 @@ impl DeviceManager {
         })
     }
 
-    /// Drains the queue, dropping anything older than `PENDING_FEATURE_MAX_AGE`.
+    /// [`Self::take_pending_features_stamped`] without the times.
     pub fn take_pending_features(
         &self,
         binding: &SessionBinding,
     ) -> Vec<crate::device_links::packet::NetworkPacket> {
+        self.take_pending_features_stamped(binding)
+            .into_iter()
+            .map(|(_, packet)| packet)
+            .collect()
+    }
+
+    /// Drains the queue with each entry's first queueing time, dropping
+    /// anything older than `PENDING_FEATURE_MAX_AGE`.
+    pub fn take_pending_features_stamped(
+        &self,
+        binding: &SessionBinding,
+    ) -> Vec<(Instant, crate::device_links::packet::NetworkPacket)> {
         self.with_session(binding, |session| {
             session
                 .pending_features
@@ -273,7 +295,6 @@ impl DeviceManager {
                     }
                     fresh
                 })
-                .map(|(_, packet)| packet)
                 .collect()
         })
         .unwrap_or_default()
@@ -389,4 +410,24 @@ impl DeviceManager {
             Ok(())
         })?
     }
+}
+
+/// The one place the pending queue grows: bounded to `PENDING_FEATURE_LIMIT`
+/// (the oldest goes, and is logged), in order.
+fn push_pending(
+    session: &mut crate::device_links::core::device_session::DeviceSession,
+    at: Instant,
+    packet: crate::device_links::packet::NetworkPacket,
+) {
+    if session.pending_features.len()
+        >= crate::device_links::core::device_session::PENDING_FEATURE_LIMIT
+    {
+        if let Some((_, dropped)) = session.pending_features.pop_front() {
+            debug_log!(
+                "[DeskLink] Queue full: dropped the oldest queued {}",
+                dropped.packet_type
+            );
+        }
+    }
+    session.pending_features.push_back((at, packet));
 }
