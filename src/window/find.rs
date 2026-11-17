@@ -49,6 +49,9 @@ pub(super) fn search_this_page(window: &DesklinkWindow) {
     {
         if let Some(page) = imp.terminals.borrow().as_ref() {
             page.focus_search();
+            if let Some(entry) = visible_page_search(window) {
+                entry.select_region(0, -1);
+            }
             return;
         }
     }
