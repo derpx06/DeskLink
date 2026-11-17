@@ -112,7 +112,12 @@ fn gather(window: &DesklinkWindow) -> Sources {
                 super::unavailable_reason(device).map_or_else(
                     || "Connected".to_string(),
                     |_| {
-                        if device.status == crate::device_links::device::DeviceStatus::Paired {
+                        if device.status == crate::device_links::device::DeviceStatus::Paired
+                            && device.quiet
+                        {
+                            "Checking connection…".to_string()
+                        } else if device.status == crate::device_links::device::DeviceStatus::Paired
+                        {
                             "Connecting…".to_string()
                         } else {
                             "Offline".to_string()

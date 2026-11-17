@@ -28,6 +28,8 @@ pub(crate) enum LinkState {
     Relay,
     /// Pulsing: reachable, the encrypted connection still being set up.
     Connecting,
+    /// Pulsing: was connected, nothing heard for a few seconds; being checked.
+    Checking,
     /// Broken: not reachable.
     Offline,
 }
@@ -36,6 +38,7 @@ impl LinkState {
     pub(crate) fn of(device: &DeviceView) -> Self {
         match device.status {
             DeviceStatus::Paired if !device.feature_transport_ready => Self::Connecting,
+            DeviceStatus::Paired if device.quiet => Self::Checking,
             DeviceStatus::Paired => match shown_path(device) {
                 Some("turn") => Self::Relay,
                 _ => Self::Direct,
@@ -133,6 +136,12 @@ impl Presentation {
                 "Connecting…",
                 "Setting up a secure connection",
                 "Setting up",
+            ),
+            LinkState::Checking => make(
+                Status::Idle,
+                "Checking connection…",
+                "Not heard from for a moment",
+                "Checking",
             ),
             LinkState::Offline => Self {
                 status: Status::Err,
@@ -258,6 +267,15 @@ mod tests {
         phone.feature_transport_ready = true;
         phone.connection_path = Some("lan".into());
         assert_eq!(LinkState::of(&phone), LinkState::Direct);
+        // Silent for a few seconds: said so, not "Connected".
+        phone.quiet = true;
+        assert_eq!(LinkState::of(&phone), LinkState::Checking);
+        let words = Presentation::of(&phone);
+        assert_eq!(
+            (words.status, words.word),
+            (Status::Idle, "Checking connection…")
+        );
+        phone.quiet = false;
         let words = Presentation::of(&phone);
         assert_eq!((words.status, words.word), (Status::Ok, "Connected"));
         assert_eq!(words.detail, "over Wi-Fi");

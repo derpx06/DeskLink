@@ -20,11 +20,17 @@ export function lastSeen(device, now = new Date()) {
     return `last seen ${today ? time : `${seen.getDate()} ${MONTHS[seen.getMonth()]} ${time}`}`;
 }
 
+/// Ready, but the app says nothing has been heard for a few seconds
+/// (`quiet`; an old app never sends it, so it is only ever `=== true`).
+export const checking = device => !!device?.ready && device.quiet === true;
+
 /// "Connected · Wi-Fi · 82%, charging", "last seen 14:02", "Connecting…"
 /// (read out in accessible names, so words rather than a symbol).
 export function statusLine(device, now = new Date()) {
     if (!device)
         return 'No phone connected';
+    if (checking(device))
+        return 'Checking connection…';
     if (device.ready) {
         const parts = ['Connected'];
         if (ROUTE[device.path])
@@ -43,6 +49,8 @@ export function statusLine(device, now = new Date()) {
 export function headerLine(device, now = new Date()) {
     if (!device)
         return 'No phone connected';
+    if (checking(device))
+        return 'Checking connection…';
     if (device.ready) {
         const parts = ['Connected'];
         if (ROUTE[device.path])
@@ -58,6 +66,8 @@ export function headerLine(device, now = new Date()) {
 export function shortStatus(device, now = new Date()) {
     if (!device)
         return statusLine(device, now);
+    if (checking(device))
+        return 'Checking connection…';
     if (!device.ready)
         return device.reachable ? 'Connecting…' : 'Not connected'; // the header has "last seen"
     const parts = [];
@@ -127,12 +137,14 @@ export function quickTiles(device) {
         {id: 'send-clipboard', icon: 'edit-paste-symbolic', label: 'Clipboard', name: `Send the clipboard to ${name}`},
         {id: 'show-screen', icon: 'video-display-symbolic', label: 'Screen', name: `Show the screen of ${name}`},
         {id: 'ring', icon: 'audio-volume-high-symbolic', label: 'Ring', name: `Ring ${name}`},
-    ].map(tile => ({...tile, action: tile.id, enabled: ready && has(device, tile.id)}));
+    ].map(tile => ({...tile, action: tile.id, enabled: ready && !checking(device) && has(device, tile.id)}));
 }
 
 /// One dim line under the tiles when the phone is connected but takes none of
 /// them (an older DeskLink on it): greyed tiles alone give no reason.
 export function tilesNote(device) {
+    if (checking(device))
+        return `Checking the connection to ${device.name}…`;
     if (!device?.ready || quickTiles(device).some(tile => tile.enabled))
         return '';
     return `This version of DeskLink on ${device.name} can't do this yet`;
@@ -165,7 +177,7 @@ export const EMPTY = {
 /// wants a look on it (`unread`, `live`).
 export function chipState(device) {
     return {
-        state: device.ready ? 'ready' : (device.reachable ? 'connecting' : 'away'),
+        state: checking(device) ? 'connecting' : (device.ready ? 'ready' : (device.reachable ? 'connecting' : 'away')),
         unread: device.unread > 0 ? device.unread : 0,
         live: !!device.screen || device.terminals > 0,
     };

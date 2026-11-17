@@ -580,6 +580,9 @@ pub(crate) fn can_send_feature(device: &DeviceView, packet_type: &str) -> bool {
 /// Why an action on `device` cannot run now, if it cannot.
 fn unavailable_reason(device: &DeviceView) -> Option<String> {
     match device.status {
+        DeviceStatus::Paired if device.feature_transport_ready && device.quiet => {
+            Some(format!("Checking the connection to {}…", device.name))
+        }
         DeviceStatus::Paired if device.feature_transport_ready => None,
         DeviceStatus::Paired => Some(format!("Connecting to {}…", device.name)),
         _ => Some(format!("{} is offline", device.name)),

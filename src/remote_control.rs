@@ -440,6 +440,8 @@ pub fn show_remote_control_dialog(
         });
     }
     let link_ready = Rc::new(Cell::new(true));
+    // The link is up but quiet: the window says so instead of "Connecting".
+    let link_quiet = Rc::new(Cell::new(false));
     let last_control_request = Rc::new(Cell::new(std::time::Instant::now()));
     // Automatic control requests since the last grant or click (backs off).
     let control_asks = Rc::new(Cell::new(0u32));
@@ -490,6 +492,7 @@ pub fn show_remote_control_dialog(
         let loading_label = loading_label.downgrade();
         let restarter = Rc::clone(&restarter);
         let link_ready = Rc::clone(&link_ready);
+        let link_quiet = Rc::clone(&link_quiet);
         let ask_again = ask_again.downgrade();
         let last_control_request = Rc::clone(&last_control_request);
         let control_asks = Rc::clone(&control_asks);
@@ -512,6 +515,7 @@ pub fn show_remote_control_dialog(
                 if let Some(title) = title.upgrade() {
                     if let Some(view) = daemon.devices().into_iter().find(|d| d.id == *device) {
                         link_ready.set(view.feature_transport_ready);
+                        link_quiet.set(view.quiet);
                         title.set_title(&view.name);
                         if let Some(kind) = kind.upgrade() {
                             kind.set_icon_name(Some(crate::window::device_type_icon(
@@ -666,7 +670,11 @@ pub fn show_remote_control_dialog(
                     .get()
                     .is_some_and(|at| at.elapsed() < TYPING_HINT_FOR),
             });
-            let connecting = format!("Connecting to {phone}…");
+            let connecting = if link_quiet.get() {
+                format!("Checking the connection to {phone}…")
+            } else {
+                format!("Connecting to {phone}…")
+            };
             let waiting = paintable.is_none();
             if let (Some(loading), Some(label)) = (loading.upgrade(), loading_label.upgrade()) {
                 loading.set_visible(waiting);

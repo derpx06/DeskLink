@@ -132,6 +132,17 @@ fn a_device_maps_to_the_documented_dict() {
     });
     let mapped = shell_device(&device, &AppSettings::default());
     assert!(mapped.paired && mapped.reachable && mapped.ready && mapped.charging);
+    assert!(!mapped.quiet);
+    // Silent for a few seconds: `quiet` is on the wire for the top bar.
+    device.quiet = true;
+    assert!(shell_device(&device, &AppSettings::default()).quiet);
+    device.feature_transport_ready = false;
+    assert!(
+        !shell_device(&device, &AppSettings::default()).quiet,
+        "only a ready phone is checking"
+    );
+    device.feature_transport_ready = true;
+    device.quiet = false;
     assert_eq!(
         (mapped.battery, mapped.screen, mapped.terminals),
         (81, "control", 2)

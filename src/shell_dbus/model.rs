@@ -95,6 +95,10 @@ pub(super) struct ShellDevice {
     pub(super) paired: bool,
     pub(super) reachable: bool,
     pub(super) ready: bool,
+    /// Ready, but nothing heard for a few seconds: "Checking connection…".
+    /// Sent as `quiet`; an extension from before it ignores it (and an app
+    /// from before it never sends it: the extension reads only `=== true`).
+    pub(super) quiet: bool,
     pub(super) battery: i32,
     pub(super) charging: bool,
     pub(super) path: String,
@@ -289,6 +293,7 @@ pub(super) fn shell_device(device: &DeviceView, settings: &AppSettings) -> Shell
             DeviceStatus::Discovered | DeviceStatus::Unreachable
         ),
         ready: device.feature_transport_ready,
+        quiet: device.feature_transport_ready && device.quiet,
         // Only a live reading: a stale one would read as current in the top bar.
         battery: battery
             .filter(|_| device.feature_transport_ready)

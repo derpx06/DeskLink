@@ -110,6 +110,8 @@ pub(crate) struct Need {
 pub(crate) enum Reach {
     Ready,
     Connecting,
+    /// Was ready, nothing heard for a few seconds: being checked.
+    Checking,
     #[default]
     Offline,
 }
@@ -165,6 +167,9 @@ impl PhoneFacts {
             id: device.id.clone(),
             name: device.name.clone(),
             reach: match device.status {
+                DeviceStatus::Paired if device.feature_transport_ready && device.quiet => {
+                    Reach::Checking
+                }
                 DeviceStatus::Paired if device.feature_transport_ready => Reach::Ready,
                 DeviceStatus::Paired => Reach::Connecting,
                 _ => Reach::Offline,
@@ -663,6 +668,16 @@ pub(crate) fn blocker(feature: Feature, phone: &PhoneFacts) -> Option<Need> {
                 allow: None,
             })
         }
+        Reach::Checking => {
+            return Some(Need {
+                id: "reach",
+                on_phone: false,
+                title: format!("Checking the connection to {name}…"),
+                detail: "This works again as soon as the phone answers.".into(),
+                fix: Fix::None,
+                allow: None,
+            })
+        }
         Reach::Ready => {}
     }
     match feature {
@@ -692,6 +707,9 @@ pub(crate) fn blocker(feature: Feature, phone: &PhoneFacts) -> Option<Need> {
 /// The short words a tile's hint line shows for `need`.
 pub(crate) fn short(need: &Need) -> &'static str {
     match need.id {
+        "reach" if need.fix == Fix::None && need.title.starts_with("Checking") => {
+            "Checking connection…"
+        }
         "reach" if need.fix == Fix::None => "Connecting…",
         "reach" => "Can't reach",
         "phone-update" => "Needs an update",

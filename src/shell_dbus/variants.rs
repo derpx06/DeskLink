@@ -15,6 +15,7 @@ impl ShellDevice {
         dict.insert("paired", self.paired);
         dict.insert("reachable", self.reachable);
         dict.insert("ready", self.ready);
+        dict.insert("quiet", self.quiet);
         dict.insert("battery", self.battery);
         dict.insert("charging", self.charging);
         dict.insert("path", &self.path);

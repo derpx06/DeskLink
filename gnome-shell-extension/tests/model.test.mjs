@@ -6,7 +6,7 @@ import {fileURLToPath} from 'node:url';
 
 import {
     bodyHeight, everythingSent, footer, headerLine, lastSeen, mediaClock, mediaPosition, menuBlocks, moreSummary, seekReason, seekThrottle,
-    looksLikeLink, quickTiles, headerGlyph, offlineHint, EMPTY, chipState, panelBadge, pillVisible, visibilityGate, has, tilesNote, sections, sessionLine, shortStatus, statusLine, timer, duration,
+    looksLikeLink, quickTiles, headerGlyph, offlineHint, EMPTY, chipState, panelBadge, pillVisible, visibilityGate, has, tilesNote, sections, sessionLine, shortStatus, statusLine, timer, duration, checking,
 } from '../desklink@derx06.github.io/model.js';
 
 const ALL_ACTIONS = ['open', 'ring', 'lock', 'send-files', 'send-link', 'send-clipboard', 'ping', 'show-screen',
@@ -519,4 +519,21 @@ test('a connected phone that takes no tile says why; a short screen puts the til
     const busy = phone({media: {title: 't'}, transfers: [{name: 'a'}], screen: 'view'});
     assert.deepEqual(menuBlocks(busy, [busy], [], true), ['tiles', 'media', 'live', 'transfers', 'more', 'footer']);
     assert.deepEqual(menuBlocks(phone({ready: false}), [phone()], [], true), ['offline', 'more', 'footer']);
+});
+
+test('a ready but quiet phone reads "Checking connection…" and its tiles grey out; an old app never sends quiet', () => {
+    const quiet = phone({quiet: true});
+    assert.ok(checking(quiet));
+    assert.equal(statusLine(quiet), 'Checking connection…');
+    assert.equal(headerLine(quiet), 'Checking connection…');
+    assert.equal(shortStatus(quiet), 'Checking connection…');
+    assert.ok(quickTiles(quiet).every(tile => !tile.enabled));
+    assert.match(tilesNote(quiet), /Checking the connection to/);
+    assert.equal(chipState(quiet).state, 'connecting');
+    // Old app: no `quiet` property at all, and a non-boolean is not quiet.
+    assert.ok(!checking(phone()));
+    assert.ok(!checking(phone({quiet: 'yes'})));
+    assert.ok(quickTiles(phone()).some(tile => tile.enabled));
+    // Not ready: the old words win.
+    assert.equal(statusLine(phone({ready: false, quiet: true})), 'Connecting…');
 });

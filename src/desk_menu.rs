@@ -18,6 +18,9 @@ const RECENT: usize = 5;
 
 /// "Connected · 82% · charging", "last seen 14:02", "Connecting…".
 pub(crate) fn status_words(device: &DeviceView) -> String {
+    if device.feature_transport_ready && device.quiet {
+        return "Checking connection…".to_string();
+    }
     if device.feature_transport_ready {
         let mut parts = vec!["Connected".to_string()];
         if let Some(battery) = device.battery_status.as_ref() {
@@ -60,7 +63,9 @@ fn call_line(status: &crate::device_links::device::CallStatus) -> String {
 /// The heading of a phone's section: "realme 14 5G · Connected · 82% ⚡".
 fn header_words(device: &DeviceView) -> String {
     let mut words = format!("{} · ", device.name);
-    if device.feature_transport_ready {
+    if device.feature_transport_ready && device.quiet {
+        words.push_str("Checking connection…");
+    } else if device.feature_transport_ready {
         words.push_str("Connected");
         if let Some(battery) = device
             .battery_status
