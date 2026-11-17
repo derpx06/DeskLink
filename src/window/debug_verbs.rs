@@ -199,7 +199,13 @@ pub(super) fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &st
         // "scroll-to PAGE Y": that page scrolled to Y pixels.
         "scroll-to" => {
             if let Some((scroll, _)) = win.imp().bodies.borrow().get(id).cloned() {
-                scroll.vadjustment().set_value(arg.parse().unwrap_or(0.0));
+                // A number: that offset; else a widget name: its top, in view.
+                let top = arg.parse().ok().or_else(|| {
+                    let child = scroll.child()?;
+                    let widget = named_widgets(child.upcast_ref(), arg).into_iter().next()?;
+                    Some(f64::from(widget.compute_bounds(&child)?.y()) - 12.0)
+                });
+                scroll.vadjustment().set_value(top.unwrap_or(0.0));
             }
         }
         // "where PREFIX": the centre of each shown widget named PREFIX...,
@@ -614,6 +620,13 @@ pub(super) fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &st
         }
         "fake-note" => {
             let verb_id = id;
+            // "fake-note Some_words|second_line": that text (shots of a list).
+            if !id.is_empty() && id != "pinned" {
+                let _ =
+                    crate::device_links::notes::new_note(&id.replace('_', " ").replace('|', "\n"));
+                win.refresh_soon();
+                return true;
+            }
             let id = crate::device_links::notes::new_note(
                 "# Release checklist\nShip **F6** after the *real-phone* run.\n\n\
                  - [x] contract\n- [ ] Android side\n- `cargo test` green\n1. tag\n2. push",

@@ -690,3 +690,95 @@ fn the_sidebar_is_a_narrow_rail_on_a_middling_window() {
         window.close();
     });
 }
+
+/// An empty shelf in a temp dir (the global one, so tests take turns).
+fn fresh_notes() -> std::sync::MutexGuard<'static, ()> {
+    let turn = crate::device_links::notes::tests::ONE_SHELF
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = std::env::temp_dir().join(format!("desklink-home-notes-{}", uuid::Uuid::new_v4()));
+    crate::device_links::notes::install(dir.join("notes"));
+    turn
+}
+
+fn all_words(window: &super::super::DesklinkWindow) -> Vec<String> {
+    words_and(window.upcast_ref(), "dl-secondary").0
+}
+
+#[test]
+fn the_notes_card_counts_in_words() {
+    assert_eq!(notes_card::notes_words(0), "No notes yet");
+    assert_eq!(notes_card::notes_words(1), "1 note");
+    assert_eq!(notes_card::notes_words(4), "4 notes");
+}
+
+/// Home's Notes card: the empty state, a note typed in its entry (saved to
+/// the Notes store, listed after Home redraws, its row opens that note), New
+/// note, and the same card with the phone away. (Needs a display.)
+#[test]
+fn the_notes_card_lists_notes_and_saves_a_quick_one() {
+    use adw::subclass::prelude::ObjectSubclassIsExt;
+    let _shelf = fresh_notes();
+    crate::test_display::run(|| {
+        let window = home_window("paired", 1920);
+        assert!(
+            all_words(&window).contains(&"No notes yet".to_string()),
+            "empty subtitle"
+        );
+        assert!(
+            all_words(&window)
+                .iter()
+                .any(|w| w.starts_with("Type one below")),
+            "the friendly line"
+        );
+        let entry = shown(&window, "home-note-entry")
+            .and_downcast::<gtk::Entry>()
+            .expect("the quick entry");
+        // Nothing typed: Enter saves nothing.
+        entry.emit_activate();
+        assert!(crate::device_links::notes::notes().is_empty());
+        entry.set_text("buy oat milk");
+        entry.emit_activate();
+        let saved = crate::device_links::notes::notes();
+        assert_eq!(saved.len(), 1, "one note saved");
+        assert_eq!(saved[0].body, "buy oat milk");
+        window.refresh_devices();
+        spin();
+        let open = named_widgets(window.upcast_ref(), "")
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|button| {
+                button.accessible_role() == gtk::AccessibleRole::Button
+                    && button.label().is_none()
+                    && named_widgets(button.upcast_ref(), "")
+                        .iter()
+                        .filter_map(|w| w.downcast_ref::<gtk::Label>())
+                        .any(|l| l.label() == "buy oat milk")
+            })
+            .expect("a row for the new note");
+        assert!(all_words(&window).contains(&"1 note".to_string()));
+        open.emit_clicked();
+        spin();
+        assert_eq!(
+            window.imp().page_stack.visible_child_name().as_deref(),
+            Some("notes"),
+            "the Notes page, not Home"
+        );
+        window.close();
+
+        // Away: still readable, the entry still saves (desk data), and the
+        // card says it syncs when the phone is back.
+        let window = home_window("unreachable", 1920);
+        assert!(
+            shown(&window, "home-note-entry").is_some(),
+            "notes stay readable and writable"
+        );
+        assert!(
+            all_words(&window)
+                .iter()
+                .any(|w| w.starts_with("Notes sync with")),
+            "away says when it syncs"
+        );
+        window.close();
+    });
+}

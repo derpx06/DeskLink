@@ -256,12 +256,23 @@ fn spans(line: &str) -> Vec<((usize, usize), Span)> {
 
 /// A line of a note as plain words for the list: its list, task and heading
 /// marks and its bold, italic and code marks left out.
-fn plain_words(line: &str) -> String {
+pub(in crate::window) fn plain_words(line: &str) -> String {
     line.trim_start_matches(['#', '>', ' ', '-', '*'])
         .trim_start_matches("[ ] ")
         .trim_start_matches("[x] ")
         .replace("**", "")
         .replace(['*', '`'], "")
+}
+
+/// A note's first line other than its title, as plain words ("" when it has none).
+pub(in crate::window) fn preview_of(note: &Note) -> String {
+    note.body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find(|line| line.trim_start_matches(['#', ' ']) != note.label())
+        .map(plain_words)
+        .unwrap_or_default()
 }
 
 fn note_row(note: &Note) -> gtk::ListBoxRow {
@@ -273,14 +284,7 @@ fn note_row(note: &Note) -> gtk::ListBoxRow {
     let title = super::ellipsized(&note.label(), &["heading"]);
     title.set_xalign(0.0);
     words.append(&title);
-    let preview: String = note
-        .body
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .find(|line| line.trim_start_matches(['#', ' ']) != note.label())
-        .map(plain_words)
-        .unwrap_or_default();
+    let preview = preview_of(note);
     let detail = super::ellipsized(
         &if preview.is_empty() {
             modified_words(note.modified)
@@ -354,7 +358,7 @@ fn confirm_remove_duplicates(button: &gtk::Button) {
     dialog.present(Some(&window));
 }
 
-fn modified_words(modified: i64) -> String {
+pub(in crate::window) fn modified_words(modified: i64) -> String {
     let now = glib::DateTime::now_local().ok();
     glib::DateTime::from_unix_local(modified / 1000)
         .ok()

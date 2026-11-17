@@ -38,10 +38,12 @@ mod cards;
 mod hero;
 mod links;
 mod media;
+mod notes_card;
 mod tiles;
 use cards::*;
 use hero::*;
 use media::*;
+use notes_card::notes_card;
 use tiles::*;
 
 // The crate-facing surface (everything else stays inside).
@@ -110,6 +112,8 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         settings.shows_notifications(&device.id),
         crate::device_links::folders::bucket_on(&device.id),
         gliding_onto(&device.id),
+        // The Notes card shows what is stored here (or sent by the phone).
+        crate::device_links::notes::generation(),
     ))
     .unwrap_or_default();
     if !win.page_changed("home", key) {
@@ -177,6 +181,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         // What came in sits under the actions: the two columns end near each
         // other instead of the left stopping after the tiles.
         left.append(&columns(daemon, device));
+        right.append(&notes_card(win, device));
         right.append(&terminals_card(win, device));
         let split = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)

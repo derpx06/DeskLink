@@ -336,4 +336,4 @@ mod relay_tests;
 #[cfg(test)]
 mod sync_scenarios;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

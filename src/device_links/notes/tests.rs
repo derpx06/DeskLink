@@ -114,7 +114,7 @@ fn a_peer_cannot_grow_the_shelf_past_its_bounds() {
 }
 
 /// The tests that `install` the one global shelf take turns.
-static ONE_SHELF: Mutex<()> = Mutex::new(());
+pub(crate) static ONE_SHELF: Mutex<()> = Mutex::new(());
 
 /// Any change to the shelf clears identical copies, and the result is saved.
 #[test]

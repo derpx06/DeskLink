@@ -116,7 +116,7 @@ fn files_card(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
 /// A card: its title and a line under it on the left, an optional widget at
 /// the end of the header, and `body` below. Dimmed while what it shows is
 /// the last known (`stale`).
-fn feature_card(
+pub(super) fn feature_card(
     title: &str,
     subtitle: &str,
     end: Option<&gtk::Widget>,
@@ -150,7 +150,7 @@ fn feature_card(
 }
 
 /// A text button that opens page `name`: "View all", "Open".
-fn page_button(label: &str, name: &str) -> gtk::Button {
+pub(super) fn page_button(label: &str, name: &str) -> gtk::Button {
     let button = button(ButtonKind::Text, label, None);
     button.set_valign(gtk::Align::Center);
     button.set_action_name(Some("win.show-page"));

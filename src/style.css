@@ -352,6 +352,15 @@ banner.dl-banner-host > revealer > widget button:focus-visible { outline: 2px so
   color: @terminal_fg;
   box-shadow: none;
 }
+.home-note {
+  min-height: 48px;
+  padding: 6px 12px;
+  border-radius: 12px;
+  background-color: @surface_2;
+  box-shadow: none;
+}
+.home-note label.dl-secondary { font-weight: 400; }
+.home-note:hover { background-color: alpha(currentColor, 0.1); }
 .term-strip:hover { background-color: mix(@terminal_bg, white, 0.06); }
 .strip-title { font-size: 0.93em; color: @terminal_fg; }
 .strip-line { font-size: 0.86em; color: @terminal_dim; }
