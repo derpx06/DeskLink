@@ -41,6 +41,7 @@ mod bucket;
 pub(crate) mod calls;
 mod dialpad;
 mod everything;
+mod find;
 mod gallery;
 pub(crate) mod insert;
 mod sound;
@@ -192,8 +193,9 @@ pub(crate) const PAGE_ACCELS: [(&str, &str); 6] = [
     ("contacts", "<control>6"),
 ];
 
-/// Ctrl+K opens "Find anything" (`win.palette`); Ctrl+F does too, off the
-/// Terminals page and outside a text field. Shown in the shortcuts dialog, on
+/// Ctrl+K opens "Search everything" (`win.palette`, "Find anything" in the
+/// palette); Ctrl+F searches the page on screen (`find`), and does the same as
+/// Ctrl+K on a page without a search box of its own. Shown in the shortcuts dialog, on
 /// the search buttons, as key caps in the sidebar's search field and next to
 /// nothing else.
 pub(crate) const PALETTE_ACCEL: &str = "<control>k";

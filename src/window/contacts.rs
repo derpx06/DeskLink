@@ -238,6 +238,7 @@ impl Page {
             .build();
         clipboard::ensure_css();
         search.update_property(&[gtk::accessible::Property::Label("Search contacts")]);
+        super::find::register(&search);
         let refresh = ui_kit::icon_button("desklink-refresh-symbolic", "Refresh from the phone");
         refresh.set_valign(gtk::Align::Center);
         let header = gtk::Box::builder().spacing(8).build();

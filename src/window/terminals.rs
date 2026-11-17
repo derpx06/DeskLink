@@ -85,6 +85,7 @@ impl Page {
             .width_request(240)
             .build();
         search.update_property(&[gtk::accessible::Property::Label("Search terminals")]);
+        super::find::register(&search);
         clipboard::ensure_css();
         let count = text("", &["dl-secondary"]);
         let detach = ui_kit::button(ButtonKind::Danger, "Detach", None);

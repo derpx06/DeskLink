@@ -253,6 +253,7 @@ fn side_list(nav: &adw::NavigationView) -> gtk::Widget {
         .placeholder_text("Search settings")
         .build();
     search.update_property(&[gtk::accessible::Property::Label("Search settings")]);
+    super::find::register(&search);
     {
         let nav = nav.downgrade();
         search.connect_search_changed(move |entry| {
@@ -625,6 +626,7 @@ fn build_view(
         .placeholder_text("Search settings")
         .build();
     search.update_property(&[gtk::accessible::Property::Label("Search settings")]);
+    super::find::register(&search);
     {
         let (groups, results, stack, nothing) = (
             groups.clone(),

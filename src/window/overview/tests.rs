@@ -1048,3 +1048,105 @@ fn only_the_selected_phones_transfers_are_its_own() {
     assert_eq!(ids("B"), ["b", "c"], "another phone's transfer is not B's");
     assert_eq!(ids("A"), ["a", "c"]);
 }
+
+// ---- Ctrl+F: search this page (window/find.rs) ----
+
+fn ctrl_f(window: &super::super::DesklinkWindow) {
+    gtk::prelude::ActionGroupExt::activate_action(window, "toggle-search", None);
+    spin();
+}
+
+fn focused_search(window: &super::super::DesklinkWindow) -> Option<gtk::SearchEntry> {
+    let focus = gtk::prelude::GtkWindowExt::focus(window)?;
+    named_widgets(window.upcast_ref(), "page-search")
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::SearchEntry>().ok())
+        .find(|entry| focus.is_ancestor(entry) || focus == *entry.upcast_ref::<gtk::Widget>())
+}
+
+/// Ctrl+F focuses the search box of the page on screen, whichever page it
+/// is, with what is in it selected; Ctrl+F again selects it again; Escape
+/// clears it. (Needs a display.)
+#[test]
+fn ctrl_f_searches_the_page_on_screen() {
+    use adw::subclass::prelude::ObjectSubclassIsExt;
+    let _shelf = fresh_notes();
+    crate::test_display::run(|| {
+        let window = home_window("paired", 1280);
+        for (page, label) in [
+            ("notes", "Search notes"),
+            ("contacts", "Search contacts"),
+            ("settings", "Search settings"),
+            ("terminals", "Search terminals"),
+        ] {
+            assert!(window.show_page(page), "{page}");
+            spin();
+            ctrl_f(&window);
+            let entry =
+                focused_search(&window).unwrap_or_else(|| panic!("{page}: no search focused"));
+            assert_eq!(entry.placeholder_text().as_deref(), Some(label), "{page}");
+            // What is typed there is selected by the next Ctrl+F, and Escape clears it.
+            entry.set_text("abc");
+            entry.set_position(1);
+            ctrl_f(&window);
+            assert_eq!(entry.selection_bounds(), Some((0, 3)), "{page}: selected");
+            entry.emit_by_name::<()>("stop-search", &[]);
+            assert_eq!(entry.text(), "", "{page}: Escape clears");
+        }
+        let _ = window.imp();
+        window.close();
+    });
+}
+
+/// On a page without a search box Ctrl+F opens the global search, so the key
+/// is never dead; Ctrl+K opens it everywhere. (Needs a display.)
+#[test]
+fn ctrl_f_without_a_page_search_opens_the_global_one() {
+    crate::test_display::run(|| {
+        let window = home_window("paired", 1280);
+        assert!(window.show_page("home"));
+        spin();
+        assert!(!super::super::palette::is_open());
+        ctrl_f(&window);
+        assert!(
+            super::super::palette::is_open(),
+            "Home has no search: the palette opens"
+        );
+        gtk::prelude::ActionGroupExt::activate_action(&window, "palette", None);
+        spin();
+        assert!(!super::super::palette::is_open(), "Ctrl+K closes it again");
+        assert!(window.show_page("notes"));
+        spin();
+        gtk::prelude::ActionGroupExt::activate_action(&window, "palette", None);
+        spin();
+        assert!(
+            super::super::palette::is_open(),
+            "Ctrl+K is the global search on a page with its own"
+        );
+        gtk::prelude::ActionGroupExt::activate_action(&window, "palette", None);
+        spin();
+        window.close();
+    });
+}
+
+/// Ctrl+F inside text that is not the page's search box (the note's title or
+/// body) stays the text's: nothing moves. (Needs a display.)
+#[test]
+fn ctrl_f_in_the_note_editor_is_left_to_the_text() {
+    let _shelf = fresh_notes();
+    crate::test_display::run(|| {
+        let window = home_window("paired", 1280);
+        window.new_note();
+        spin();
+        let before =
+            gtk::prelude::GtkWindowExt::focus(&window).expect("the note title has the focus");
+        ctrl_f(&window);
+        assert_eq!(
+            gtk::prelude::GtkWindowExt::focus(&window),
+            Some(before),
+            "the focus did not move"
+        );
+        assert!(!super::super::palette::is_open());
+        window.close();
+    });
+}

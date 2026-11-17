@@ -495,26 +495,9 @@ impl ObjectImpl for DesklinkWindow {
                     }
                 })
                 .build(),
-            // Ctrl+F: the terminal search on the Terminals page; anywhere
-            // else (and not while typing, where Ctrl+F is the text's)
-            // "Find anything".
+            // Ctrl+F: search this page (`find`).
             gio::ActionEntry::builder("toggle-search")
-                .activate(|window: &super::DesklinkWindow, _, _| {
-                    // Not over a dialog (the palette is one: Ctrl+K closes it).
-                    if palette::is_open() || window.visible_dialog().is_some() {
-                        return;
-                    }
-                    if window.imp().page.borrow().as_str() == "terminals"
-                        && window.imp().main_stack.visible_child_name().as_deref()
-                            == Some("devices")
-                    {
-                        if let Some(page) = window.imp().terminals.borrow().as_ref() {
-                            page.focus_search();
-                        }
-                    } else if !palette::typing_in(window) {
-                        palette::toggle(window, "");
-                    }
-                })
+                .activate(|window: &super::DesklinkWindow, _, _| find::search_this_page(window))
                 .build(),
             // Ctrl+K: "Find anything".
             gio::ActionEntry::builder("palette")

@@ -375,6 +375,7 @@ impl Page {
             .hexpand(true)
             .build();
         search.update_property(&[gtk::accessible::Property::Label("Search notes")]);
+        super::find::register(&search);
         let add = ui_kit::icon_button("desklink-add-symbolic", "New note");
         add.update_property(&[gtk::accessible::Property::Label("New note")]);
         let top = gtk::Box::builder()
