@@ -1051,6 +1051,18 @@ fn only_the_selected_phones_transfers_are_its_own() {
 
 // ---- Ctrl+F: search this page (window/find.rs) ----
 
+/// No palette left open by another test on the shared GTK thread.
+fn no_palette_open(window: &super::super::DesklinkWindow) {
+    for _ in 0..3 {
+        if !super::super::palette::is_open() {
+            return;
+        }
+        gtk::prelude::ActionGroupExt::activate_action(window, "palette", None);
+        spin();
+    }
+    assert!(!super::super::palette::is_open(), "a palette is stuck open");
+}
+
 fn ctrl_f(window: &super::super::DesklinkWindow) {
     gtk::prelude::ActionGroupExt::activate_action(window, "toggle-search", None);
     spin();
@@ -1073,6 +1085,7 @@ fn ctrl_f_searches_the_page_on_screen() {
     let _shelf = fresh_notes();
     crate::test_display::run(|| {
         let window = home_window("paired", 1280);
+        no_palette_open(&window);
         for (page, label) in [
             ("notes", "Search notes"),
             ("contacts", "Search contacts"),
@@ -1104,6 +1117,7 @@ fn ctrl_f_searches_the_page_on_screen() {
 fn ctrl_f_without_a_page_search_opens_the_global_one() {
     crate::test_display::run(|| {
         let window = home_window("paired", 1280);
+        no_palette_open(&window);
         assert!(window.show_page("home"));
         spin();
         assert!(!super::super::palette::is_open());
@@ -1136,6 +1150,7 @@ fn ctrl_f_in_the_note_editor_is_left_to_the_text() {
     let _shelf = fresh_notes();
     crate::test_display::run(|| {
         let window = home_window("paired", 1280);
+        no_palette_open(&window);
         window.new_note();
         spin();
         let before =
@@ -1157,6 +1172,7 @@ fn ctrl_f_in_the_note_editor_is_left_to_the_text() {
 fn ctrl_f_over_a_dialog_does_nothing() {
     crate::test_display::run(|| {
         let window = home_window("paired", 1280);
+        no_palette_open(&window);
         assert!(window.show_page("notes"));
         spin();
         let dialog = adw::AlertDialog::new(Some("A question"), None);
@@ -1185,6 +1201,7 @@ fn ctrl_f_over_a_dialog_does_nothing() {
 fn ctrl_f_on_the_snippets_and_clipboard_tabs_opens_the_global_search() {
     crate::test_display::run(|| {
         let window = home_window("paired", 1280);
+        no_palette_open(&window);
         for page in ["snippets", "clipboard"] {
             assert!(window.show_page(page), "{page}");
             spin();
@@ -1219,6 +1236,7 @@ fn ctrl_f_is_never_dead_on_a_narrow_window_or_a_settings_subpage() {
             }
         };
         let window = home_window("paired", 420);
+        no_palette_open(&window);
         assert!(window.show_page("notes"));
         spin();
         never_dead(&window, "narrow Notes");
@@ -1237,6 +1255,7 @@ fn ctrl_f_is_never_dead_on_a_narrow_window_or_a_settings_subpage() {
 fn escape_in_a_page_search_clears_it_and_leaves_without_closing_anything() {
     crate::test_display::run(|| {
         let window = home_window("paired", 1280);
+        no_palette_open(&window);
         assert!(window.show_page("notes"));
         spin();
         ctrl_f(&window);
