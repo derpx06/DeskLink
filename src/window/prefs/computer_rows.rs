@@ -237,7 +237,10 @@ pub(super) const FLATPAK_SCRIPT: &str =
 
 /// "Show Send to phone in the file manager": a switch; in a Flatpak (which
 /// cannot write the host's menus) a row that shows the commands to copy.
-pub(super) fn file_manager_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::PreferencesRow {
+pub(super) fn file_manager_row(
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+) -> adw::PreferencesRow {
     if crate::device_links::pty::host::in_flatpak() {
         let row = adw::ActionRow::builder()
             .title("Show Send to phone in the file manager")

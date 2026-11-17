@@ -73,7 +73,10 @@ pub(crate) struct Request {
 /// `scheme://…`: a URI, as opposed to a path that happens to hold `://`.
 fn is_uri(text: &str) -> bool {
     text.split_once("://").is_some_and(|(scheme, _)| {
-        scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
             && scheme
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
@@ -685,11 +688,19 @@ fn send(app: &DesklinkApplication, device: &str, paths: &[String]) {
         return;
     };
     if paths.len() > file_manager::MAX_ENTRIES {
-        say(app, "Can't send to phone", &file_manager::too_many_message(paths.len()));
+        say(
+            app,
+            "Can't send to phone",
+            &file_manager::too_many_message(paths.len()),
+        );
         return;
     }
     if !BURST.with(|burst| burst.borrow_mut().allow(std::time::Instant::now())) {
-        say(app, "Too many send requests", "Wait a few seconds and try again.");
+        say(
+            app,
+            "Too many send requests",
+            "Wait a few seconds and try again.",
+        );
         return;
     }
     let requested: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();

@@ -202,7 +202,8 @@ fn notify_desktop(title: &str, body: &str) {
     let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
         return;
     };
-    let hints = std::collections::HashMap::from([("desktop-entry".to_string(), APP_ID.to_variant())]);
+    let hints =
+        std::collections::HashMap::from([("desktop-entry".to_string(), APP_ID.to_variant())]);
     let call = (
         "DeskLink",
         0u32,
@@ -315,7 +316,8 @@ impl Dirs {
         }
     }
     fn extension(&self) -> PathBuf {
-        self.data.join("nautilus-python/extensions/desklink_send_to.py")
+        self.data
+            .join("nautilus-python/extensions/desklink_send_to.py")
     }
     fn phones(&self) -> PathBuf {
         self.data.join("desklink/send-to-phones.json")
@@ -413,9 +415,13 @@ pub(crate) fn sync(
     let action: &[(String, String)] = if nemo_action_in_use { &phones } else { &[] };
     note(
         "Nemo action",
-        sync_per_phone(&dirs.nemo_actions(), action, ".nemo_action", false, |id, _| {
-            nemo_action(exe, id)
-        }),
+        sync_per_phone(
+            &dirs.nemo_actions(),
+            action,
+            ".nemo_action",
+            false,
+            |id, _| nemo_action(exe, id),
+        ),
     );
     // Thunar's Send To.
     let thunar_wanted = has_desktop(env.desktop, &["XFCE"]) || (env.installed)("thunar");
@@ -574,7 +580,12 @@ mod tests {
                 if path.is_dir() {
                     walk(base, &path, out);
                 } else {
-                    out.push(path.strip_prefix(base).unwrap().to_string_lossy().into_owned());
+                    out.push(
+                        path.strip_prefix(base)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
                 }
             }
         }
@@ -598,13 +609,23 @@ mod tests {
 
     #[test]
     fn every_refusal_is_worded() {
-        let skip = |f| Skipped { folders: f, ..Skipped::default() };
+        let skip = |f| Skipped {
+            folders: f,
+            ..Skipped::default()
+        };
         assert_eq!(skip(0).message(), None);
         assert_eq!(
             skip(2).message().as_deref(),
             Some("Folders aren't sent yet. Select files.")
         );
-        let mixed = Skipped { folders: 1, remote: 2, missing: 1, unreadable: 3, special: 1, protected: 1 };
+        let mixed = Skipped {
+            folders: 1,
+            remote: 2,
+            missing: 1,
+            unreadable: 3,
+            special: 1,
+            protected: 1,
+        };
         let text = mixed.message().unwrap();
         for part in [
             "Folders aren't sent yet.",
@@ -643,7 +664,9 @@ mod tests {
                 PathBuf::from("/home/me/rel.txt"),
             ]
         );
-        assert!(is_uri("smb://x") && is_uri("file:///x") && !is_uri("/a://b") && !is_uri("a b://c"));
+        assert!(
+            is_uri("smb://x") && is_uri("file:///x") && !is_uri("/a://b") && !is_uri("a b://c")
+        );
     }
 
     // ---- S2: validation ----
@@ -715,7 +738,10 @@ mod tests {
             assert!(burst.allow(t0 + Duration::from_millis(n)), "{n}");
         }
         assert!(!burst.allow(t0 + Duration::from_secs(5)), "a sixth in 10 s");
-        assert!(burst.allow(t0 + Duration::from_secs(11)), "the window moved on");
+        assert!(
+            burst.allow(t0 + Duration::from_secs(11)),
+            "the window moved on"
+        );
     }
 
     // ---- S3: generated files ----
@@ -751,7 +777,12 @@ mod tests {
 
     #[test]
     fn the_files_script_passes_hostile_names_as_plain_arguments() {
-        let names = ["it's \"q\" $(touch pwned) `id` %F;&|", "line\nbreak.txt", "-rf", "\u{e9}\u{1F4F1}.txt"];
+        let names = [
+            "it's \"q\" $(touch pwned) `id` %F;&|",
+            "line\nbreak.txt",
+            "-rf",
+            "\u{e9}\u{1F4F1}.txt",
+        ];
         let got = run_script("", &names);
         assert_eq!(&got[..4], ["--send-files", "--to", "p1", "--"]);
         assert_eq!(&got[4..], names);
@@ -781,24 +812,47 @@ mod tests {
             .collect();
         let clean = clean_phones(&list);
         assert_eq!(clean.len(), HOSTILE.len() + 1, "only plain ids: {clean:?}");
-        assert!(clean.iter().all(|(id, name)| safe_id(id) && !name.contains(['\n', '\r'])));
+        assert!(clean
+            .iter()
+            .all(|(id, name)| safe_id(id) && !name.contains(['\n', '\r'])));
         assert_eq!(clean.last().unwrap().1, "Fine");
         assert_eq!(clean[HOSTILE.len() - 1].1, "phone", "a blank name");
         // Dolphin
         let dolphin = keyfile(&super::super::dolphin_menu(exe, &clean));
         let group = "Desktop Action phone0";
         let argv = glib::shell_parse_argv(dolphin.string(group, "Exec").unwrap().as_str()).unwrap();
-        let argv: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let argv: Vec<String> = argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         // The Desktop Entry layer doubles a literal `%` (`%%`); the shell layer is exact.
         let spec_exe = exe.to_str().unwrap().replace('%', "%%");
-        assert_eq!(argv, [spec_exe.as_str(), "--send-files", "--to", "p0", "--", "%F"]);
-        assert_eq!(dolphin.string(group, "Name").unwrap(), "Send to $(rm -rf ~)");
+        assert_eq!(
+            argv,
+            [spec_exe.as_str(), "--send-files", "--to", "p0", "--", "%F"]
+        );
+        assert_eq!(
+            dolphin.string(group, "Name").unwrap(),
+            "Send to $(rm -rf ~)"
+        );
         for i in 0..clean.len() {
-            let name = dolphin.string(&format!("Desktop Action phone{i}"), "Name").unwrap();
+            let name = dolphin
+                .string(&format!("Desktop Action phone{i}"), "Name")
+                .unwrap();
             assert!(name.starts_with("Send to "), "{name}");
-            assert_eq!(dolphin.keys(&format!("Desktop Action phone{i}")).unwrap().len(), 3);
+            assert_eq!(
+                dolphin
+                    .keys(&format!("Desktop Action phone{i}"))
+                    .unwrap()
+                    .len(),
+                3
+            );
         }
-        assert_eq!(dolphin.groups().len(), clean.len() + 1, "no injected groups");
+        assert_eq!(
+            dolphin.groups().len(),
+            clean.len() + 1,
+            "no injected groups"
+        );
         // Thunar
         for (id, name) in &clean {
             let entry = keyfile(&super::super::thunar_sendto(exe, id, name));
@@ -808,10 +862,27 @@ mod tests {
         // Nemo
         let action = nemo_action(exe, "p0");
         let nemo = keyfile(&action);
-        let argv = glib::shell_parse_argv(nemo.string("Nemo Action", "Exec").unwrap().as_str()).unwrap();
-        let argv: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(argv, [exe.to_str().unwrap(), "--send-files", "--to", "p0", "--", "%F"]);
-        assert_eq!(nemo.string("Nemo Action", "Dependencies").unwrap(), exe.to_str().unwrap());
+        let argv =
+            glib::shell_parse_argv(nemo.string("Nemo Action", "Exec").unwrap().as_str()).unwrap();
+        let argv: Vec<String> = argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            [
+                exe.to_str().unwrap(),
+                "--send-files",
+                "--to",
+                "p0",
+                "--",
+                "%F"
+            ]
+        );
+        assert_eq!(
+            nemo.string("Nemo Action", "Dependencies").unwrap(),
+            exe.to_str().unwrap()
+        );
         // JSON is data, not code.
         let json: serde_json::Value = serde_json::from_str(&phones_json(exe, &clean)).unwrap();
         assert_eq!(json["exe"], exe.to_str().unwrap());
@@ -820,19 +891,27 @@ mod tests {
 
     #[test]
     fn the_dolphin_menu_shows_for_files_and_folders() {
-        let menu = super::super::dolphin_menu(Path::new("/usr/bin/desklink"), &phones(&[("p1", "P")]));
+        let menu =
+            super::super::dolphin_menu(Path::new("/usr/bin/desklink"), &phones(&[("p1", "P")]));
         assert!(menu.contains("MimeType=application/octet-stream;inode/directory;\n"));
         assert!(menu.contains("X-KDE-Protocols=file\n"));
     }
 
     fn setup() -> (Dirs, PathBuf) {
         let root = tmp();
-        let dirs = Dirs { data: root.join("data"), config: root.join("config") };
+        let dirs = Dirs {
+            data: root.join("data"),
+            config: root.join("config"),
+        };
         (dirs, root)
     }
 
     fn env<'a>(desktop: &'a str, python: bool, installed: &'a dyn Fn(&str) -> bool) -> Env<'a> {
-        Env { desktop, installed, python_nautilus: python }
+        Env {
+            desktop,
+            installed,
+            python_nautilus: python,
+        }
     }
 
     const EXE: &str = "/usr/bin/desklink";
@@ -843,13 +922,30 @@ mod tests {
         let none = |_: &str| false;
         let one = phones(&[("p1", "Pixel")]);
         // No python-nautilus: scripts (the fallback), no extension.
-        assert!(sync(&dirs, Path::new(EXE), &one, true, &env("GNOME", false, &none)).is_empty());
+        assert!(sync(
+            &dirs,
+            Path::new(EXE),
+            &one,
+            true,
+            &env("GNOME", false, &none)
+        )
+        .is_empty());
         let got = files(&root);
-        assert!(got.contains(&"data/nautilus/scripts/Send to Pixel".into()), "{got:?}");
+        assert!(
+            got.contains(&"data/nautilus/scripts/Send to Pixel".into()),
+            "{got:?}"
+        );
         assert!(got.contains(&"data/nautilus/scripts/Add to DeskLink Bucket".into()));
         assert!(!got.iter().any(|f| f.contains("nautilus-python")));
         // With it: the extension and its data; the Send script goes, Bucket stays.
-        assert!(sync(&dirs, Path::new(EXE), &one, true, &env("GNOME", true, &none)).is_empty());
+        assert!(sync(
+            &dirs,
+            Path::new(EXE),
+            &one,
+            true,
+            &env("GNOME", true, &none)
+        )
+        .is_empty());
         let got = files(&root);
         assert_eq!(
             got,
@@ -860,7 +956,14 @@ mod tests {
             ]
         );
         // Switch off: every file this feature wrote is gone.
-        assert!(sync(&dirs, Path::new(EXE), &one, false, &env("GNOME", true, &none)).is_empty());
+        assert!(sync(
+            &dirs,
+            Path::new(EXE),
+            &one,
+            false,
+            &env("GNOME", true, &none)
+        )
+        .is_empty());
         assert_eq!(files(&root), Vec::<String>::new());
         std::fs::remove_dir_all(&root).ok();
     }
@@ -878,9 +981,18 @@ mod tests {
                 "data/nemo/scripts/Add to DeskLink Bucket",
             ]
         );
-        sync(&dirs, Path::new(EXE), &phones(&[("p1", "Pixel"), ("p2", "Tab")]), true, &e);
+        sync(
+            &dirs,
+            Path::new(EXE),
+            &phones(&[("p1", "Pixel"), ("p2", "Tab")]),
+            true,
+            &e,
+        );
         let got = files(&root);
-        assert!(got.contains(&"data/nemo/scripts/Send to Tab".into()), "{got:?}");
+        assert!(
+            got.contains(&"data/nemo/scripts/Send to Tab".into()),
+            "{got:?}"
+        );
         assert!(!got.iter().any(|f| f.contains("actions")), "{got:?}");
         sync(&dirs, Path::new(EXE), &[], true, &e);
         assert_eq!(files(&root), Vec::<String>::new(), "last phone unpaired");
@@ -895,24 +1007,46 @@ mod tests {
         let e = env("GNOME:KDE", true, &all);
         assert!(sync(&dirs, Path::new(EXE), &two, true, &e).is_empty());
         let before = files(&root);
-        for expect in ["kio/servicemenus", "Thunar/sendto", "nemo/scripts", "caja/scripts", "nautilus-python"] {
-            assert!(before.iter().any(|f| f.contains(expect)), "{expect}: {before:?}");
+        for expect in [
+            "kio/servicemenus",
+            "Thunar/sendto",
+            "nemo/scripts",
+            "caja/scripts",
+            "nautilus-python",
+        ] {
+            assert!(
+                before.iter().any(|f| f.contains(expect)),
+                "{expect}: {before:?}"
+            );
         }
         std::fs::create_dir_all(dirs.data.join("nautilus/scripts")).unwrap();
         std::fs::write(dirs.data.join("nautilus/scripts/Mine"), "#!/bin/sh\n").unwrap();
-        std::fs::write(dirs.data.join("nautilus-python/extensions/other.py"), "x = 1\n").unwrap();
+        std::fs::write(
+            dirs.data.join("nautilus-python/extensions/other.py"),
+            "x = 1\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(dirs.data.join("applications")).unwrap();
         for name in OPEN_WITH_FILES {
             std::fs::write(
                 dirs.data.join("applications").join(name),
-                super::super::open_with_helper("N", "C", Path::new(EXE), "--bucket", &["image/png".into()]),
+                super::super::open_with_helper(
+                    "N",
+                    "C",
+                    Path::new(EXE),
+                    "--bucket",
+                    &["image/png".into()],
+                ),
             )
             .unwrap();
         }
         assert!(remove_all(&dirs).is_empty());
         assert_eq!(
             files(&root),
-            ["data/nautilus-python/extensions/other.py", "data/nautilus/scripts/Mine"],
+            [
+                "data/nautilus-python/extensions/other.py",
+                "data/nautilus/scripts/Mine"
+            ],
             "only the user's own files remain"
         );
         std::fs::remove_dir_all(&root).ok();
@@ -923,9 +1057,18 @@ mod tests {
         let (dirs, root) = setup();
         let all = |_: &str| true;
         let evil = phones(&[("x; touch pwned", "Evil"), ("ok_1", "$(touch pwned)")]);
-        sync(&dirs, Path::new(EXE), &evil, true, &env("GNOME:KDE:X-Cinnamon:XFCE", true, &all));
+        sync(
+            &dirs,
+            Path::new(EXE),
+            &evil,
+            true,
+            &env("GNOME:KDE:X-Cinnamon:XFCE", true, &all),
+        );
         for file in files(&root) {
-            assert!(!file.contains("pwned") || file.contains("$(touch pwned)"), "{file}");
+            assert!(
+                !file.contains("pwned") || file.contains("$(touch pwned)"),
+                "{file}"
+            );
             assert!(!file.contains(';'), "{file}");
         }
         for file in files(&root) {
@@ -939,17 +1082,26 @@ mod tests {
     #[test]
     fn nautilus_python_is_found_by_its_library_and_a_working_typelib() {
         let dir = tmp();
-        assert!(!python_nautilus_present(&[dir.clone()], || true), "no library");
+        assert!(
+            !python_nautilus_present(&[dir.clone()], || true),
+            "no library"
+        );
         std::fs::write(dir.join("libnautilus-python.so"), "").unwrap();
         assert!(python_nautilus_present(&[dir.clone()], || true));
-        assert!(!python_nautilus_present(&[dir.clone()], || false), "no typelib");
+        assert!(
+            !python_nautilus_present(&[dir.clone()], || false),
+            "no typelib"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- the Python extension ----
 
     fn have_python() -> bool {
-        std::process::Command::new("python3").arg("--version").output().is_ok()
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok()
     }
 
     #[test]
@@ -965,7 +1117,11 @@ mod tests {
             .arg(&path)
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert!(EXTENSION.starts_with(EXTENSION_MARK));
         std::fs::remove_dir_all(&dir).ok();
     }
