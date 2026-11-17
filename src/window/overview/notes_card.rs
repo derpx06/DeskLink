@@ -15,7 +15,8 @@ const SHOWN: usize = 3;
 
 thread_local! {
     /// What is typed in the entry: kept when Home is redrawn (a note arriving
-    /// from the phone) so typing is never lost.
+    /// from the phone) so typing is never lost. One draft for every phone:
+    /// the entry is the computer's, not a phone's.
     static DRAFT: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
@@ -90,6 +91,15 @@ pub(super) fn notes_card(win: &DesklinkWindow, device: &DeviceView) -> gtk::Box 
     entry.set_widget_name("home-note-entry");
     entry.update_property(&[gtk::accessible::Property::Label("Quick note")]);
     entry.set_text(&DRAFT.with(|draft| draft.borrow().clone()));
+    // A redraw gives the focus back with `grab_focus`, which selects all of
+    // an entry's text: the next key would replace the draft. The cursor goes
+    // to the end instead, once the focus change is done.
+    entry.connect_has_focus_notify(|entry| {
+        if entry.has_focus() && !entry.text().is_empty() {
+            let entry = entry.clone();
+            gtk::glib::idle_add_local_once(move || entry.set_position(-1));
+        }
+    });
     entry.connect_changed(|entry| {
         DRAFT.with(|draft| *draft.borrow_mut() = entry.text().to_string())
     });

@@ -782,3 +782,34 @@ fn the_notes_card_lists_notes_and_saves_a_quick_one() {
         window.close();
     });
 }
+
+/// A note arriving while a sentence is half typed redraws Home: the draft is
+/// kept, the focus is back in the entry, and nothing is selected (the next
+/// key adds to it, never replaces it). (Needs a display.)
+#[test]
+fn a_half_typed_note_survives_a_redraw_unselected() {
+    let _shelf = fresh_notes();
+    crate::test_display::run(|| {
+        let window = home_window("paired", 1280);
+        let entry = || {
+            shown(&window, "home-note-entry")
+                .and_downcast::<gtk::Entry>()
+                .expect("the quick entry")
+        };
+        let first = entry();
+        first.grab_focus();
+        first.set_text("half typed");
+        first.set_position(-1);
+        // A note arrives from elsewhere: Home is redrawn.
+        crate::device_links::notes::new_note("from the phone").unwrap();
+        window.refresh_devices();
+        spin();
+        let second = entry();
+        assert_ne!(first, second, "Home was redrawn");
+        assert_eq!(second.text(), "half typed", "the draft is kept");
+        assert!(second.has_focus(), "the focus is back in the entry");
+        assert_eq!(second.selection_bounds(), None, "nothing is selected");
+        assert_eq!(second.position(), 10, "the cursor is at the end");
+        window.close();
+    });
+}

@@ -100,6 +100,7 @@ locks are recovered, queues are bounded and blocking reads have deadlines.
 | F15 | S4 | `media_art.rs`, `mpris.rs` | Two stale doc texts. | listed |
 | F16 | S1 | `daemon/clipboard.rs` | Restarting the desk put the phone's old clipboard over the laptop's: a fresh desk had no time for its own copy, so any `clipboard.connect` was "newer" (and pre-1.3 phones stamp the read time). Seen on the owner's laptop at 00:04. | **fixed**: `clipboard.connect` only fills an empty clipboard; DeskLink's start counts as the last local copy for plain packets (`a_connect_snapshot_only_fills_an_empty_clipboard`, `a_live_copy_is_placed_but_not_one_made_before_the_desk_started`). Trade-off: a phone copy made while the desk was off is sent again by hand |
 | - | note | `pairing.rs` | Prompt pairing compares 6 digits; QR pairing is the strong path. | design, wire-level: no change |
+| - | note | `window/overview/notes_card.rs` | Home shows the title and first body line of the 3 newest notes; there is no private-note concept. | follow-up: a "Show note previews on Home" toggle (default on) |
 
 ## Unlock, session lock, logind
 
