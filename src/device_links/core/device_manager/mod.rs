@@ -609,9 +609,12 @@ impl DeviceManager {
         })
     }
 
-    /// Whether a newer generation (or session) than `binding`'s now exists for
-    /// its device: a redial registered a new link after `binding` ended.
-    pub fn generation_replaced(&self, binding: &SessionBinding) -> bool {
+    /// Whether a newer generation than `binding`'s exists for its device AND
+    /// already has a WebRTC attempt: the device-keyed state (a share, a remote
+    /// session, transfers) is then that peer's, not the ended one's. A newer
+    /// generation without a peer yet owns nothing, so the ended peer's state
+    /// must still be reset.
+    pub fn newer_generation_has_peer(&self, binding: &SessionBinding) -> bool {
         let Ok(sessions) = self.sessions.lock() else {
             return false;
         };
@@ -619,6 +622,7 @@ impl DeviceManager {
             session.state != SessionState::Terminated
                 && (session.session_id != binding.session_id
                     || session.connection_generation > binding.generation)
+                && session.webrtc_attempt_id.is_some()
         })
     }
 

@@ -665,10 +665,11 @@ impl Drop for PeerWorkerGuard {
             self.sessions.active_webrtc_attempt(&self.binding),
             Ok(Some(ref active)) if active != &self.attempt_id
         );
-        // Or a redial registered a newer generation while this worker was
-        // leaving: its device-keyed state (a Phone Screen share, a remote
-        // session, transfers) is the newer generation's now.
-        if superseded || self.sessions.generation_replaced(&self.binding) {
+        // Or a redial registered a newer generation that already has its own
+        // peer: the device-keyed state (a Phone Screen share, a remote
+        // session, transfers) is that peer's now. With no newer peer yet it
+        // is still this one's to reset (a stale Controlling lease, the portal).
+        if superseded || self.sessions.newer_generation_has_peer(&self.binding) {
             return;
         }
         reset_device_webrtc_state(&self.binding.device_id);

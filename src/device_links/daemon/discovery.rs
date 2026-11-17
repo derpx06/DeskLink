@@ -812,9 +812,8 @@ impl DaemonWorker {
                         crate::device_links::limits::log_limited_every(
                             "slot-refused-dial",
                             &format!(
-                                "{} Not dialling {}: too many handshakes in progress to {ip}",
+                                "{} Not dialling a phone: too many handshakes in progress to {ip}",
                                 crate::device_links::webrtc::coordinator::stamp(),
-                                info.id
                             ),
                             Duration::from_secs(30),
                         );
@@ -860,8 +859,9 @@ impl DaemonWorker {
                                 crate::device_links::limits::log_limited_every(
                                     "redial-failing",
                                     &format!(
-                                        "{} Redialling {id}: {addresses} address(es), {failures} failure(s), next try in {}s",
+                                        "{} Redialling {}: {addresses} address(es), {failures} failure(s), next try in {}s",
                                         crate::device_links::webrtc::coordinator::stamp(),
+                                        id.chars().take(8).collect::<String>(),
                                         next.map_or(0, |next| next.as_secs())
                                     ),
                                     Duration::from_secs(30),
@@ -1185,7 +1185,7 @@ fn handle_identity_packet(
             book.candidate(&info.id, address.ip());
             book.wake(Some(&info.id));
         }
-        crate::device_links::webrtc::coordinator::recovery_sign(
+        crate::device_links::webrtc::coordinator::recovery_sign_from_beacon(
             &info.id, sessions, config, devices, events,
         );
         probe_silent_link(sessions, &info.id);

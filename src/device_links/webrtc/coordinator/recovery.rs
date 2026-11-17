@@ -180,6 +180,31 @@ pub(crate) fn recovery_sign(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     events: &Arc<Mutex<Vec<DaemonEvent>>>,
 ) {
+    sign(device_id, sessions, config, devices, events, true);
+}
+
+/// [`recovery_sign`] for a beacon: authenticated only by a cleartext device id,
+/// so for a phone with no link it resets the ladder but leaves the honest
+/// "Can't reach" words alone (only Try again, a network change or a link clear
+/// them).
+pub(crate) fn recovery_sign_from_beacon(
+    device_id: &str,
+    sessions: &Arc<DeviceManager>,
+    config: &Arc<Mutex<Config>>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
+) {
+    sign(device_id, sessions, config, devices, events, false);
+}
+
+fn sign(
+    device_id: &str,
+    sessions: &Arc<DeviceManager>,
+    config: &Arc<Mutex<Config>>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
+    clears_words_without_link: bool,
+) {
     let Some(binding) = sessions
         .current_bindings()
         .into_iter()
@@ -187,13 +212,15 @@ pub(crate) fn recovery_sign(
     else {
         // The session has no link (it was cut): still a sign of a paired
         // phone, so "Try again" and a network change reset the ladder and the
-        // "Can't reach" words now, not when a link next registers.
-        if sign_is_new(device_id, std::time::Instant::now()) {
-            if let Some(attempt) = sessions.reset_recovery(device_id) {
-                if recovery_delay(attempt).is_none() || shows_unavailable(devices, device_id) {
-                    clear_error(devices, device_id);
-                }
-            }
+        // "Can't reach" words now, not when a link next registers. (This
+        // takes the 1 s sign debounce slot, so a with-link sign right after,
+        // such as an adopted socket, is dropped: the ladder is already reset.)
+        if sign_is_new(device_id, std::time::Instant::now())
+            && sessions.reset_recovery(device_id).is_some()
+            && clears_words_without_link
+            && shows_unavailable(devices, device_id)
+        {
+            clear_error(devices, device_id);
         }
         return;
     };

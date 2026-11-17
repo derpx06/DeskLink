@@ -45,7 +45,7 @@ pub(super) fn incoming_tcp_loop(
                     crate::device_links::limits::log_limited_every(
                         "slot-refused",
                         &format!(
-                            "{} Refused a connection from {}: too many handshakes in progress",
+                            "{} Refused a connection from {} (a local address): too many handshakes in progress",
                             crate::device_links::webrtc::coordinator::stamp(),
                             source.ip()
                         ),

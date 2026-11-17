@@ -1379,11 +1379,12 @@ fn the_worker_guard_clears_its_attempt_on_panic_but_not_a_newer_one() {
     assert_eq!(attempt(&desktop).as_deref(), Some("a2"));
 }
 
-/// F-QA3-4 hardening: an OLD generation's worker leaving late (a redial already
-/// registered a newer link) must not tear down the device-keyed state of the
-/// newer generation (a Phone Screen share, a remote session, transfers).
-#[test]
-fn a_late_old_worker_leaves_the_newer_generations_state_alone() {
+/// F-QA3-4 hardening: an OLD generation's worker leaving late, after a redial
+/// registered a newer link. If the newer generation already has its own peer,
+/// the device-keyed state (a Phone Screen share, a remote session, transfers)
+/// is that peer's and survives; with no newer peer yet it is still the ended
+/// peer's, and is reset (a stale lease, the portal).
+fn late_old_worker(newer_has_peer: bool) -> Option<(i32, i32)> {
     use super::PeerWorkerGuard;
     use crate::device_links::core::test_link::TestNetwork;
     use crate::device_links::daemon::test_peer::peer_pair;
@@ -1396,6 +1397,14 @@ fn a_late_old_worker_leaves_the_newer_generations_state_alone() {
         old.generation, desktop.binding.generation,
         "a newer generation"
     );
+    if newer_has_peer {
+        desktop
+            .sessions
+            .with_session(&desktop.binding, |session| {
+                session.webrtc_attempt_id = Some("new".to_string())
+            })
+            .unwrap();
+    }
     let id = desktop.peer_id();
     let mut shown = crate::device_links::webrtc::remote_session::RemoteSession::new();
     shown.set_phone_screen(1080, 2400);
@@ -1408,20 +1417,29 @@ fn a_late_old_worker_leaves_the_newer_generations_state_alone() {
         attempt_id: "old".into(),
         sessions: Arc::clone(&desktop.sessions),
     });
-    let kept = crate::device_links::webrtc::remote_session::sessions()
-        .lock()
-        .unwrap()
-        .get(&id)
-        .and_then(|session| session.phone_screen());
-    assert_eq!(
-        kept,
-        Some((1080, 2400)),
-        "the new generation's share survived"
-    );
     crate::device_links::webrtc::remote_session::sessions()
         .lock()
         .unwrap()
-        .remove(&id);
+        .remove(&id)
+        .and_then(|session| session.phone_screen())
+}
+
+#[test]
+fn a_late_old_worker_leaves_the_newer_generations_state_alone() {
+    assert_eq!(
+        late_old_worker(true),
+        Some((1080, 2400)),
+        "the new peer's share survived"
+    );
+}
+
+#[test]
+fn a_late_old_worker_still_resets_its_own_state_when_the_newer_generation_has_no_peer() {
+    assert_eq!(
+        late_old_worker(false),
+        None,
+        "the ended peer's state was reset"
+    );
 }
 
 /// F-QA3-4 hardening: with the session's link gone (`disconnect_if_current`),
@@ -1460,6 +1478,16 @@ fn a_sign_of_a_phone_with_no_link_still_clears_the_unavailable_state() {
     assert!(sessions.current_bindings().is_empty(), "no link");
     super::reconnect("00-nolink", &sessions, &config, &devices, &Arc::default());
     assert_eq!(devices.lock().unwrap()["00-nolink"].last_error, None);
+    // A beacon (cleartext id only) resets the ladder but leaves the words.
+    devices
+        .lock()
+        .unwrap()
+        .get_mut("00-nolink")
+        .unwrap()
+        .last_error = Some(super::unavailable_words("Pixel 9"));
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    super::recovery_sign_from_beacon("00-nolink", &sessions, &config, &devices, &Arc::default());
+    assert!(devices.lock().unwrap()["00-nolink"].last_error.is_some());
     // The ladder starts over too (read through the paired session by id).
     assert_eq!(sessions.reset_recovery("00-nolink"), Some(0));
     crate::device_links::daemon::discovery::forget_addresses("00-nolink");

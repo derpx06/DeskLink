@@ -121,7 +121,8 @@ pub(crate) use phone_remote::{
     stamp_remote_input, start_phone_remote_control, stop_phone_remote_control,
 };
 pub(crate) use recovery::{
-    claim_start, is_unavailable, reconnect, recovery_delay, recovery_sign, update_words,
+    claim_start, is_unavailable, reconnect, recovery_delay, recovery_sign,
+    recovery_sign_from_beacon, update_words,
 };
 #[cfg(test)]
 pub(crate) use recovery::{unavailable_words, HEALTHY_AFTER};
