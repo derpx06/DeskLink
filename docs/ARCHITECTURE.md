@@ -1,4 +1,4 @@
-# DeskLink 1.3 technical architecture
+# DeskLink 0.3 technical architecture
 
 Status: written 2026-11-06 from the code on the checked-out trees (desk `DeskLink/` branch `webrtc-stabilisation` at `2a07423`; phone `desklink-mobile/` branch `webrtc-stabilisation` at `255c8da`) and the workspace documents (`CLAUDE.md`, `docs/WEBRTC.md`, `docs/RELAY.md`, `docs/PAIRING-OFF-LAN.md`, `docs/LINUX-SUPPORT.md`, `docs/TERMINALS-MOBILE.md`, `docs/UI-REDESIGN.md`, `docs/FEATURE-STATUS.md`, `docs/IDENTIFIER_COMPATIBILITY.md`, `docs/protocol/stageD-protocol.md`). No build or test was run to write it. Where a document and the code disagree, the code is described and the disagreement is listed in section 15.5. Citations are `path:line` (line numbers drift; treat them as pointers). Desktop paths are under `DeskLink/src/`, phone paths under `desklink-mobile/src/main/java/org/desklink/mobile/`, unless a path starts with `docs/`, `protocol/` or `tools/` (workspace root).
 
@@ -6,7 +6,7 @@ Contents: 1 Product and goals; 2 System context; 3 Repo and module map; 4 Identi
 
 ## 1. Product and goals
 
-DeskLink is one product in two apps: a Rust + GTK4/libadwaita desktop client for Linux (`DeskLink/`, crate `desklink` 1.3.0, `DeskLink/Cargo.toml`) and a Kotlin/Java Android app (`desklink-mobile/`, package `org.desklink.mobile`, versionName `1.3.0`, versionCode `20300`, `minSdk 24`, `targetSdk 36`, `desklink-mobile/build.gradle.kts:35-42`). A phone and a computer pair once by scanning a QR code, then use each other: shared clipboard, phone notifications on the desk, notes and snippets, contacts, a shared "Bucket" folder, file transfer, shared terminals, the computer's screen on the phone (view, remote control, a second display), the phone's screen on the computer, calls, sound, lock/unlock and hand-off. There are no accounts (`DeskLink/README.md`).
+DeskLink is one product in two apps: a Rust + GTK4/libadwaita desktop client for Linux (`DeskLink/`, crate `desklink` 0.3.0, `DeskLink/Cargo.toml`) and a Kotlin/Java Android app (`desklink-mobile/`, package `org.desklink.mobile`, versionName `0.3.0`, versionCode `20300`, `minSdk 24`, `targetSdk 36`, `desklink-mobile/build.gradle.kts:35-42`). A phone and a computer pair once by scanning a QR code, then use each other: shared clipboard, phone notifications on the desk, notes and snippets, contacts, a shared "Bucket" folder, file transfer, shared terminals, the computer's screen on the phone (view, remote control, a second display), the phone's screen on the computer, calls, sound, lock/unlock and hand-off. There are no accounts (`DeskLink/README.md`).
 
 It grew out of KDE Connect and speaks **DeskLink Protocol v9** (packet types `desklink.*`, mDNS service `_desklink._udp`, protocol constant `9`). It is not a KDE product and does not interoperate with real KDE Connect peers (`CLAUDE.md`, `docs/PROTOCOL_COMPATIBILITY.md`).
 
@@ -19,7 +19,7 @@ Goals that shape the architecture (each is a binding invariant in the workspace 
 5. **Frozen identifiers.** `org.desklink.mobile`, `derx06.desklink.com`, the `desklink` executable and `~/.config/desklink/` are installed or persisted state and are not renamed (`docs/IDENTIFIER_COMPATIBILITY.md`).
 6. **Same product, two bodies.** The two apps mirror each other's contracts (packets, channels, capabilities, QR proof, file protocol, UI tokens and words); a wire change is a paired edit (section 3).
 
-Non-goals stated in the repo: interoperability with KDE Connect, KDE branding, account-based sync, and (removed in 1.3) phone file browsing/SFTP, automations, run commands, drawing pad, presenter, webcam, remote keyboard, TV remote, Bluetooth link/call audio and system-volume sync (`docs/WEBRTC.md` "Removed in 1.3"; "Type on phone" was removed on 2026-11-03, `docs/protocol/stageD-protocol.md` W16).
+Non-goals stated in the repo: interoperability with KDE Connect, KDE branding, account-based sync, and (removed in 0.3) phone file browsing/SFTP, automations, run commands, drawing pad, presenter, webcam, remote keyboard, TV remote, Bluetooth link/call audio and system-volume sync (`docs/WEBRTC.md` "Removed in 0.3"; "Type on phone" was removed on 2026-11-03, `docs/protocol/stageD-protocol.md` W16).
 
 ## 2. System context
 
@@ -180,7 +180,7 @@ A change to anything in this table is a **paired edit** (workspace `CLAUDE.md`, 
 
 ---
 
-### 3.5 Module rules (phase 3, 1.3)
+### 3.5 Module rules (phase 3, 0.3)
 
 The desk code is split by responsibility: no file over about 1 000 lines of production code, except the few noted below. A large area is a directory module: `mod.rs` is its **facade**, and the files next to it are its **parts**.
 
@@ -297,7 +297,7 @@ Trust is written by `Config::trust_device`; a failed save reverts the session st
 
 ### 4.5 Off-LAN seam: `PairingTransport`
 
-Pairing never crosses the relay in 1.3. The seam that makes adding it small:
+Pairing never crosses the relay in 0.3. The seam that makes adding it small:
 
 | | Desktop | Android |
 |---|---|---|
@@ -468,7 +468,7 @@ The 23 `@LoadablePlugin` classes (`plugins/`, counted by file): Activity, Batter
 * **Intersection, not comparison.** The handover lists, filtered by our profile, must be a subset of the signed identity lists (`handover_list_is_consistent`, also `WebRtcSessionCoordinator.kt:2271`); `record_peer_profile` stores them; a type is **sent** only if the peer's handover `incomingCapabilities` has it (`peer_accepts`, `:217`) and **accepted** only if its `outgoingCapabilities` has it (`peer_sends`, `:228`). A type one build lacks is simply off between those two builds. Both return true when no handover is recorded yet.
 * **Dispatch order** (`SharedPacketDispatcher::authorize`): bootstrap types only from the LAN bootstrap; payload descriptors refused on either source; unpaired -> `UnpairedFeature`; any non-bootstrap packet from LAN -> `FeatureOnLan`; WebRTC before feature-ready -> `UnpairedFeature`; outside the profile or failing `peer_sends` -> `FeatureNotEnabled`; not in the desk's incoming list -> `UnsupportedByDeskLink`; not in the peer's identity outgoing list -> `UnsupportedByPeer`.
 * **Direction split of the 33 profile types**: both ways (18): clipboard, clipboard.connect, filelane.v1, findmyphone.request, folders, lock.request, mousepad.request, mpris, mpris.request, notes, notification, notification.request, ping, settings.request (desk to phone only `{set:{glide:true}}`), share.request, snippets, sync.have, unlock.request. Phone to desk only (6): activity, battery, contacts.response_uids_timestamps, contacts.response_vcards, shareinputdevices, telephony. Desk to phone only (9): contacts.request_all_uids_timestamps, contacts.request_vcards_by_uid, handoff, lock, notification.action, notification.reply, settings, shareinputdevices.request, telephony.request (asserted at `registry.rs:606`).
-* **Removed in 1.3** (`REMOVED_TYPES`, 15): `mousepad.keyboardstate`, `automations`, `runcommand`, `runcommand.request`, `digitizer`, `digitizer.session`, `presenter`, `mousepad.echo`, `systemvolume`, `systemvolume.request`, `connectivity_report`, `share.request.update`, `notification.cancel`, `telephony.request_mute`, `sms.request`. In no list, so refused on both sides (`FeatureNotEnabled`; phone `Device.kt:1057`).
+* **Removed in 0.3** (`REMOVED_TYPES`, 15): `mousepad.keyboardstate`, `automations`, `runcommand`, `runcommand.request`, `digitizer`, `digitizer.session`, `presenter`, `mousepad.echo`, `systemvolume`, `systemvolume.request`, `connectivity_report`, `share.request.update`, `notification.cancel`, `telephony.request_mute`, `sms.request`. In no list, so refused on both sides (`FeatureNotEnabled`; phone `Device.kt:1057`).
 
 ### 7.4 `FeatureTransport` and queueing
 
@@ -781,14 +781,14 @@ The trust root on each side is the **certificate stored at pairing**. Boundaries
 
 | Item | Fact | Source |
 |---|---|---|
-| Crate | `desklink` 1.3.0, edition 2021, `rust-version = "1.85"`; release profile `lto = "thin"`, `codegen-units = 1`, panics unwind (the crash reporter and handler guards need it) | `Cargo.toml` |
+| Crate | `desklink` 0.3.0, edition 2021, `rust-version = "1.85"`; release profile `lto = "thin"`, `codegen-units = 1`, panics unwind (the crash reporter and handler guards need it) | `Cargo.toml` |
 | Key dependencies | gtk4 0.9 (`v4_12`), libadwaita 0.7 (`v1_5`), gstreamer 0.23.6, gstreamer-webrtc 0.23.5 (`v1_22`), `gst-plugin-gtk4` (bundled paintable sink, used only where the distro ships none), openssl, `tungstenite` (relay client), `portable-pty`, `vt100`, `reis` (libei), `mdns-sd`, `x11rb` (xtest, xfixes), `arboard`, `qrcode`, `desklink-relay` (protocol types only) | `Cargo.toml` |
 | Resources | `build.rs` runs `glib-compile-resources` over `src/desklink.gresource.xml` and panics if the tool is missing; reruns on `window.ui`, `shortcuts-dialog.ui`, `style.css`, `ui-kit.css`, `files-ui.css`, `src/icons`, `src/fonts` | `build.rs` |
 | Meson | Packaging path. `src/meson.build` runs `cargo build --locked [--release]` into the build dir and copies the binary to `bindir`; installs the GNOME Shell extension, the desktop/metainfo/schema/search-provider/D-Bus service files and the licences. Meson tests: `desktop-file-validate`, `appstreamcli validate --no-net --explain`, `glib-compile-schemas --strict --dry-run` | `meson.build`, `src/meson.build`, `data/meson.build` |
 | `config.rs` | `src/config.rs` is checked in and hand-written (`VERSION` from `CARGO_PKG_VERSION`, `LOCALEDIR` from `DESKLINK_LOCALEDIR` at build time). `config.rs.in` is not referenced by any meson file (the workspace `CLAUDE.md` says otherwise; see section 15.5) | `src/config.rs`, `src/meson.build` |
 | i18n | gettext via `i18n.gettext('desklink')`; `po/LINGUAS` lists no language, so nothing is translated yet | `po/` |
 | Flatpak | `derx06.desklink.com.json`, runtime `org.gnome.Platform` 51, `rust-stable` extension. `finish-args` include `--talk-name=org.freedesktop.Flatpak` (host terminals via `flatpak-spawn --host`), so it is **not a sandbox**; every finish-arg must be justified in `SECURITY.md`, which `flatpak/check-manifest.py [--release]` enforces together with the tag `v<Cargo version>` | `derx06.desklink.com.json`, `flatpak/check-manifest.py` |
-| Native packages | `packaging/debian` (native 3.0), `packaging/obs/desklink.spec`, `packaging/aur/{desklink,desklink-bin}`, `flake.nix` (all 1.3.0; all go through meson, which calls `cargo build --locked`) | `packaging/README.md` |
+| Native packages | `packaging/debian` (native 3.0), `packaging/obs/desklink.spec`, `packaging/aur/{desklink,desklink-bin}`, `flake.nix` (all 0.3.0; all go through meson, which calls `cargo build --locked`) | `packaging/README.md` |
 | Supply chain | `deny.toml` (cargo-deny: licence allow-list, bans, crates.io only, `yanked=deny`); `scripts/third-party-licenses.sh` regenerates `THIRD_PARTY_LICENSES` | `deny.toml`, `scripts/` |
 | Relay | Separate crate `DeskLink/relay` (`desklink-relay` 0.1.0, own workspace and lock; sources `auth config hub limits main protocol server turn`). Build: `cd DeskLink/relay && cargo build --release`. Deploy: one small VPS, Caddy terminating TLS in front of the relay on 127.0.0.1:8080, optional coturn, or Cloudflare Realtime TURN (`relay/deploy/DEPLOY.md`) | `relay/` |
 
@@ -810,7 +810,7 @@ CI (`DeskLink/.github/workflows/ci.yml`, SHA-pinned actions) runs on pushes to `
 
 | Item | Fact |
 |---|---|
-| Identity | `applicationId` `org.desklink.mobile`; debug build adds `.debug` and `-debug`. `compileSdk 37`, `minSdk 24`, `targetSdk 36`, versionName `1.3.0`, versionCode `20300` (rule: 20000 + minor*100 + patch), JVM target 11, core-library desugaring (`build.gradle.kts`) |
+| Identity | `applicationId` `org.desklink.mobile`; debug build adds `.debug` and `-debug`. `compileSdk 37`, `minSdk 24`, `targetSdk 36`, versionName `0.3.0`, versionCode `20300` (rule: 20000 + minor*100 + patch), JVM target 11, core-library desugaring (`build.gradle.kts`) |
 | Build types | `debug` signed with the checked-in `debug.keystore` (historical compatibility material, never regenerate); `release` minified, ABIs arm64-v8a + armeabi-v7a unless `-PallAbis`, signed only when `DESKLINK_UPLOAD_KEYSTORE` is provided, otherwise `*-release-unsigned.apk` |
 | Relay default | `BuildConfig.DEFAULT_RELAY_URL` from Gradle property or env `DESKLINK_RELAY_URL`, else `""` |
 | OCR | `-Pdesklink.ocr=true` selects source set `src/ocr/java` (Google ML Kit, about +18 MB, proprietary licence); default `false` selects `src/noocr/java` (a stub that answers "not available") |
@@ -943,11 +943,11 @@ Found while writing this document; none was fixed. The code is taken as authorit
 | # | Documents say | Code or tree says |
 |---|---|---|
 | 1 | `docs/protocol/stageD-protocol.md` W18 section 1 names the control channel `desklink-file-control-v2` | `desklink-file-control-v1` on both sides (`webrtc/mod.rs:152`, `WebRtcChannel.kt:16`); only the data channel is v2; `docs/WEBRTC.md` has it right |
-| 2 | `DeskLink/README.md` still lists "a browser for the phone's files" and "a presentation remote" | Both were removed in 1.3 (`docs/WEBRTC.md` "Removed in 1.3") |
+| 2 | `DeskLink/README.md` still lists "a browser for the phone's files" and "a presentation remote" | Both were removed in 0.3 (`docs/WEBRTC.md` "Removed in 0.3") |
 | 3 | `phone_connect/CLAUDE.md`: "lint has abortOnError = false" | `desklink-mobile/build.gradle.kts:142` has `abortOnError = true` with `lint-baseline.xml` (168 entries; the "4 baseline errors" in the status notes are a subset) |
 | 4 | `phone_connect/CLAUDE.md`: meson "regenerates `src/config.rs` from `src/config.rs.in`" | No meson file references `config.rs.in`; `src/config.rs` is hand-written and checked in |
 | 5 | `flatpak/README.md`: runtime GNOME 51 "because DeskLink needs GStreamer 1.28 (`v1_28`)" | `Cargo.toml` uses `v1_22`; CI/Debian/RPM state a 1.22 floor |
-| 6 | `SECURITY.md` supported versions: only 1.0.x; `packaging/obs/_service` has `revision v1.0.0` | Version is 1.3.0 everywhere else |
+| 6 | `SECURITY.md` supported versions: only 1.0.x; `packaging/obs/_service` has `revision v1.0.0` | Version is 0.3.0 everywhere else |
 | 7 | `webrtc/mod.rs` comment: the `Terminal` channel is "reserved for a future ... feature"; `application/mod.rs` comment: "port 1717"; `daemon/mod.rs` comment: "Android's 120 s idle reaper" | Terminals use the channel (`coordinator/terminal_pump.rs`, `terminal_bridge/`); the TCP range is 1716-1764; Android's `IDLE_TIMEOUT_MILLIS` is 35 s |
 | 8 | `docs/WEBRTC.md`, `CLAUDE.md`: a negotiation not feature-ready within 10 s is rebuilt; `PEER_PROBE_AFTER`/`PEER_DEAD_AFTER` "mirrored on Android" | The 10 s rule and `PEER_DEAD_AFTER_DOZING` exist only on the desk; Android has a 5 s answer watchdog and a 20 s attempt-stall check, and reports `dozing` instead. Android's recovery policy never stops, whereas the desk stops initiating after the sixth rung |
 | 9 | `CLAUDE.md`: redialer dials "last three IPv4s and one IPv6" | Only `MAX_ADDRESSES = 3` plus 2 unverified candidates and a comment were found; no code enforcing an IPv6 slot was located |
@@ -957,7 +957,7 @@ Found while writing this document; none was fixed. The code is taken as authorit
 | 13 | `HandoverCapabilitiesTest` pinned `deskSends` 25 / `deskAccepts` 22 | Fixed: it now lists `filelane.v1` (both) and `activity` (accepts), 27 and 24 like the desk |
 | 14 | - | `MousePadPlugin.onPacketReceived` still reads `"state"` into `isKeyboardEnabled` (dead code from the removed `keyboardstate`) |
 | 15 | Notes caps described as shared | Per-packet items: desk 200 / phone 500; index entries: desk 4000 / phone 5000 (stored caps equal) |
-| 16 | Removed in 1.3 | `RemovedFeatures` markers are named `type_removed_1_4` and `simplified_2_0`; the `versionCode` comment mentions a first build "2.0.0" |
+| 16 | Removed in 0.3 | `RemovedFeatures` markers are named `type_removed_1_4` and `simplified_2_0`; the `versionCode` comment mentions a first build "2.0.0" |
 | 17 | `CLAUDE.md`: storage root `~/.config/desklink/` | The config lives under `~/.config/desklink/protocol/` (`IDENTIFIER_COMPATIBILITY.md` has it right) |
 | 18 | `docs/UI-REDESIGN.md` spec: buttons 12 dp, cards 16, rail 80 dp, 64 dp bar, token names `outline`/`hint`/`live*`, both apps on one dark palette, `px` -> `em` on the desk | Phone buttons are stadium (desk buttons are 12 px), cards 20, rail 88 dp, floating 68 dp pill bar, tokens named `hairlineStrong`/`textFaint`/`coral*`; phone dark `bg 111113` vs desk `131315`; two desk token sets coexist; `style.css` has 34 `px` sizes; breakpoints are 860/480/760 sp; the extension tile set is Files/Clipboard/Ring/Lock/Screen/Photo (no Hand off). The spec's harness paths `~/.cache/ui-audit/...` and a `high-contrast` e2e verb do not exist; "switchOutline pinned in TokenContrastTest" was not confirmed |
 | 19 | `docs/FEATURE-STATUS.md`: desk `webrtc-stabilisation` = `f5fd840`; phone work on `phone-int2`, not pushed | The checked-out desk branch is `2a07423` (two wobble-guard commits ahead); the phone's `webrtc-stabilisation` is `255c8da`, ahead of `phone-int2` (`dd18e12`) by the Extend commits. Test counts therefore differ by tree |

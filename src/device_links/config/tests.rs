@@ -65,7 +65,7 @@ fn no_relay_is_wanted_until_one_is_set_up() {
     );
 }
 
-/// 1.3 ships LAN-only: with the switch off, even a stored relay address,
+///  0.3 ships LAN-only: with the switch off, even a stored relay address,
 /// "on" and "Use TURN" (kept untouched in config.json) reach nothing.
 #[test]
 fn the_relay_compiled_out_ignores_every_stored_relay_setting() {
@@ -197,7 +197,7 @@ fn terminal_access_is_off_by_default_and_for_configs_that_predate_it() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// 1.3: what removed features stored is deleted on the first start, quietly;
+/// 0.3: what removed features stored is deleted on the first start, quietly;
 /// pairing records, the certificate and every other preference stay.
 #[test]
 fn the_stored_data_of_removed_features_goes_on_first_start_and_nothing_else() {
@@ -808,7 +808,7 @@ fn a_failed_save_at_start_is_not_fatal() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// 1.3 cleans up after itself: the old restore-token file and the old
+///  0.3 cleans up after itself: the old restore-token file and the old
 /// transfer folder go, quietly, once.
 #[test]
 fn leftover_tokens_and_old_transfer_state_are_removed() {

@@ -14,8 +14,11 @@ ready, and the advisory is published once users can update.
 
 | Version | Supported |
 |---|---|
-| 1.0.x | Yes |
-| < 1.0 | No |
+| 0.3.x (beta) | Yes |
+| < 0.3 | No |
+
+The relay and TURN are compiled off in 0.3 (LAN only); the relay and TURN sections
+below describe a build with them on.
 
 ## What is protected, and how
 
@@ -120,7 +123,7 @@ It **can** see:
 
 If no direct path exists and TURN is allowed, encrypted media may flow through
 a TURN server (Cloudflare Realtime or a self-hosted coturn). It sees IP
-addresses and traffic volume, not content. Turn TURN off under Preferences →
-Away From Home to allow direct paths only.
+addresses and traffic volume, not content. TURN is used exactly when the relay is
+(`RELAY_ENABLED`, off in 0.3); there is no setting for it.
 
 Running your own relay: [`relay/deploy/DEPLOY.md`](relay/deploy/DEPLOY.md).

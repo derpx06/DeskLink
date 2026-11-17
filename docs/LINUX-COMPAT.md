@@ -1,4 +1,4 @@
-# DeskLink 1.3 on Linux: distributions and desktops
+# DeskLink 0.3 on Linux: distributions and desktops
 
 What builds and runs where, and what each feature does on each desktop. Rows
 that cannot work say so in **Settings → Advanced → System check** and in

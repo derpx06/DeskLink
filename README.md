@@ -1,7 +1,11 @@
 # DeskLink
 
-Use your Android phone and your GNOME desktop together. DeskLink is a Rust,
-GTK 4 and libadwaita desktop app; it pairs with the DeskLink Android app.
+Use your Android phone and your Linux desktop together (checked on GNOME, KDE
+Plasma, Xfce, Cinnamon, MATE and sway). DeskLink is a Rust, GTK 4 and libadwaita
+desktop app; it pairs with the DeskLink Android app (Android 7.0 or newer).
+
+**0.3.0 is a beta**, the first public release: it works, and it is still being
+shaped. Please report problems on the issue tracker.
 
 - See your phone's screen on the desktop, with low latency.
 - Control the computer's mouse and keyboard from the phone, after you approve
@@ -10,11 +14,13 @@ GTK 4 and libadwaita desktop app; it pairs with the DeskLink Android app.
   Code or Codex on the computer.
 - Phone notifications on the desktop, with replies and actions.
 - Clipboard sync in both directions, and text and link sharing.
-- File transfer both ways, and a browser for the phone's files.
-- A presentation remote, ping, find-my-phone, battery status, and locking the
-  desktop session from the phone.
+- File transfer both ways, and a Bucket folder kept in step.
+- Ping, find-my-phone, battery status, lock and unlock from the phone, notes
+  and snippets, contacts and calls on the computer, media control both ways,
+  the phone's microphone or sound here and this computer's sound there, and
+  Glide (the pointer carrying on onto the phone).
 - Works on your Wi-Fi network (LAN). Connecting away from home through the
-  DeskLink relay is built but switched off in 1.3 (see "Away from home").
+  DeskLink relay is built but switched off in 0.3 (see "Away from home").
 - No account. Devices pair directly by scanning a code.
 
 DeskLink speaks DeskLink Protocol v9. It grew out of KDE Connect but is not a
@@ -26,7 +32,7 @@ KDE product and does not interoperate with KDE Connect peers.
 
 | Distribution | How | Notes |
 |---|---|---|
-| Any (x86_64, aarch64) | Flatpak | Everything bundled; the recommended install |
+| Any (x86_64) | Flatpak bundle from GitHub Releases | Everything bundled; not a sandbox (see below) |
 | Debian 13 (trixie) | native `.deb` ([`packaging/debian`](packaging/debian)) | Built with Debian's own Rust 1.85 |
 | Ubuntu 24.04 LTS and newer | native `.deb` | 24.04 needs the `rustc-1.85` toolchain package; it ships no `gstreamer1.0-gtk4`, which DeskLink bundles |
 | Fedora 43 and newer | native RPM ([`packaging/obs`](packaging/obs)) | H.264 needs `gstreamer1-plugin-openh264` or `gstreamer1-plugin-libav` |
@@ -43,7 +49,7 @@ Controlling this computer from the phone depends on the desktop:
 |---|---|---|
 | GNOME, KDE Plasma | yes (portal) | yes (portal) |
 | Cinnamon, MATE, XFCE and other X11 desktops | yes (X11 fallback, native packages only: the Flatpak runtime has no X11 capture) | yes (XTest), after approving the phone at the desk under Remote Control |
-| COSMIC, wlroots compositors (Sway, Hyprland, ...) | not yet: their portals offer ScreenCast but not RemoteDesktop, and DeskLink needs both for any desktop share | not yet |
+| COSMIC, wlroots compositors (Sway, Hyprland, ...) | yes where the portal offers ScreenCast, view only (sway checked; COSMIC expected) | no: there is no RemoteDesktop portal |
 
 Settings, Advanced, System check (or `desklink --check`) lists what works on
 your computer and the packages to install for the rest.
@@ -51,15 +57,17 @@ your computer and the packages to install for the rest.
 The X11 fallback is used only when the session is X11 and the portal offers no
 screen sharing. It captures every monitor as one picture.
 
-### Flathub
-
-Once the app is published on Flathub:
+### Flatpak bundle
 
 ```sh
-flatpak install flathub derx06.desklink.com
+flatpak install --user ./desklink-0.3.0-x86_64.flatpak
 ```
 
-The sandboxed build keeps its own pairing records, so phones paired with
+The bundle is on GitHub Releases. It is not on Flathub: shared terminals need
+`--talk-name=org.freedesktop.Flatpak`, which removes the sandbox (see
+[`SECURITY.md`](SECURITY.md)).
+
+The Flatpak build keeps its own pairing records, so phones paired with
 another install of DeskLink need to pair again. See
 [`flatpak/README.md`](flatpak/README.md) for its permissions and known
 limitations.
@@ -80,8 +88,8 @@ needs a glibc at least as new as Arch's; elsewhere use the Flatpak or a native
 package. Install it with:
 
 ```sh
-tar -xzf desklink-1.3.0-x86_64.tar.gz
-sudo cp -r desklink-1.3.0-x86_64/usr/. /usr/
+tar -xzf desklink-0.3.0-x86_64.tar.gz
+sudo cp -r desklink-0.3.0-x86_64/usr/. /usr/
 sudo gtk-update-icon-cache -qtf /usr/share/icons/hicolor
 ```
 
@@ -167,11 +175,12 @@ cargo build --release
 
 Release builds should set `DESKLINK_RELAY_URL=wss://<your relay>/v1` in the
 environment at build time; it becomes the default relay address. Without it
-there is no default relay, and one can be set as `relay_url` in config.json.
+there is no default relay, and one can be set as `relay_url` in
+`protocol/config.json`.
 
 ## Away from home
 
-**Off in 1.3.** This release is LAN-only. The relay is controlled only in
+**Off in 0.3.** This release is LAN-only. The relay is controlled only in
 code, by `RELAY_ENABLED` in `src/device_links/relay_link/mod.rs` (and
 `BuildConfig.RELAY_ENABLED` in the Android app); there is no setting to turn
 it or TURN on or off. The rest of this section describes the feature for a
@@ -181,8 +190,9 @@ On the same network, devices find each other and connect directly. When they
 are apart, DeskLink can reach the phone through the **DeskLink relay**, a small
 WebSocket server that only forwards connection setup; media that cannot go
 direct falls back to the relay's TURN server. To use your own relay, set
-`relay_url` (`wss://host/v1`) in `~/.config/desklink/config.json`; there is no
-UI for it.
+`relay_url` (`wss://host/v1`) in `~/.config/desklink/protocol/config.json`
+(Flatpak: `~/.var/app/derx06.desklink.com/config/desklink/protocol/config.json`);
+there is no UI for it.
 
 To run your own relay, see [`relay/deploy/DEPLOY.md`](relay/deploy/DEPLOY.md)
 and [`relay/README.md`](relay/README.md).
@@ -205,10 +215,9 @@ Details are in [`SECURITY.md`](SECURITY.md).
 
 ## What it does not do
 
-MPRIS media control, system volume control and remote command execution exist
-in this app's packet layer but are **not** advertised: the Android app only
-implements them in the phone-controls-desktop direction. SMS, contacts,
-telephony and a mounted phone filesystem are out of scope.
+Browsing the phone's files, the presentation remote, system volume, run
+commands, the drawing pad, the webcam and Bluetooth were removed in 0.3. SMS and
+a mounted phone filesystem are out of scope.
 
 ## Development
 
@@ -220,8 +229,12 @@ match the Android app's `WebRtcFeatureProfile` exactly.
 
 GPL-3.0-or-later. See [`COPYING`](COPYING).
 
-## Screenshots
+## Uninstalling
 
-The AppStream metadata references `data/screenshots/devices.png`,
-`screen.png` and `files.png` on the `master` branch. **These images still need
-to be added** before publishing to Flathub.
+Removing the package or the Flatpak leaves what the app wrote under your home
+folder: `~/.config/desklink/` (pairings and settings, on purpose; delete it to
+forget every phone), the top-bar extension copy in
+`~/.local/share/gnome-shell/extensions/desklink@derx06.github.io` (turn it off
+with `gnome-extensions disable desklink@derx06.github.io` first), and the
+search provider file `~/.local/share/gnome-shell/search-providers/derx06.desklink.com.search-provider.ini`.
+Flatpak: `flatpak uninstall --delete-data derx06.desklink.com`.

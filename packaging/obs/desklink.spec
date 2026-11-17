@@ -11,7 +11,7 @@
 %global debug_package %{nil}
 
 Name:           desklink
-Version:        1.3.0
+Version:        0.3.0
 Release:        0%{?dist}
 Summary:        Use an Android phone and a Linux desktop together
 License:        GPL-3.0-or-later
@@ -26,6 +26,7 @@ BuildRequires:  gcc
 BuildRequires:  meson >= 1.0.0
 BuildRequires:  gettext
 BuildRequires:  desktop-file-utils
+BuildRequires:  /usr/bin/xmllint
 # glib-compile-resources and glib-compile-schemas (zypper cannot resolve
 # file paths outside OBS).
 %if 0%{?suse_version}

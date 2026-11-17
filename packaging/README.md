@@ -22,7 +22,7 @@ oldest tested is 1.24), OpenSSL 3.0, Rust 1.85, Meson 1.0. VTE 0.76 (`vte-2.91-g
 Terminals page then shows a read-only preview with "Open in terminal
 window", which runs the session in the system terminal.
 
-Built and tested in clean chroots of each release (2026-11, `cargo test`
+Built and tested in clean chroots of each release (2026-11; the later, wider matrix is in `.tools/screenshots/p25-distro/INDEX.md`; `cargo test`
 under Xvfb, then the package installed into a pristine root of the same
 release and `desklink --check` run):
 
@@ -58,10 +58,10 @@ Build dependencies, per family:
 
 | Family | Packages |
 |---|---|
-| Debian 13, Ubuntu 24.04+ | `debhelper meson cargo rustc pkgconf gettext libglib2.0-dev-bin libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev libssl-dev desktop-file-utils` (Ubuntu 24.04: `rustc-1.85 cargo-1.85`) |
+| Debian 13, Ubuntu 24.04+ | `debhelper meson cargo rustc pkgconf gettext libglib2.0-dev-bin libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev libssl-dev desktop-file-utils libxml2-utils` (Ubuntu 24.04: `rustc-1.85 cargo-1.85`) |
 | Fedora | `sudo dnf builddep packaging/obs/desklink.spec` (the spec's `BuildRequires`) |
 | openSUSE | `rpmspec -q --buildrequires packaging/obs/desklink.spec \| xargs -d '\n' sudo zypper install` |
-| Arch | `rust meson gtk4 libadwaita vte4 gstreamer gst-plugins-base gst-plugins-bad libnice openssl` |
+| Arch | `rust meson gtk4 libadwaita vte4 gstreamer gst-plugins-base gst-plugins-bad libnice openssl libxml2` |
 
 Runtime: each package depends on what a fresh install needs to connect
 (`webrtcbin`, `nicesrc`, DTLS/SRTP/SCTP, VP8, Opus, `pipewiresrc`/`pipewiresink`,
@@ -105,7 +105,7 @@ sudo apt install devscripts equivs
 cp -r packaging/debian debian         # dpkg-buildpackage wants ./debian
 sudo mk-build-deps -ir debian/control # installs the Build-Depends
 dpkg-buildpackage -us -uc -b
-sudo apt install ../desklink_1.3.0_*.deb
+sudo apt install ../desklink_0.3.0_*.deb
 ```
 
 The package is `3.0 (native)`: bump `debian/changelog` (`dch -v <version>`)
@@ -123,7 +123,7 @@ GStreamer plugins, `gstreamer1.0-nice`, `gstreamer1.0-pipewire` and
 
 ```sh
 mkdir -p ~/rpmbuild/SOURCES          # openSUSE: add --define "_topdir $HOME/rpmbuild" to rpmbuild
-git archive --prefix=desklink-1.3.0/ -o ~/rpmbuild/SOURCES/desklink-1.3.0.tar.gz HEAD
+git archive --prefix=desklink-0.3.0/ -o ~/rpmbuild/SOURCES/desklink-0.3.0.tar.gz HEAD
 cargo vendor --locked vendor && tar -czf ~/rpmbuild/SOURCES/vendor.tar.gz vendor
 sudo dnf builddep packaging/obs/desklink.spec   # openSUSE: see the BuildRequires line above
 rpmbuild -ba packaging/obs/desklink.spec

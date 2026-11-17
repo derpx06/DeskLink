@@ -3,10 +3,14 @@
 
   flatpak/check-manifest.py            development: placeholders are reported
   flatpak/check-manifest.py --release  a release: a placeholder is an error
+  flatpak/check-manifest.py --release --commit SHA
+                                       as above, with the tag's commit given
+                                       (CI: $GITHUB_SHA) instead of committed
 
 Always checked: the tag names the Cargo.toml/meson version, and every
 finish-arg is explained in SECURITY.md. Release only: the git source carries
-the tag's full commit (TODO(owner): set it after tagging).
+the tag's full commit: committed (the Flathub PR) or given with --commit
+(the release workflow: the tag's own commit cannot be inside the manifest it tags).
 """
 import json, re, sys
 from pathlib import Path
@@ -20,7 +24,10 @@ desklink = next(m for m in manifest["modules"] if isinstance(m, dict) and m.get(
 source = next(s for s in desklink["sources"] if isinstance(s, dict) and s.get("type") == "git")
 if source.get("tag") != f"v{version}":
     errors.append(f"tag {source.get('tag')} is not v{version} (Cargo.toml)")
-if not re.fullmatch(r"[0-9a-f]{40}", source.get("commit", "")):
+given = sys.argv[sys.argv.index("--commit") + 1] if "--commit" in sys.argv[:-1] else ""
+if given and not re.fullmatch(r"[0-9a-f]{40}", given):
+    errors.append(f"--commit {given!r} is not a full commit sha")
+if not re.fullmatch(r"[0-9a-f]{40}", source.get("commit", "") or given):
     todo.append("TODO(owner): add the full commit sha of the tag next to \"tag\" (Flathub requires both)")
 
 security = (root / "SECURITY.md").read_text()
@@ -34,7 +41,7 @@ if "DESKLINK_RELAY_URL" in json.dumps(manifest["build-options"]):
 for line in todo:
     print(("error: " if "--release" in sys.argv else "note: ") + line)
     if "--release" in sys.argv:
-        errors.append(line)
+        errors.append(line.removeprefix("TODO(owner): "))
 for line in errors:
     print("error:", line)
 sys.exit(1 if errors else 0)

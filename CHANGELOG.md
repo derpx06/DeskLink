@@ -1,60 +1,60 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (beta)
 
-- Security: the listener serves local network sources only (and caps unpaired links per network); SECURITY.md
-  now says where the secrets are kept and that the Flatpak build is not a sandbox (shared terminals need host
-  access); the relay's images are pinned and its TURN secret no longer sits on a command line.
-- The desk's New terminal starts a shell; its Claude Code and Codex entries are gone. The phone can
-  still start them, and running ones keep their names and badges.
-- "Find anything" on the desk (Ctrl+K, the search buttons, Ctrl+F off the Terminals page): one search over
-  the actions of the selected phone (only what it takes and only while it is ready), the pages, the other
-  phones, shared terminals, recent files, notes, snippets, the clipboard history, contacts and the settings
-  subpages. Accent-insensitive, every word must match, best match first.
-- The GNOME top-bar menu is the complete remote for a paired phone: status chips, six quick
-  actions, what is going on now and a section per area (send, insert, sound, notes,
-  notifications, calls, terminals, screen, files, privacy) with the phone's switches.
-  Security-sensitive switches can only be turned off there. Top-bar interface 9.
+The first public release. It works and is still being shaped: expect rough
+edges and please report them. LAN only: the away-from-home relay is built but
+switched off.
 
-## 1.3.0 — 2026-10-25
-
-- Keep awake is off for new installs and holds the computer awake only while a
-  paired phone is connected (it used to hold for as long as any phone was
-  paired).
-- One cleanup for every unpair, from either side, replaced phone or changed
-  identity: addresses, sync state, liveness, per-phone choices and open
-  sessions are forgotten together.
-- Pairing by code closes its dialog, opens the new phone and says so.
-- The empty notifications page points at notification access on the phone.
-- Computer-wide switches on a phone's page say they apply to every phone.
-- The GNOME top-bar menu can be turned off again; the row says what turning
-  it on changes.
-- Hardening from the audit: config forward-compatibility, notes ancestors,
-  bounded image decoding, private file modes, session-password binding.
-- A copy made on the phone a second time (same text, after the computer copied something else) is placed again; it was
-  dropped as "unchanged". The Clipboard page shows a phone's copy at once.
-- A Photo tile in the top-bar menu and an Insert from Phone submenu in the tray.
-- The Flatpak, CI and releases: checks run before a release is built, actions are pinned,
-  `deny.toml` checks licences and advisories, THIRD_PARTY_LICENSES ships with the app.
-- Version 1.3.0 matches the Android app (1.3.0, versionCode 20300).
-
-## 1.0.0 — 2026-10-19
-
-First public release.
+**What it does**
 
 - Phone screen on the desktop, with hardware H.264 where the phone supports it.
-- Remote control of the computer's mouse and keyboard from the phone, through
-  the GNOME remote desktop portal and only after you approve it.
-- Shared terminals between phone and desk, with one tap to start Claude Code
-  or Codex, and a terminal window at the desk for each session.
-- Phone notifications on the desktop, with replies and actions.
-- Clipboard sync in both directions; text and link sharing.
-- File transfer both ways, and a browser for the phone's files.
-- Presentation remote, ping, find-my-phone, battery status, and locking the
-  desktop session from the phone.
-- Away from home through the DeskLink relay, with end-to-end encrypted
-  signaling and optional TURN.
-- Optional session password for screen and terminal access, stay awake while
-  a phone is paired, a tray item to end phone sessions, and 30 days of
-  connection history.
-- Pairing by QR code with a six-digit verification code. No account.
+- Remote control of the computer's mouse and keyboard from the phone, only after you approve it.
+- Shared terminals between phone and desk (the phone can start Claude Code or Codex), and a terminal
+  window at the desk for each session.
+- Phone notifications on the desktop, grouped by app, with replies and actions; clipboard sync both ways; text and link sharing.
+- File transfer both ways, and a Bucket folder kept in step; contacts and calls on the computer; notes and
+  snippets; media control both ways; the phone's microphone or sound here and this computer's sound there; Glide.
+- Pairing by QR code or a six-digit code, no account. Optional session password, stay awake while a phone is
+  paired, and 30 days of connection history.
+- "Find anything" (Ctrl+K): one search over the actions, pages, phones, terminals, recent files, notes, snippets,
+  clipboard history, contacts and settings.
+- The GNOME top-bar menu is the complete remote for a paired phone (what is happening now first, four large
+  tiles, plain offline and empty states). Top-bar interface 10.
+
+**Connection**
+
+- A ready phone that goes silent shows "Checking connection…" on every surface after 4 s; the desk probes after
+  2 s and decides on corroborated evidence (8 s on both paths); the phone tells the desk when it is about to leave
+  (Wi-Fi off, airplane mode, service end, network lost); a click on a quiet phone checks first and says
+  "Can't reach <phone>" at once; background sends wait for the phone instead of being lost.
+- Pairing from the phone now brings the connection up by itself; an unpair the phone never heard is answered
+  the next time it connects.
+- A finished transfer whose completion was lost is answered, not received twice.
+
+**Look and feel**
+
+- Home: a Notes card with the newest notes, New note and quick-add; two balanced columns on a big window;
+  Everything DeskLink does in two columns; a calm Home while the phone is away.
+- A narrow sidebar rail between the overlay and 1000sp; Files, Notes, Terminals, Contacts and Settings use a big
+  window (the chosen contact, or the page list, beside the open one).
+- Keep awake is off for new installs and holds the computer awake only while a phone is connected.
+
+**Security and robustness**
+
+- Pairing pins each device's certificate; unpaired links are capped per network; the listener serves private,
+  link-local, unique-local and carrier-NAT (100.64.0.0/10, for hotspots and Tailscale) sources, and loopback;
+  anything else is dropped before a byte is read. SECURITY.md says where the secrets are kept and that the
+  Flatpak build is not a sandbox (shared terminals need host access). The relay's images are pinned and its TURN
+  secret no longer sits on a command line. The debug-only verbs module is compiled out of release builds.
+- One cleanup for every unpair, from either side: addresses, sync state, liveness, per-phone choices and open
+  sessions are forgotten together.
+- Hardening from the audits: config forward-compatibility, notes ancestors, bounded image decoding, private file
+  modes, session-password binding, thumbnail markers, log caps.
+- The Flatpak, CI and releases: checks run before a release is built, actions are pinned, `deny.toml` checks
+  licences and advisories, THIRD_PARTY_LICENSES ships with the app.
+
+**Not included** (removed before this release): browsing the phone's files, the presentation remote, Bluetooth,
+run commands, automations, the drawing pad, the webcam and system volume.
+
+Version 0.3.0 matches the Android app (0.3.0, versionCode 20300).

@@ -792,7 +792,7 @@ impl Drop for Onboarding {
 
 /// The rules of `UI-REDESIGN.md` 5.1 for first-run and guide words: no
 /// protocol or technical words, no exclamation marks, nothing promised
-/// off this network while the relay is off (1.3).
+/// off this network while the relay is off (0.3).
 #[cfg(test)]
 pub(super) fn assert_plain(words: &str) {
     for banned in [

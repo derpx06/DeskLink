@@ -713,7 +713,7 @@ mod tests {
         assert!(top.not_now.as_deref().unwrap().starts_with("Only on GNOME"));
     }
 
-    /// Plain words, and nothing promises use off this network (1.3).
+    /// Plain words, and nothing promises use off this network (0.3).
     #[test]
     fn the_words_are_plain() {
         for facts in [facts(None), facts(Some(phone(Reach::Offline)))] {

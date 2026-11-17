@@ -1,6 +1,6 @@
 # Top-bar menu redesign (STATE row 3.8)
 
-Audit of the 1.3 menu (screens in `.tools/screenshots/p38-topbar/`): the structure was sound (stock Quick
+Audit of the 0.3 menu (screens in `.tools/screenshots/p38-topbar/`): the structure was sound (stock Quick
 Settings header, chips, pill tiles, More), but
 
 1. "what is happening now" sat under the tiles and the music, so a transfer or a live session was below the fold;

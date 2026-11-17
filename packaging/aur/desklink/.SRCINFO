@@ -1,6 +1,6 @@
 pkgbase = desklink
-	pkgdesc = Use your Android phone and GNOME desktop together
-	pkgver = 1.0.0
+	pkgdesc = Use your Android phone and Linux desktop together
+	pkgver = 0.3.0
 	pkgrel = 1
 	url = https://github.com/derpx06/DeskLink
 	arch = x86_64
@@ -28,8 +28,14 @@ pkgbase = desklink
 	depends = vte4
 	optdepends = gst-plugin-gtk4: system video sink (a copy is bundled otherwise)
 	optdepends = xdg-desktop-portal-gnome: screen sharing and remote control on GNOME
+	optdepends = xdg-desktop-portal-kde: the same on KDE Plasma
+	optdepends = xdg-desktop-portal-gtk: the same on Xfce, MATE, Cinnamon, Budgie
+	optdepends = xdg-desktop-portal-wlr: screen sharing on sway and other wlroots compositors
+	optdepends = xdg-desktop-portal-cosmic: the same on COSMIC
+	optdepends = pipewire-pulse: PulseAudio clients alongside PipeWire (sound with the phone needs PipeWire)
+	optdepends = dunst: a notification daemon, where the desktop has none
 	optdepends = gst-plugin-va: hardware video decoding
-	source = desklink-1.0.0.tar.gz::https://github.com/derpx06/DeskLink/archive/refs/tags/v1.0.0.tar.gz
+	source = desklink-0.3.0.tar.gz::https://github.com/derpx06/DeskLink/archive/refs/tags/v0.3.0.tar.gz
 	sha256sums = SKIP
 
 pkgname = desklink

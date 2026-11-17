@@ -147,7 +147,7 @@ fn now_millis() -> u128 {
         .unwrap_or_default()
 }
 
-/// Settings that features removed in 1.3 stored (dropped on load; every other
+/// Settings that features removed in 0.3 stored (dropped on load; every other
 /// unknown key is kept for a build that knows it).
 const REMOVED_SETTING_KEYS: [&str; 3] = ["run_commands", "call_audio", "call_audio_devices"];
 

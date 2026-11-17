@@ -46,24 +46,31 @@ Use the `rust-stable` branch that matches the runtime's freedesktop base
 of the tag, temporarily replace the git source with
 `{ "type": "dir", "path": "." }`.
 
-## Submitting to Flathub
+## Releasing, and Flathub
 
-1. Tag the release: `git tag -s v1.3.0 && git push origin v1.3.0`.
-2. Add `"commit": "<full sha of v1.3.0>"` next to `"tag"` in the manifest.
-   Flathub requires both. JSON has no comments, so `flatpak/check-manifest.py`
-   is the reminder: it prints the TODO(owner) lines, and
-   `flatpak/check-manifest.py --release` fails until they are done.
-3. Set `DESKLINK_RELAY_URL` in the manifest's build `env` to the deployed
-   relay (`relay/deploy/DEPLOY.md`). Release builds always set it: it is baked
-   in as the default relay, and the manifest's `wss://relay.desklink.example/v1`
-   is the same placeholder the source falls back to without it.
-4. Generate `cargo-sources.json` from that tag's `Cargo.lock` (above).
-5. Make sure the screenshot URLs in the metainfo resolve
-   (`data/screenshots/*.png` on `master`; see the top-level README).
-6. Fork <https://github.com/flathub/flathub>, branch from `new-pr`, add the
-   manifest and `cargo-sources.json`, and open a pull request against
-   `new-pr`. Follow <https://docs.flathub.org/docs/for-app-authors/submission>.
-7. Run the linter before submitting:
+The GitHub release workflow builds the bundle itself: it swaps the manifest's
+git source for the checked-out tree (`flatpak/ci-manifest.py`, which picks the
+`desklink` module by name) and runs
+`flatpak/check-manifest.py --release --commit "$GITHUB_SHA"`, so the tag's own
+commit need not be written in the manifest. Try the same locally:
+`python3 flatpak/ci-manifest.py` writes `ci-manifest.json`.
+
+The Flatpak is **not planned for Flathub**: shared terminals need
+`--talk-name=org.freedesktop.Flatpak`, which Flathub rejects (SECURITY.md). If
+that changes, a submission needs:
+
+1. A signed tag: `git tag -s v0.3.0 && git push origin v0.3.0`.
+2. `"commit": "<full sha of the tag>"` next to `"tag"` in the manifest
+   (`flatpak/check-manifest.py --release` checks it).
+3. The relay address: the manifest sets none and the source falls back to an
+   empty default (no default relay). A build with the relay enabled sets
+   `DESKLINK_RELAY_URL` in the manifest's build `env`.
+4. `cargo-sources.json` generated from that tag's `Cargo.lock` (above).
+5. Screenshots: the metainfo has none today; add `data/screenshots/*.png` and
+   the `<screenshots>` element together.
+6. A pull request against <https://github.com/flathub/flathub> (branch from
+   `new-pr`), following <https://docs.flathub.org/docs/for-app-authors/submission>.
+7. The linter first:
    `flatpak run --command=flatpak-builder-lint org.flatpak.Builder manifest derx06.desklink.com.json`
    and `... repo repo` on the built repository.
 

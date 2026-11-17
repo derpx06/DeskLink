@@ -1,4 +1,4 @@
-# Improvements (1.3, phase 3.5): desk audit
+# Improvements (0.3, phase 3.5): desk audit
 
 A per-module reliability and performance pass over the desk after the
 module split (693cf8f). Each module group was audited read-only by an
@@ -144,7 +144,7 @@ the Shell1 sender gate is right and PropertiesChanged is sent only on change.
 
 - Screen (3.4): nothing reliability-relevant on the desk side.
 
-## Security audit (1.3, SEC-1 to SEC-6)
+## Security audit (0.3, SEC-1 to SEC-6)
 
 - **SEC-1 fixed** (own branch): the TCP listener serves local sources only (`lan_scope::inbound_source_ok`, pinned with the phone by `testdata/lan_source_vectors.json`).
 - **SEC-2 fixed, partly**: unpaired links are counted per /24 or /64 as well as per address (six per network). Not done: reserving

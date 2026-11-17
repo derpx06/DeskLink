@@ -2,7 +2,7 @@
 <component type="desktop-application">
   <id>derx06.desklink.com</id>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>GPL-3.0-or-later</project_license>
+  <project_license>GPL-3.0-or-later AND GPL-2.0-or-later</project_license>
 
   <name>DeskLink</name>
   <summary>Use your phone and computer together</summary>
@@ -16,7 +16,7 @@
     <ul>
       <li>See your phone’s screen on the desktop, with low latency</li>
       <li>Control your computer’s mouse and keyboard from the phone, with your approval</li>
-      <li>Shared terminals, including one tap to start Claude Code or Codex on your computer</li>
+      <li>Shared terminals, with one tap on the phone to start Claude Code or Codex on your computer</li>
       <li>Phone notifications on the desktop, with replies</li>
       <li>Clipboard sync in both directions</li>
       <li>File transfer in both directions</li>
@@ -54,49 +54,24 @@
     <control>touch</control>
   </supports>
 
-  <screenshots>
-    <screenshot type="default">
-      <caption>Paired phones and what they can do</caption>
-      <image>https://raw.githubusercontent.com/derpx06/DeskLink/master/data/screenshots/devices.png</image>
-    </screenshot>
-    <screenshot>
-      <caption>The phone’s screen on the desktop</caption>
-      <image>https://raw.githubusercontent.com/derpx06/DeskLink/master/data/screenshots/screen.png</image>
-    </screenshot>
-    <screenshot>
-      <caption>Files moving between the phone and the computer</caption>
-      <image>https://raw.githubusercontent.com/derpx06/DeskLink/master/data/screenshots/files.png</image>
-    </screenshot>
-  </screenshots>
-
   <branding>
     <color type="primary" scheme_preference="light">#3584e4</color>
     <color type="primary" scheme_preference="dark">#62a0ea</color>
   </branding>
 
   <releases>
-    <release version="1.3.0" date="2026-10-25">
+    <release version="0.3.0" type="development" date="2026-11-17">
       <description translate="no">
-        <p>Safer pairing and sessions, and a steadier connection.</p>
+        <p>The first public release, a beta: a steadier connection, notes, and a calmer Home.</p>
         <ul>
-          <li>The computer is kept awake only while a paired phone is connected, and the setting starts off</li>
-          <li>Unpairing from either side forgets everything kept for that phone</li>
-          <li>Pairing by code now closes its dialog and opens the new phone</li>
-          <li>The top-bar menu can be turned off again from Preferences</li>
-          <li>Hardened pairing, config, notes, contacts, clipboard and remote sessions</li>
-        </ul>
-      </description>
-    </release>
-    <release version="1.0.0" date="2026-10-19">
-      <description translate="no">
-        <p>First public release.</p>
-        <ul>
-          <li>Phone screen on the desktop, and remote control of the computer from the phone</li>
-          <li>Shared terminals, with one tap to start Claude Code or Codex</li>
-          <li>Notifications with replies, clipboard sync, file transfer and a phone file browser</li>
-          <li>Presentation remote</li>
-          <li>Away from home through the DeskLink relay, with end-to-end encrypted signaling</li>
-          <li>Optional session password, stay-awake while paired, and connection history</li>
+          <li>The connection says “Checking connection…” when the phone goes quiet and recovers or gives up within seconds; a click on a phone that does not answer says so at once</li>
+          <li>The phone tells the computer when Wi-Fi or the app is about to go away</li>
+          <li>Pairing from the phone now brings the connection up by itself</li>
+          <li>A Notes card on Home, two balanced columns on a big window, and a narrow sidebar rail</li>
+          <li>Files, Notes, Terminals, Contacts and Settings use a big window; notifications are grouped by app</li>
+          <li>Safer pairing and sessions: unpaired links are limited per network and the listener serves local sources only</li>
+          <li>Removed: browsing the phone’s files, the presentation remote, Bluetooth, run commands, the drawing pad, the webcam and system volume</li>
+          <li>LAN only: the away-from-home relay is built but switched off</li>
         </ul>
       </description>
     </release>

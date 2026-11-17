@@ -36,7 +36,15 @@ jobs:
       - name: Check the tag and the relay address
         run: |
           grep -q "version: '${GITHUB_REF_NAME#v}'" meson.build
-          test -n "$DESKLINK_RELAY_URL"
+          # The relay address is only needed once the relay is compiled in
+          # (RELAY_ENABLED); in a LAN-only release it is inert.
+          if [ -z "$DESKLINK_RELAY_URL" ]; then
+            if grep -q 'pub const RELAY_ENABLED: bool = true' src/device_links/relay_link/mod.rs; then
+              echo "::error::DESKLINK_RELAY_URL is not set but the relay is enabled in this build"
+              exit 1
+            fi
+            echo "::warning::DESKLINK_RELAY_URL is not set: this release is LAN-only (RELAY_ENABLED is false)"
+          fi
 
       - name: Build the app tarball
         run: |
@@ -74,7 +82,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: The manifest is releasable (tag, commit, permissions)
-        run: python3 flatpak/check-manifest.py --release || { echo "::error::finish the TODO(owner) lines (flatpak/check-manifest.py --release)"; exit 1; }
+        # The tag's own commit cannot be written in the manifest it tags: it is
+        # this run's (the Flathub PR carries the committed one).
+        run: python3 flatpak/check-manifest.py --release --commit "$GITHUB_SHA" || { echo "::error::the Flatpak manifest is not releasable (flatpak/check-manifest.py --release)"; exit 1; }
 
       - name: Generate cargo sources and a manifest for this checkout
         run: |
@@ -83,13 +93,7 @@ jobs:
           git clone https://github.com/flatpak/flatpak-builder-tools /tmp/fbt
           git -C /tmp/fbt checkout 9d86d336a39b9af38b86f114b6ce5820fe260f91
           python3 /tmp/fbt/cargo/flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
-          python3 - <<'PY'
-          import json, os
-          m = json.load(open("derx06.desklink.com.json"))
-          m["build-options"]["env"]["DESKLINK_RELAY_URL"] = os.environ["DESKLINK_RELAY_URL"]
-          m["modules"][0]["sources"][0] = {"type": "dir", "path": ".", "skip": [".flatpak-builder", "build-flatpak", "repo", "target"]}
-          json.dump(m, open("ci-manifest.json", "w"), indent=2)
-          PY
+          python3 flatpak/ci-manifest.py
 
       - name: Build the bundle
         run: |
@@ -118,6 +122,13 @@ jobs:
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          # 0.x is a beta: a PRERELEASE, so it is never "latest".
+          prerelease: true
+          name: ${{ github.ref_name }} (beta)
+          body: |
+            **Beta.** DeskLink ${{ github.ref_name }} is the first public release: it works and is still being
+            shaped. Install: the Flatpak bundle (`flatpak install --user ./desklink-*.flatpak`) or the tarball;
+            see the README. Please report problems on the issue tracker.
           generate_release_notes: true
           files: |
             desklink-*

@@ -275,7 +275,7 @@ pub(crate) fn webrtc_capabilities(capabilities: &[String]) -> Vec<String> {
     result
 }
 
-/// 1.3 removed these features; their types are in no list and nobody
+///  0.3 removed these features; their types are in no list and nobody
 /// may send or accept them, whatever a peer advertises.
 #[cfg(test)]
 pub(crate) const REMOVED_TYPES: [&str; 15] = [

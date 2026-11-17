@@ -2,9 +2,10 @@
 
 pkgname=desklink
 # The relay the app uses away from home unless the user sets their own.
-# Set it to the deployed server (relay/deploy/DEPLOY.md) before publishing.
-_relay_url='wss://relay.example.com/v1'
-pkgver=1.3.0
+# Empty: the 0.3 beta is LAN-only (the relay is switched off in the build), so the
+# value is inert. Set it to the deployed server (relay/deploy/DEPLOY.md) when the relay is enabled.
+_relay_url=''
+pkgver=0.3.0
 pkgrel=1
 pkgdesc='Use your Android phone and Linux desktop together'
 arch=('x86_64' 'aarch64')

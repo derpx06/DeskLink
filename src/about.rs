@@ -17,15 +17,14 @@ const PRIVACY: &str = "https://github.com/derpx06/DeskLink#privacy";
 
 /// What changed in this version, in plain words (the dialog's own markup:
 /// `<p>`, `<ul>` and `<li>` only).
-const RELEASE_NOTES: &str = "<p>A steadier connection, safer pairing and more to do with your phone.</p>\
+const RELEASE_NOTES: &str = "<p>The first public release, a beta: a steadier connection, notes and a calmer Home.</p>\
 <ul>\
-<li>Comes back by itself after sleep, a new network or a restart, and says clearly when it cannot.</li>\
+<li>Says \u{201c}Checking connection\u{2026}\u{201d} when the phone goes quiet, and recovers or gives up within seconds.</li>\
+<li>Comes back by itself after sleep, a new network or a restart.</li>\
 <li>File transfers pick up where they stopped and never arrive twice.</li>\
-<li>Glide: your mouse and keyboard carry on onto the phone.</li>\
-<li>Sound both ways, and the phone's notes, snippets, contacts and calls here when you turn them on.</li>\
-<li>Pairing by code opens the new phone, and unpairing forgets everything kept for it.</li>\
-<li>Keep awake holds the computer awake only while a phone is connected, and starts off.</li>\
-<li>A Photo tile in the top-bar menu, and the menu can be turned off again.</li>\
+<li>A Notes card on Home, and a layout that uses a big window.</li>\
+<li>Glide, sound both ways, and the phone's notes, snippets, contacts and calls here when you turn them on.</li>\
+<li>Pairing from the phone brings the connection up by itself.</li>\
 </ul>";
 
 /// The KDE Connect authors named in its own About data.
@@ -158,7 +157,7 @@ mod tests {
     }
 
     /// The release notes use only the markup the dialog accepts, and are
-    /// the 1.3 notes: a version bump fails here until they are rewritten.
+    /// the 0.3 notes: a version bump fails here until they are rewritten.
     #[test]
     fn the_release_notes_are_markup_the_dialog_accepts() {
         let tags: Vec<&str> = RELEASE_NOTES
@@ -170,6 +169,51 @@ mod tests {
             tags.iter().all(|tag| ["p", "ul", "li"].contains(tag)),
             "{tags:?}"
         );
-        assert!(VERSION.starts_with("1.3"));
+        assert!(VERSION.starts_with("0.3"));
+    }
+
+    /// One version, in every place a person or a package manager reads it:
+    /// `Cargo.toml`, `meson.build`, the newest AppStream release, the
+    /// Debian changelog and the CHANGELOG's top heading all agree (they
+    /// drifted before). The flake and the packaging files are checked too.
+    #[test]
+    fn the_version_is_the_same_everywhere_it_is_written() {
+        let cargo = include_str!("../Cargo.toml");
+        let version = cargo
+            .lines()
+            .find_map(|line| line.strip_prefix("version = \""))
+            .and_then(|rest| rest.split('"').next())
+            .expect("Cargo.toml version");
+        assert_eq!(version, VERSION);
+        let meson = include_str!("../meson.build");
+        assert!(
+            meson.contains(&format!("version: '{version}'")),
+            "meson.build"
+        );
+        let metainfo = include_str!("../data/derx06.desklink.com.metainfo.xml.in");
+        let release = metainfo
+            .split("<release version=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("a release");
+        assert_eq!(release, version, "the newest AppStream release");
+        let changelog = include_str!("../CHANGELOG.md");
+        let top = changelog
+            .lines()
+            .find_map(|line| line.strip_prefix("## "))
+            .expect("a heading");
+        assert!(top.starts_with(version), "CHANGELOG top heading: {top}");
+        assert!(include_str!("../packaging/debian/changelog")
+            .starts_with(&format!("desklink ({version})")));
+        assert!(include_str!("../flake.nix").contains(&format!("version = \"{version}\"")));
+        assert!(include_str!("../packaging/obs/desklink.spec")
+            .contains(&format!("Version:        {version}")));
+        assert!(include_str!("../packaging/aur/desklink/PKGBUILD")
+            .contains(&format!("pkgver={version}")));
+        assert!(include_str!("../packaging/aur/desklink-bin/PKGBUILD")
+            .contains(&format!("pkgver={version}")));
+        assert!(include_str!("../derx06.desklink.com.json")
+            .contains(&format!("\"tag\" : \"v{version}\"")));
+        assert!(include_str!("../packaging/obs/_service").contains(&format!("v{version}</param>")));
     }
 }

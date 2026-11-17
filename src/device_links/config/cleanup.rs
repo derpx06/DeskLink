@@ -6,7 +6,7 @@
 
 use super::*;
 
-/// What features removed in 1.3 left in `base_dir`: the automations' sealed
+/// What features removed in 0.3 left in `base_dir`: the automations' sealed
 /// rules and their key.
 const REMOVED_FEATURE_DIRS: [&str; 2] = ["automations", "transfers"];
 
