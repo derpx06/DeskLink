@@ -1076,14 +1076,7 @@ mod tests {
             .collect();
         assert_eq!(
             argv,
-            [
-                exe.to_str().unwrap(),
-                "--send-files",
-                "--to",
-                "p0",
-                "--",
-                "%F"
-            ]
+            [spec_exe.as_str(), "--send-files", "--to", "p0", "--", "%F"]
         );
         assert_eq!(
             nemo.string("Nemo Action", "Dependencies").unwrap(),
@@ -1318,14 +1311,14 @@ mod tests {
                 assert_eq!(std::fs::read_to_string(spot).unwrap(), theirs, "{spot:?}");
             }
         }
+        // The phones' other entries were still written: one failure stops nothing.
+        assert!(dirs.config.join("caja/scripts/Send to Tab").exists());
         // Switched off, and removed outright: still there.
         sync(&dirs, Path::new(EXE), &one, false, &e);
         remove_all(&dirs);
         for spot in &spots {
             assert_eq!(std::fs::read_to_string(spot).unwrap(), theirs, "{spot:?}");
         }
-        // The phones' other entries were still written: one failure stops nothing.
-        assert!(dirs.config.join("caja/scripts/Send to Tab").exists());
         std::fs::remove_dir_all(&root).ok();
     }
 
