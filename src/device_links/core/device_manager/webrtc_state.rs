@@ -213,6 +213,31 @@ impl DeviceManager {
         })
     }
 
+    /// Queues a feature for a link that is feature-ready but quiet (silent on
+    /// both paths for a few seconds): the same bounded queue (64 entries,
+    /// 30 s, in order), drained by the daemon's tick once the phone answers
+    /// again, or by the next feature-ready edge if it was rebuilt instead.
+    pub fn queue_feature_while_quiet(
+        &self,
+        binding: &SessionBinding,
+        packet: crate::device_links::packet::NetworkPacket,
+    ) -> Result<(), SessionError> {
+        self.with_session(binding, |session| {
+            if session.pending_features.len()
+                >= crate::device_links::core::device_session::PENDING_FEATURE_LIMIT
+            {
+                session.pending_features.pop_front();
+            }
+            session.pending_features.push_back((Instant::now(), packet));
+        })
+    }
+
+    /// Whether anything is queued for this session (a send that finds a queue
+    /// goes behind it, so order holds).
+    pub fn has_pending_features(&self, binding: &SessionBinding) -> Result<bool, SessionError> {
+        self.with_session(binding, |session| !session.pending_features.is_empty())
+    }
+
     /// Whether a feature may be queued for the handover now: one is under
     /// way and younger than the negotiation timeout, or there is none yet and
     /// the bootstrap link is open. A stalled attempt, or a closed link with

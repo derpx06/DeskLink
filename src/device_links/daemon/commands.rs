@@ -851,7 +851,10 @@ impl DaemonWorker {
                 // Runs on the command thread, which may wait a moment for proof
                 // of life; the window's thread never does.
                 transport.preflight()?;
-                f(&transport)
+                // The session may have been replaced while the preflight waited
+                // (the phone reconnected): the send takes a fresh snapshot, not
+                // the one from before the wait.
+                FeatureTransport::for_device(&self.sessions, device_id).and_then(|fresh| f(&fresh))
             });
         let Err(error) = result else {
             return true;

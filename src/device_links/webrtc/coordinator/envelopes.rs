@@ -9,7 +9,7 @@
 use super::*;
 
 /// Sends, in order, the features queued while WebRTC was not ready.
-fn flush_pending_features(binding: &SessionBinding, sessions: &Arc<DeviceManager>) {
+pub(crate) fn flush_pending_features(binding: &SessionBinding, sessions: &Arc<DeviceManager>) {
     let pending = sessions.take_pending_features(binding);
     if pending.is_empty() {
         return;

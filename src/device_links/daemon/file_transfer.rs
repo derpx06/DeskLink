@@ -475,7 +475,7 @@ fn queue_send(
     file_path: PathBuf,
     from_waiting: bool,
 ) -> bool {
-    let transport = match FeatureTransport::for_device(sessions, device_id) {
+    let mut transport = match FeatureTransport::for_device(sessions, device_id) {
         Ok(transport) if transport.is_ready() => transport,
         Ok(_) | Err(_) => {
             debug_log!("[Daemon] File transfer for {device_id} was not started: not connected");
@@ -495,6 +495,17 @@ fn queue_send(
         if let Err(error) = transport.preflight() {
             push_error(errors, error);
             return false;
+        }
+        // A fresh snapshot: the session may have been replaced during the wait.
+        match FeatureTransport::for_device(sessions, device_id) {
+            Ok(fresh) if fresh.is_ready() => transport = fresh,
+            _ => {
+                push_error(
+                    errors,
+                    "That phone isn't connected, so the file was not sent".to_string(),
+                );
+                return false;
+            }
         }
     }
     if QUEUED.fetch_add(1, Ordering::AcqRel) >= MAX_QUEUED {

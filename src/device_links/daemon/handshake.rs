@@ -388,6 +388,9 @@ pub(crate) fn attach_bootstrap_link(
             // link carries a newer socket, and leaves quietly.
             replaced.shutdown();
             binding.link.note_attached(link_dialed_by_us);
+            // The phone just completed a handshake: whatever it said about
+            // leaving is history.
+            crate::device_links::webrtc::coordinator::clear_leaving(&binding.device_id);
             debug_log!(
                 "[DL-WRTC-BOOT] adopted a replacement bootstrap socket for {} (session {}, generation {}); kept the feature-ready WebRTC transport",
                 binding.device_id, binding.session_id, binding.generation

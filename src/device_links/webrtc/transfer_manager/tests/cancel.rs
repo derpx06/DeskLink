@@ -217,3 +217,35 @@ fn a_finished_transfer_offered_or_closed_again_after_a_reconnect_is_answered_not
     assert_eq!(link.sent(FileAction::Accept)[2].resume_block, Some(0));
     assert_eq!(manager.probe(|engine| engine.incoming_ids()).len(), 2);
 }
+
+/// CONC-2: a Bucket file placed here has no wanted entry any more. Its
+/// re-offer after a lost `complete` is answered from the done record (accepted
+/// at the end), not refused by the folder gate that ran before it.
+#[test]
+fn a_placed_bucket_files_reoffer_is_answered_from_the_done_record_not_refused() {
+    let hand = Hand::new("finished-bucket");
+    let data = payload(50_000, 92);
+    let hash = hex(&hash_of_hashes(&[openssl::sha::sha256(&data)]));
+    let mut done = FileControl::new(&wire_of("alpha", "beta"), FileAction::Done, id(1), "token0");
+    done.file_hash = Some(hash.clone());
+    done.blocks = Some(1);
+    done.total_size = Some(data.len() as u64);
+    hand.send(hand.offer(id(1), "bucket.bin", data.len() as u64));
+    eventually("the accept", || hand.reply(FileAction::Accept));
+    hand.manager
+        .on_frame(frame_of(id(1), 0, 0, &data, data.len() as u64));
+    hand.send(done);
+    eventually("the complete", || hand.reply(FileAction::Complete));
+
+    let (manager, link) = reconnected(&hand);
+    let mut again = hand.offer(id(1), "bucket.bin", data.len() as u64);
+    again.folder = Some("bucket".into());
+    again.relpath = Some("Trips/bucket.bin".into());
+    again.content_sha256 = Some(hex(&openssl::sha::sha256(&data)));
+    manager.on_control(again);
+    manager.probe(|_| ());
+    assert!(link.sent(FileAction::Error).is_empty(), "not refused");
+    let accept = &link.sent(FileAction::Accept)[0];
+    assert_eq!(accept.resume_block, Some(1));
+    assert_eq!(accept.prefix_sha256.as_deref(), Some(hash.as_str()));
+}

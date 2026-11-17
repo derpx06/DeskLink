@@ -93,6 +93,7 @@ pub(crate) use desktop_share::{
     desktop_extended, desktop_session, end_phone_sessions, phones_awaiting_approval,
     take_share_failures,
 };
+pub(crate) use envelopes::flush_pending_features;
 pub(crate) use file_link::{
     cancel_file_transfer, start_clipboard_transfer, start_file_transfer, start_folder_transfer,
 };

@@ -467,6 +467,26 @@ impl Engine {
             net.send(cancel);
             return;
         }
+        // Placed already, and its sender never heard (a link lost between):
+        // accepted as whole, from the last block, so it only has to say
+        // `done` and hear `complete`; nothing is opened and no second copy
+        // is placed. Before the Bucket and gallery gates: once a Bucket file is
+        // placed its wanted entry is gone, and a re-offer after a lost `complete`
+        // must be answered from this record, not refused.
+        if let Some(done) = self
+            .store
+            .find_done(&id, &net.wire.peer_device_id)
+            .filter(|done| {
+                done.token == token && done.total_size == total && done.filename == filename
+            })
+        {
+            let mut accept = net.msg(FileAction::Accept, &id, &token);
+            accept.resume_block = Some(done.blocks);
+            accept.prefix_sha256 = Some(done.file_hash);
+            accept.max_frame_bytes = Some(FRAME_BYTES_PROVEN);
+            net.send(accept);
+            return;
+        }
         let folder = message.folder_ref();
         // F8: only a file folder sync asked for, for this phone's pair.
         if let Some(reference) = &folder {
@@ -495,24 +515,6 @@ impl Engine {
                 self.refused(&message, "a gallery offer that was not allowed", None);
                 return refuse(code::REFUSED, Some(why));
             }
-        }
-        // Placed already, and its sender never heard (a link lost between):
-        // accepted as whole, from the last block, so it only has to say
-        // `done` and hear `complete`; nothing is opened and no second copy
-        // is placed.
-        if let Some(done) = self
-            .store
-            .find_done(&id, &net.wire.peer_device_id)
-            .filter(|done| {
-                done.token == token && done.total_size == total && done.filename == filename
-            })
-        {
-            let mut accept = net.msg(FileAction::Accept, &id, &token);
-            accept.resume_block = Some(done.blocks);
-            accept.prefix_sha256 = Some(done.file_hash);
-            accept.max_frame_bytes = Some(FRAME_BYTES_PROVEN);
-            net.send(accept);
-            return;
         }
         // The same transfer offered again: answered from where we are.
         if let Some(existing) = self.incoming.get_mut(&key) {

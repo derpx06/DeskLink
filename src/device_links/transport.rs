@@ -37,6 +37,26 @@ pub(crate) fn should_surface_send_error(error: &str) -> bool {
 pub(crate) const NOT_REACHABLE: &str =
     "Can't reach the phone. Check that it's on and on your network.";
 
+/// What a send on a feature-ready link does.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReadySend {
+    /// Onto the channel.
+    Now,
+    /// Behind what is already queued (the link is quiet, or an earlier quiet
+    /// spell's queue has not drained: order holds).
+    Queue,
+    /// A file payload on a quiet link: its own path says "can't reach".
+    Refuse,
+}
+
+pub(crate) fn ready_send_plan(quiet: bool, queue_waiting: bool, has_payload: bool) -> ReadySend {
+    match (quiet || queue_waiting, has_payload) {
+        (false, _) => ReadySend::Now,
+        (true, false) => ReadySend::Queue,
+        (true, true) => ReadySend::Refuse,
+    }
+}
+
 /// Whether the click preflight does not apply: a peer that is not ready is the
 /// handover path (queueing rules), and a dozing phone cannot answer and is
 /// never held up (its own rules judge it).
@@ -153,14 +173,33 @@ impl FeatureTransport {
     /// `flush_pending_features` once WebRTC is ready.
     pub(crate) fn send(&self, packet: &NetworkPacket) -> Result<(), String> {
         if self.is_ready() {
-            // A dead channel accepts bytes and loses them in silence: once the
-            // link is quiet, ask it and say so instead (no waiting here: this
-            // is the shared path, some callers are on the window's thread).
-            if self.is_quiet() {
-                crate::device_links::webrtc::coordinator::probe_asap(
-                    &self.snapshot.binding.device_id,
-                );
-                return Err(NOT_REACHABLE.to_string());
+            // A dead channel accepts bytes and loses them in silence: while the
+            // link is quiet, or while earlier features still wait behind a
+            // quiet spell (order), the packet is queued instead (bounded, in
+            // order) and goes out when the phone answers again. A user's click
+            // never gets here quiet: its preflight failed first. Packets with a
+            // payload (files) have their own path and are refused.
+            let waiting = self
+                .sessions
+                .has_pending_features(&self.snapshot.binding)
+                .map_err(|error| error.to_string())?;
+            let quiet = self.is_quiet();
+            let has_payload =
+                packet.payload_size.is_some() || packet.payload_transfer_info.is_some();
+            match ready_send_plan(quiet, waiting, has_payload) {
+                ReadySend::Now => {}
+                ReadySend::Refuse => return Err(NOT_REACHABLE.to_string()),
+                ReadySend::Queue => {
+                    if quiet {
+                        crate::device_links::webrtc::coordinator::probe_asap(
+                            &self.snapshot.binding.device_id,
+                        );
+                    }
+                    return self
+                        .sessions
+                        .queue_feature_while_quiet(&self.snapshot.binding, packet.clone())
+                        .map_err(|error| error.to_string());
+                }
             }
             return crate::device_links::webrtc::coordinator::send_feature_packet(
                 &self.sessions,
@@ -528,6 +567,67 @@ mod tests {
         assert_eq!(transport.preflight(), Ok(()));
         assert!(started.elapsed() < std::time::Duration::from_millis(1_000));
         crate::device_links::webrtc::coordinator::forget_liveness("preflight-notready-phone");
+    }
+
+    /// A send on a ready link: straight out when healthy and nothing waits;
+    /// queued (never dropped) while quiet or behind a queue; a payload on a
+    /// quiet link is refused.
+    #[test]
+    fn a_background_send_on_a_quiet_link_is_queued_not_dropped() {
+        assert_eq!(ready_send_plan(false, false, false), ReadySend::Now);
+        assert_eq!(ready_send_plan(true, false, false), ReadySend::Queue);
+        assert_eq!(
+            ready_send_plan(false, true, false),
+            ReadySend::Queue,
+            "order"
+        );
+        assert_eq!(ready_send_plan(true, false, true), ReadySend::Refuse);
+        assert_eq!(ready_send_plan(false, false, true), ReadySend::Now);
+    }
+
+    /// The quiet queue is the handover queue: bounded to 64 (oldest out),
+    /// in order, and visible to `has_pending_features`.
+    #[test]
+    fn the_quiet_queue_is_bounded_and_in_order() {
+        let sessions = Arc::new(DeviceManager::new());
+        sessions
+            .register_link(
+                "phone-1".into(),
+                SessionLink::test_placeholder("phone-1"),
+                true,
+            )
+            .unwrap();
+        let binding = sessions.current_binding("phone-1").unwrap();
+        assert!(!sessions.has_pending_features(&binding).unwrap());
+        for n in 0..70 {
+            let mut packet = NetworkPacket::new(PACKET_TYPE_PING);
+            packet.set("n", n as i64);
+            sessions
+                .queue_feature_while_quiet(&binding, packet)
+                .unwrap();
+        }
+        assert!(sessions.has_pending_features(&binding).unwrap());
+        let drained = sessions.take_pending_features(&binding);
+        assert_eq!(
+            drained.len(),
+            crate::device_links::core::PENDING_FEATURE_LIMIT
+        );
+        let numbers: Vec<i64> = drained.iter().map(|p| p.get_i64("n").unwrap()).collect();
+        assert_eq!(numbers.first(), Some(&6), "the oldest went");
+        assert!(
+            numbers.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+            "in order"
+        );
+        assert!(!sessions.has_pending_features(&binding).unwrap());
+        // A binding the session moved past is the stale-generation error.
+        sessions
+            .register_link(
+                "phone-1".into(),
+                SessionLink::test_placeholder("phone-1"),
+                true,
+            )
+            .unwrap();
+        assert!(sessions.has_pending_features(&binding).is_err());
     }
 
     /// A click on a phone that does not answer is told, never swallowed as

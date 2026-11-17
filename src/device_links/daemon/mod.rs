@@ -64,6 +64,17 @@ pub(super) fn heartbeat_dead(dozing: bool) -> std::time::Duration {
 /// milliseconds, never reaches this, and sees the old LAN rate.
 pub(crate) const LAN_ESCALATE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The data channel's silence as the LAN rules may read it: only while a peer
+/// is feature-ready. A stale clock (the ladder ran out, a negotiation is under
+/// way) would escalate the LAN heartbeat and cut its budget for a phone that
+/// has no data channel at all.
+pub(super) fn scoped_data_silence(
+    ready: bool,
+    data: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    data.filter(|_| ready)
+}
+
 /// The LAN probe cadence: [`HEARTBEAT_IDLE`] for a dozing phone (the thaw) and
 /// for one whose data channel is answering, [`HEARTBEAT_IDLE_AWAKE`] once the
 /// data channel has been silent past [`LAN_ESCALATE_AFTER`].
@@ -209,7 +220,20 @@ fn run_liveness_tick(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     config: &Arc<Mutex<Config>>,
 ) {
-    use crate::device_links::webrtc::coordinator::{data_silence, is_dozing, is_leaving};
+    use crate::device_links::webrtc::coordinator::{
+        data_silence as clock, flush_pending_features, is_dozing, is_leaving,
+    };
+    // The data clock means something only while a peer is feature-ready: a
+    // stale one (the ladder ran out, a negotiation is under way) must not
+    // escalate the LAN heartbeat to 2 s or cut its budget to 8 s.
+    let connections = sessions.connection_snapshot();
+    let ready: std::collections::HashSet<&str> = connections
+        .iter()
+        .filter(|connection| connection.feature_transport_ready)
+        .map(|connection| connection.device_id.as_str())
+        .collect();
+    let data_silence =
+        |device_id: &str| scoped_data_silence(ready.contains(device_id), clock(device_id));
     let dead_after = |device_id: &str| {
         lan_dead_after(
             is_dozing(device_id),
@@ -222,6 +246,24 @@ fn run_liveness_tick(
         |device_id| heartbeat_idle(is_dozing(device_id), data_silence(device_id)),
         dead_after,
     );
+    // Features queued while a ready phone was quiet go out, in order, once it
+    // answers again (any packet clears quiet): the queue never waits for a
+    // feature-ready edge that a mere hiccup does not make.
+    for id in &ready {
+        let quiet = devices
+            .lock()
+            .ok()
+            .and_then(|devices| devices.get(*id).map(|device| device.quiet))
+            .unwrap_or(true);
+        if quiet {
+            continue;
+        }
+        if let Some(binding) = sessions.current_binding(id) {
+            if sessions.has_pending_features(&binding).unwrap_or(false) {
+                flush_pending_features(&binding, sessions);
+            }
+        }
+    }
 
     for binding in tick.probe {
         let packet = super::packet::NetworkPacket::new(super::packet::PACKET_TYPE_HEARTBEAT);

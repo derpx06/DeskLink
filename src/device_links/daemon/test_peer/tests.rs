@@ -693,6 +693,69 @@ fn an_awake_phone_is_probed_every_two_seconds_and_judged_on_both_paths() {
     assert!(tick(s(8), true, Some(s(9))).dead.is_empty(), "dozing: 90 s");
 }
 
+/// CONC-5: a stale data clock (no feature-ready peer) neither escalates the
+/// LAN heartbeat to 2 s nor cuts its budget to 8 s.
+#[test]
+fn a_stale_data_clock_without_a_ready_peer_does_not_tighten_the_lan_rules() {
+    use crate::device_links::daemon::{
+        heartbeat_idle, lan_dead_after, scoped_data_silence, HEARTBEAT_DEAD, HEARTBEAT_IDLE,
+    };
+    let stale = Some(std::time::Duration::from_secs(120));
+    assert_eq!(scoped_data_silence(false, stale), None);
+    assert_eq!(
+        heartbeat_idle(false, scoped_data_silence(false, stale)),
+        HEARTBEAT_IDLE
+    );
+    assert_eq!(
+        lan_dead_after(false, false, scoped_data_silence(false, stale)),
+        HEARTBEAT_DEAD
+    );
+    assert_eq!(scoped_data_silence(true, stale), stale);
+}
+
+/// CONC-6: an adopted replacement socket is the phone completing a
+/// handshake: a stale `leaving` does not outlive it.
+#[test]
+fn a_stale_leaving_report_does_not_survive_a_new_link() {
+    let net = TestNetwork::new();
+    let (mut desktop, phone) = paired_pair(&net);
+    let id = desktop.peer_id();
+    let mut bye = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT);
+    bye.set("leaving", true);
+    crate::device_links::webrtc::coordinator::note_heartbeat(&id, &bye);
+    assert!(crate::device_links::webrtc::coordinator::is_leaving(&id));
+    desktop.drop_link();
+    attach_fresh_link(&mut desktop, &net);
+    assert!(
+        !crate::device_links::webrtc::coordinator::is_leaving(&id),
+        "a new link clears it"
+    );
+    let _ = phone;
+}
+
+/// CONC-3: the send after the preflight takes a fresh snapshot (the session
+/// may have been replaced while the preflight waited). Pinned by the source:
+/// the preflight line is followed by a new `for_device`, and a transfer's
+/// `queue_send` reassigns its transport after the preflight.
+#[test]
+fn the_send_after_the_preflight_uses_a_fresh_snapshot() {
+    let commands = include_str!("../commands.rs");
+    let at = commands.find("transport.preflight()?;").expect("preflight");
+    assert!(
+        commands[at..].contains("FeatureTransport::for_device(&self.sessions, device_id)")
+            && commands[at..].find("FeatureTransport::for_device").unwrap()
+                < commands[at..].find("f(&fresh)").unwrap()
+            || commands[at..].contains(".and_then(|fresh| f(&fresh))"),
+        "with_feature_transport re-takes the snapshot after the wait"
+    );
+    let files = include_str!("../file_transfer.rs");
+    let at = files.find("transport.preflight()").expect("preflight");
+    assert!(
+        files[at..].contains("transport = fresh"),
+        "queue_send re-takes it too"
+    );
+}
+
 /// A dozing phone (frozen by its OS) gets 90 s of LAN silence before its
 /// link is buried; an awake one keeps the 30 s budget.
 #[test]
