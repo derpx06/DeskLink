@@ -789,7 +789,9 @@ mod tests {
         let group = "Desktop Action phone0";
         let argv = glib::shell_parse_argv(dolphin.string(group, "Exec").unwrap().as_str()).unwrap();
         let argv: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(argv, [exe.to_str().unwrap(), "--send-files", "--to", "p0", "--", "%F"]);
+        // The Desktop Entry layer doubles a literal `%` (`%%`); the shell layer is exact.
+        let spec_exe = exe.to_str().unwrap().replace('%', "%%");
+        assert_eq!(argv, [spec_exe.as_str(), "--send-files", "--to", "p0", "--", "%F"]);
         assert_eq!(dolphin.string(group, "Name").unwrap(), "Send to $(rm -rf ~)");
         for i in 0..clean.len() {
             let name = dolphin.string(&format!("Desktop Action phone{i}"), "Name").unwrap();

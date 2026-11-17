@@ -1927,7 +1927,12 @@ mod tests {
         }
         let exe = Path::new(EXE);
         let menu = dolphin_menu(exe, &[("p1".into(), "Pixel".into())]);
-        assert_eq!(mime_lines(&menu), ["MimeType=application/octet-stream;"]);
+        // A Type=Service menu is never an application handler; folders are
+        // listed so the entry shows for a mixed selection.
+        assert_eq!(
+            mime_lines(&menu),
+            ["MimeType=application/octet-stream;inode/directory;"]
+        );
         assert!(
             menu.starts_with("[Desktop Entry]\nType=Service\n"),
             "not an Application"
