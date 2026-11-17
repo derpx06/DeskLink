@@ -14,10 +14,47 @@ use crate::device_links::notes;
 const SHOWN: usize = 3;
 
 thread_local! {
+    /// Where the cursor was before Home was rebuilt, until the person types
+    /// or leaves the entry: whichever of the focus change and the restore
+    /// comes last, the cursor ends up here (and nothing is selected).
+    /// One for the process: DeskLink has one window, so one quick entry.
+    static PENDING_CURSOR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     /// What is typed in the entry: kept when Home is redrawn (a note arriving
     /// from the phone) so typing is never lost. One draft for every phone:
     /// the entry is the computer's, not a phone's.
     static DRAFT: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn apply_pending_cursor(entry: &gtk::Entry) {
+    if let Some(position) = PENDING_CURSOR.with(|pending| pending.get()) {
+        entry.select_region(position, position);
+    }
+}
+
+/// Gives the focus to `entry`, a rebuilt copy of the entry that had it with
+/// its cursor at `position`: the cursor stays there however the focus-in
+/// (which selects all) and this restore are ordered.
+pub(in crate::window) fn restore_cursor(entry: &gtk::Entry, position: i32) {
+    PENDING_CURSOR.with(|pending| pending.set(Some(position)));
+    entry.grab_focus();
+    apply_pending_cursor(entry);
+    let entry = entry.clone();
+    gtk::glib::idle_add_local_once(move || {
+        apply_pending_cursor(&entry);
+        // The focus did not land (the entry is not mapped, the page changed)
+        // while the window is active: nothing late is coming, so no stale
+        // position waits for a click or Tab hours from now.
+        let in_entry = entry.root().is_some_and(|root| {
+            gtk::prelude::RootExt::focus(&root).is_some_and(|focus| focus.is_ancestor(&entry))
+        });
+        let active = entry
+            .root()
+            .and_downcast::<gtk::Window>()
+            .is_some_and(|window| window.is_active());
+        if !in_entry && active {
+            PENDING_CURSOR.with(|pending| pending.set(None));
+        }
+    });
 }
 
 /// "No notes yet", "1 note", "5 notes".
@@ -92,20 +129,56 @@ pub(super) fn notes_card(win: &DesklinkWindow, device: &DeviceView) -> gtk::Box 
     entry.update_property(&[gtk::accessible::Property::Label("Quick note")]);
     entry.set_text(&DRAFT.with(|draft| draft.borrow().clone()));
     // A redraw gives the focus back with `grab_focus`, which selects all of
-    // an entry's text: the next key would replace the draft. The cursor goes
-    // to the end instead, once the focus change is done.
+    // an entry's text: the next key would replace the draft. The cursor is
+    // put back where it was (`restore_cursor`), whenever the focus change
+    // is actually done: at once, or late (a window that was not active).
     // (A GtkEntry's focus is its inner GtkText's.)
     if let Some(inner) = entry.delegate() {
         inner.connect_notify_local(Some("has-focus"), {
-            let entry = entry.clone();
-            move |_, _| {
-                if !entry.text().is_empty() {
-                    let entry = entry.clone();
-                    gtk::glib::idle_add_local_once(move || entry.set_position(-1));
+            // Weak: the entry owns its text, which owns this closure.
+            let entry = entry.downgrade();
+            move |inner, _| {
+                if inner.has_focus() {
+                    if let Some(entry) = entry.upgrade() {
+                        gtk::glib::idle_add_local_once(move || apply_pending_cursor(&entry));
+                    }
+                } else {
+                    // Out of the entry: nothing is owed to it any more.
+                    PENDING_CURSOR.with(|pending| pending.set(None));
                 }
             }
         });
     }
+    // The person's own keys end it: from the first one the cursor is theirs.
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed(|_, key, _, _| {
+        use gtk::gdk::Key;
+        // Shift, Ctrl, Alt and the like are not typing.
+        let modifier = matches!(
+            key,
+            Key::Shift_L
+                | Key::Shift_R
+                | Key::Control_L
+                | Key::Control_R
+                | Key::Alt_L
+                | Key::Alt_R
+                | Key::Meta_L
+                | Key::Meta_R
+                | Key::Super_L
+                | Key::Super_R
+                | Key::ISO_Level3_Shift
+                | Key::Caps_Lock
+                | Key::Num_Lock
+        );
+        if !modifier {
+            PENDING_CURSOR.with(|pending| pending.set(None));
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    entry.add_controller(keys);
+    // Off the screen (another page): no position is owed to it.
+    entry.connect_unmap(|_| PENDING_CURSOR.with(|pending| pending.set(None)));
     entry.connect_changed(|entry| {
         DRAFT.with(|draft| *draft.borrow_mut() = entry.text().to_string())
     });

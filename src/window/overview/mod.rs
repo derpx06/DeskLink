@@ -53,6 +53,7 @@ pub(crate) use links::link_to_send;
 // What the rest of the module's parent uses (everything else stays inside).
 pub(super) use cards::preview_line;
 pub(super) use links::show_send_link_dialog;
+pub(super) use notes_card::restore_cursor;
 pub(super) use tiles::{hand_off, tile_columns};
 
 pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &DeviceView) {

@@ -585,10 +585,7 @@ impl DesklinkWindow {
                     .next()
                     .and_downcast::<gtk::Entry>()
                 {
-                    entry.grab_focus();
-                    // Focusing selects all of an entry's text: the cursor goes
-                    // back where it was once that is done.
-                    glib::idle_add_local_once(move || entry.select_region(position, position));
+                    overview::restore_cursor(&entry, position);
                 }
             } else if let Some(widget) =
                 focus_path.and_then(|path| widget_at(body.upcast_ref(), &path))

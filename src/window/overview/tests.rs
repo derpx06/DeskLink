@@ -924,6 +924,24 @@ fn the_quick_note_entry_keeps_the_focus_when_its_card_changes_column() {
         let after = entry();
         assert_ne!(before, after, "Home was rebuilt");
         assert_ne!(column(&after), was_left, "the Notes card changed column");
+        // Wait for the condition, not for one pass of the main loop: the
+        // focus change may land late, so the cursor must settle and then
+        // stay (a late focus-in must not move it again).
+        let context = gtk::glib::MainContext::default();
+        let pump = |passes: u32| {
+            for _ in 0..passes {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let settled = |entry: &gtk::Entry| {
+            focused(entry) && entry.selection_bounds().is_none() && entry.position() == 4
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !settled(&after) && std::time::Instant::now() < deadline {
+            pump(1);
+        }
+        pump(60);
         assert!(focused(&after), "the entry has the focus again");
         assert_eq!(after.text(), "half typed");
         assert_eq!(after.selection_bounds(), None, "nothing is selected");
