@@ -676,12 +676,6 @@ thread_local! {
     static DIAL_DIALOG: RefCell<Option<glib::WeakRef<adw::AlertDialog>>> = const { RefCell::new(None) };
 }
 
-/// Asks before calling `number` from a link (`tel:`), `desklink --dial`, the
-/// search provider, a missed-call button or a contact: a web page, or any
-/// process on the session bus, can start a call request without the user
-/// meaning to. Every dial goes through here and nowhere else. The default
-/// answer is Cancel, so a stray Enter never places a call. With `phone`, that
-/// phone places the call; else the first that can.
 /// The phone a call or message goes out from: with `wanted`, that phone (or
 /// none: a contact belongs to its phone); without, the first that can, by
 /// name then id, so the choice is the same every time.
@@ -705,6 +699,13 @@ pub(super) fn selected_caller(win: &DesklinkWindow) -> Option<String> {
     pick_phone(daemon.devices(), Some(&id)).map(|device| device.id)
 }
 
+/// Asks before calling `number` from a link (`tel:`), `desklink --dial`, the
+/// search provider, a missed-call button or a contact: a web page, or any
+/// process on the session bus, can start a call request without the user
+/// meaning to. Every dial goes through here and nowhere else. The default
+/// answer is Cancel, so a stray Enter never places a call. With `phone`, that
+/// phone places the call; else the first that can,
+/// by name then id.
 pub(crate) fn confirm_dial(win: &DesklinkWindow, number: &str, phone: Option<&str>) {
     confirm_telephony(win, number, phone, "dial");
 }
@@ -752,11 +753,22 @@ fn confirm_telephony(
     };
     // Only a request that will be asked uses up the allowance.
     DIAL_ASKED.with(|last| last.set(Some(now)));
-    let phone = pick_phone(daemon.devices(), phone);
+    let wanted = phone;
+    let devices = daemon.devices();
+    let phone = pick_phone(devices.clone(), wanted);
     let Some(phone) = phone else {
         let dialog = adw::AlertDialog::new(
-            Some("No Phone to Call With"),
-            Some("Connect a phone with DeskLink to make calls from this computer."),
+            Some("No phone to call with"),
+            Some(
+                &match wanted.and_then(|id| devices.iter().find(|device| device.id == id)) {
+                    Some(device) => format!(
+                        "{} cannot place calls right now. Check that it is connected.",
+                        device.name
+                    ),
+                    None => "Connect a phone with DeskLink to make calls from this computer."
+                        .to_string(),
+                },
+            ),
         );
         dialog.add_response("close", "_Close");
         dialog.present(Some(win));

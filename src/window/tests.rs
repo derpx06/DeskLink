@@ -977,5 +977,37 @@ fn details_opens_the_banners_error_not_a_later_passing_one() {
             "Trusted device certificate changed",
             "the banner's own raw error"
         );
+        // Details opens the banner's own error.
+        window
+            .imp()
+            .error_banner
+            .emit_by_name::<()>("button-clicked", &[]);
+        let dialog = window
+            .visible_dialog()
+            .and_downcast::<adw::AlertDialog>()
+            .expect("Details opens the error");
+        assert!(
+            dialog.body().contains("identity changed"),
+            "{}",
+            dialog.body()
+        );
+        assert!(!dialog.body().contains("passing"), "{}", dialog.body());
+        dialog.close();
     });
+}
+
+/// The Files page's moving cards come from the selected phone's transfers
+/// only: its refresh goes through `rows_for` with the selected phone's id
+/// (the filter itself is `only_the_selected_phones_transfers_are_its_own`).
+#[test]
+fn the_files_page_asks_for_the_selected_phones_rows_only() {
+    let production = crate::source_scan::production(include_str!("transfers/live.rs"));
+    assert!(
+        production.contains("rows_for(&selected.0, rows(daemon))"),
+        "the Files cards are filtered by the selected phone"
+    );
+    assert!(
+        !production.contains("let rows = rows(daemon);"),
+        "no unfiltered list of every phone's transfers"
+    );
 }
