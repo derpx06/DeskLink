@@ -14,6 +14,12 @@ const MAX_KEYS: usize = 256;
 /// [`LOG_EVERY`]; the next one says how many were skipped. Never put
 /// personal data (text, names, paths) in `line`.
 pub(crate) fn log_limited(kind: &'static str, line: &str) {
+    log_limited_every(kind, line, LOG_EVERY);
+}
+
+/// [`log_limited`] with its own period (a status line that should be a
+/// summary, not a stream).
+pub(crate) fn log_limited_every(kind: &'static str, line: &str, every: Duration) {
     static LAST: Mutex<Option<HashMap<&'static str, (Instant, u64)>>> = Mutex::new(None);
     let Ok(mut last) = LAST.lock() else {
         return;
@@ -23,7 +29,7 @@ pub(crate) fn log_limited(kind: &'static str, line: &str) {
         last.clear();
     }
     match last.get_mut(kind) {
-        Some((at, skipped)) if at.elapsed() < LOG_EVERY => *skipped += 1,
+        Some((at, skipped)) if at.elapsed() < every => *skipped += 1,
         Some((at, skipped)) => {
             eprintln!("[DeskLink] {line} ({skipped} similar skipped)");
             *at = Instant::now();

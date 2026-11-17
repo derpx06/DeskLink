@@ -609,6 +609,19 @@ impl AddressBook {
         }
     }
 
+    /// For the log: how many addresses `device_id` has, their failures in all,
+    /// and how long until the earliest retry.
+    pub(super) fn summary(&self, device_id: &str, now: Instant) -> (usize, u32, Option<Duration>) {
+        let list = self.phones.get(device_id).map_or(&[][..], Vec::as_slice);
+        let failures = list.iter().map(|known| known.failures).sum();
+        let next = list
+            .iter()
+            .filter_map(|known| known.retry_at)
+            .map(|at| at.saturating_duration_since(now))
+            .min();
+        (list.len(), failures, next)
+    }
+
     /// Forgets `device_id` (unpaired).
     pub(super) fn forget(&mut self, device_id: &str) {
         self.phones.remove(device_id);
@@ -796,6 +809,15 @@ impl DaemonWorker {
                 };
                 for (info, ip, port) in targets {
                     let Some(slot) = super::network::HandshakeSlot::claim(ip) else {
+                        crate::device_links::limits::log_limited_every(
+                            "slot-refused-dial",
+                            &format!(
+                                "{} Not dialling {}: too many handshakes in progress to {ip}",
+                                crate::device_links::webrtc::coordinator::stamp(),
+                                info.id
+                            ),
+                            Duration::from_secs(30),
+                        );
                         // No dial started: the lease goes back at once.
                         if let Ok(mut book) = addresses().lock() {
                             book.release(&info.id, ip);
@@ -821,13 +843,30 @@ impl DaemonWorker {
                             sessions,
                             events,
                         );
-                        if let Ok(mut book) = addresses().lock() {
-                            book.dial_ended(&id, ip, &outcome, Instant::now());
-                        }
+                        let summary = addresses().lock().ok().map(|mut book| {
+                            let now = Instant::now();
+                            book.dial_ended(&id, ip, &outcome, now);
+                            book.summary(&id, now)
+                        });
                         if let Err(error) = outcome {
                             debug_log!(
-                                "[DL-WRTC-BOOT] redial of {id} at {ip}:{port} failed: {error}"
+                                "[DL-WRTC-BOOT] {} redial of {id} at {ip}:{port} failed: {error}",
+                                crate::device_links::webrtc::coordinator::stamp()
                             );
+                            // The normal log's one-line account of a phone that
+                            // keeps failing: how many addresses, how many failures,
+                            // when the next try is. One line per 30 s.
+                            if let Some((addresses, failures, next)) = summary {
+                                crate::device_links::limits::log_limited_every(
+                                    "redial-failing",
+                                    &format!(
+                                        "{} Redialling {id}: {addresses} address(es), {failures} failure(s), next try in {}s",
+                                        crate::device_links::webrtc::coordinator::stamp(),
+                                        next.map_or(0, |next| next.as_secs())
+                                    ),
+                                    Duration::from_secs(30),
+                                );
+                            }
                         }
                     });
                     if spawned.is_err() {
@@ -1291,6 +1330,25 @@ mod tests {
             book.try_dial("unpaired", phone, now),
             "not in the book: nothing to share"
         );
+    }
+
+    /// The log's one-line account of a phone that keeps failing.
+    #[test]
+    fn the_failure_summary_counts_addresses_failures_and_the_next_try() {
+        let (now, a, b) = (
+            Instant::now(),
+            "10.0.0.8".parse().unwrap(),
+            "10.0.0.9".parse().unwrap(),
+        );
+        let mut book = AddressBook::default();
+        assert_eq!(book.summary("p", now), (0, 0, None));
+        book.seen("p", a);
+        book.seen("p", b);
+        book.failed("p", a, now);
+        book.failed("p", a, now);
+        let (count, failures, next) = book.summary("p", now);
+        assert_eq!((count, failures), (2, 2));
+        assert_eq!(next, Some(address_backoff(2)));
     }
 
     #[test]

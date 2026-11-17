@@ -39,7 +39,18 @@ pub(super) fn incoming_tcp_loop(
                     .and_then(|addr| super::network::HandshakeSlot::claim(addr.ip()))
                 else {
                     // Dropping the stream closes it: at capacity, refuse rather
-                    // than queue an unauthenticated connection.
+                    // than queue an unauthenticated connection. One line per 30 s
+                    // (a port scan is one line): a silent refusal is what a
+                    // "stuck, nothing in the log" report could not tell from none.
+                    crate::device_links::limits::log_limited_every(
+                        "slot-refused",
+                        &format!(
+                            "{} Refused a connection from {}: too many handshakes in progress",
+                            crate::device_links::webrtc::coordinator::stamp(),
+                            source.ip()
+                        ),
+                        Duration::from_secs(30),
+                    );
                     continue;
                 };
                 let config = Arc::clone(&config);

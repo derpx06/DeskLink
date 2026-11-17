@@ -1379,6 +1379,93 @@ fn the_worker_guard_clears_its_attempt_on_panic_but_not_a_newer_one() {
     assert_eq!(attempt(&desktop).as_deref(), Some("a2"));
 }
 
+/// F-QA3-4 hardening: an OLD generation's worker leaving late (a redial already
+/// registered a newer link) must not tear down the device-keyed state of the
+/// newer generation (a Phone Screen share, a remote session, transfers).
+#[test]
+fn a_late_old_worker_leaves_the_newer_generations_state_alone() {
+    use super::PeerWorkerGuard;
+    use crate::device_links::core::test_link::TestNetwork;
+    use crate::device_links::daemon::test_peer::peer_pair;
+    let net = TestNetwork::new();
+    let (mut desktop, _phone) = peer_pair(&net, "late-desk", "late-phone");
+    let old = desktop.binding.clone();
+    desktop.drop_link();
+    desktop.relink();
+    assert_ne!(
+        old.generation, desktop.binding.generation,
+        "a newer generation"
+    );
+    let id = desktop.peer_id();
+    let mut shown = crate::device_links::webrtc::remote_session::RemoteSession::new();
+    shown.set_phone_screen(1080, 2400);
+    crate::device_links::webrtc::remote_session::sessions()
+        .lock()
+        .unwrap()
+        .insert(id.clone(), shown);
+    drop(PeerWorkerGuard {
+        binding: old,
+        attempt_id: "old".into(),
+        sessions: Arc::clone(&desktop.sessions),
+    });
+    let kept = crate::device_links::webrtc::remote_session::sessions()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .and_then(|session| session.phone_screen());
+    assert_eq!(
+        kept,
+        Some((1080, 2400)),
+        "the new generation's share survived"
+    );
+    crate::device_links::webrtc::remote_session::sessions()
+        .lock()
+        .unwrap()
+        .remove(&id);
+}
+
+/// F-QA3-4 hardening: with the session's link gone (`disconnect_if_current`),
+/// "Try again" / a network change / a beacon still reset the ladder and clear
+/// the "Can't reach" words; they used to wait for a new link to register.
+#[test]
+fn a_sign_of_a_phone_with_no_link_still_clears_the_unavailable_state() {
+    use crate::device_links::core::DeviceManager;
+    let dir = std::env::temp_dir().join(format!("desklink-nolink-{}", uuid::Uuid::new_v4()));
+    let config = Arc::new(Mutex::new(Config::load_from_dir(dir.clone()).unwrap()));
+    let sessions = Arc::new(DeviceManager::new());
+    let binding = paired_session(&sessions, "00");
+    let devices: Arc<Mutex<HashMap<String, crate::device_links::device::DeviceView>>> =
+        Arc::default();
+    let info = crate::device_links::device_info::DeviceInfo {
+        id: "00".into(),
+        name: "Pixel 9".into(),
+        device_type: "phone".into(),
+        protocol_version: 9,
+        incoming_capabilities: Vec::new(),
+        outgoing_capabilities: Vec::new(),
+        instance_id: None,
+        app_version: None,
+    };
+    let mut card =
+        crate::device_links::device::DeviceView::from_info(&info, "10.0.0.2".into(), true);
+    card.last_error = Some(super::unavailable_words("Pixel 9"));
+    devices.lock().unwrap().insert("00".into(), card);
+    sessions
+        .with_session(&binding, |session| {
+            session.webrtc_recovery_attempt = RECOVERY_BACKOFF_MILLIS.len() as u32
+        })
+        .unwrap();
+    // The liveness verdict took the link out of the session.
+    sessions.disconnect_if_current(&binding, "silent".into());
+    assert!(sessions.current_bindings().is_empty(), "no link");
+    super::reconnect("00", &sessions, &config, &devices, &Arc::default());
+    assert_eq!(devices.lock().unwrap()["00"].last_error, None);
+    // The ladder starts over too (read through the paired session by id).
+    assert_eq!(sessions.reset_recovery("00"), Some(0));
+    crate::device_links::daemon::discovery::forget_addresses("00");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn the_recovery_ladder_is_the_shared_one() {
     assert_eq!(

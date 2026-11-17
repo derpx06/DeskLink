@@ -185,6 +185,16 @@ pub(crate) fn recovery_sign(
         .into_iter()
         .find(|binding| binding.device_id == device_id)
     else {
+        // The session has no link (it was cut): still a sign of a paired
+        // phone, so "Try again" and a network change reset the ladder and the
+        // "Can't reach" words now, not when a link next registers.
+        if sign_is_new(device_id, std::time::Instant::now()) {
+            if let Some(attempt) = sessions.reset_recovery(device_id) {
+                if recovery_delay(attempt).is_none() || shows_unavailable(devices, device_id) {
+                    clear_error(devices, device_id);
+                }
+            }
+        }
         return;
     };
     // Only for a phone that is paired: an unpaired link must never make this
@@ -202,7 +212,7 @@ pub(crate) fn recovery_sign(
             exhausted
         })
         .unwrap_or(false);
-    if was_exhausted {
+    if was_exhausted || shows_unavailable(devices, device_id) {
         clear_error(devices, device_id);
     }
     if sessions
@@ -224,6 +234,17 @@ pub(crate) fn recovery_sign(
             eprintln!("[DeskLink] Reconnecting at a sign of the phone failed: {error}");
         }
     });
+}
+
+/// Whether the card still says the phone can't be reached (a new link resets
+/// the ladder but not the words).
+fn shows_unavailable(devices: &Arc<Mutex<HashMap<String, DeviceView>>>, device_id: &str) -> bool {
+    devices.lock().is_ok_and(|devices| {
+        devices
+            .get(device_id)
+            .and_then(|device| device.last_error.as_deref())
+            .is_some_and(is_unavailable)
+    })
 }
 
 /// Bounded reconnect backoff, matching `WebRtcRecoveryPolicy` on Android.

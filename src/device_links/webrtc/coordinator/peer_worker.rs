@@ -665,7 +665,10 @@ impl Drop for PeerWorkerGuard {
             self.sessions.active_webrtc_attempt(&self.binding),
             Ok(Some(ref active)) if active != &self.attempt_id
         );
-        if superseded {
+        // Or a redial registered a newer generation while this worker was
+        // leaving: its device-keyed state (a Phone Screen share, a remote
+        // session, transfers) is the newer generation's now.
+        if superseded || self.sessions.generation_replaced(&self.binding) {
             return;
         }
         reset_device_webrtc_state(&self.binding.device_id);

@@ -609,6 +609,33 @@ impl DeviceManager {
         })
     }
 
+    /// Whether a newer generation (or session) than `binding`'s now exists for
+    /// its device: a redial registered a new link after `binding` ended.
+    pub fn generation_replaced(&self, binding: &SessionBinding) -> bool {
+        let Ok(sessions) = self.sessions.lock() else {
+            return false;
+        };
+        sessions.get(&binding.device_id).is_some_and(|session| {
+            session.state != SessionState::Terminated
+                && (session.session_id != binding.session_id
+                    || session.connection_generation > binding.generation)
+        })
+    }
+
+    /// A sign of a paired phone with no link (the session was cut): the
+    /// recovery ladder starts over. Returns the attempt it had reached, or
+    /// `None` for an unknown or unpaired device.
+    pub fn reset_recovery(&self, device_id: &str) -> Option<u32> {
+        let mut sessions = self.sessions.lock().ok()?;
+        let session = sessions.get_mut(device_id)?;
+        if session.state == SessionState::Terminated
+            || session.pairing.state != crate::device_links::pairing::PairState::Paired
+        {
+            return None;
+        }
+        Some(std::mem::take(&mut session.webrtc_recovery_attempt))
+    }
+
     pub fn is_current(&self, binding: &SessionBinding) -> bool {
         if binding.cancellation.load(Ordering::Acquire) {
             return false;
