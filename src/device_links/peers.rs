@@ -122,6 +122,9 @@ mod tests {
             "window/transfers/cards.rs:SHOWN",
             "window/transfers/cards.rs:FAILED",
             "window/transfers/cards.rs:WAITING",
+            // Which Home column each card sat in (ids only): a layout memory
+            // for the window, harmless when a phone is gone.
+            "window/overview/balance.rs:REMEMBERED",
             // Phones we asked to pair, and ones that did not accept: dropped
             // when they pair, after two minutes, or with the window.
             "window/pairing.rs:WATCH",
