@@ -267,6 +267,7 @@ impl DeviceManager {
     }
 
     /// [`Self::take_pending_features_stamped`] without the times.
+    #[cfg(test)]
     pub fn take_pending_features(
         &self,
         binding: &SessionBinding,

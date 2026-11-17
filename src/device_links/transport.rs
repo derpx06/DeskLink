@@ -191,7 +191,8 @@ impl FeatureTransport {
         }
     }
 
-    /// The binding this handle sends on.
+    /// The binding this handle sends on (tests read it to see which session it is).
+    #[cfg(test)]
     pub(crate) fn binding(&self) -> &SessionBinding {
         &self.snapshot.binding
     }
