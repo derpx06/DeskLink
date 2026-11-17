@@ -39,7 +39,9 @@ jobs:
           # The relay address is only needed once the relay is compiled in
           # (RELAY_ENABLED); in a LAN-only release it is inert.
           if [ -z "$DESKLINK_RELAY_URL" ]; then
-            if grep -q 'pub const RELAY_ENABLED: bool = true' src/device_links/relay_link/mod.rs; then
+            flag=$(grep -E 'const RELAY_ENABLED: bool = (true|false)' src/device_links/relay_link/mod.rs || true)
+            [ -n "$flag" ] || { echo "::error::cannot read RELAY_ENABLED in src/device_links/relay_link/mod.rs"; exit 1; }
+            if echo "$flag" | grep -q '= true'; then
               echo "::error::DESKLINK_RELAY_URL is not set but the relay is enabled in this build"
               exit 1
             fi

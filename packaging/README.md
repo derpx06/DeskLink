@@ -54,6 +54,9 @@ there is no build for them: use the **Flatpak**, which carries its own GTK.
 Derivatives follow their base: Linux Mint 22, Pop!_OS 24.04, Zorin OS 18 and
 elementary OS 8 are Ubuntu 24.04; Manjaro and EndeavourOS are Arch.
 
+Version note: 0.3.0 is the first public release. Any earlier 1.x development package (none was published) sorts
+above it: remove it before installing 0.3.0 (or use an epoch if one ever needs to be kept).
+
 Build dependencies, per family:
 
 | Family | Packages |

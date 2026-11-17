@@ -810,7 +810,7 @@ CI (`DeskLink/.github/workflows/ci.yml`, SHA-pinned actions) runs on pushes to `
 
 | Item | Fact |
 |---|---|
-| Identity | `applicationId` `org.desklink.mobile`; debug build adds `.debug` and `-debug`. `compileSdk 37`, `minSdk 24`, `targetSdk 36`, versionName `0.3.0`, versionCode `20300` (rule: 20000 + minor*100 + patch), JVM target 11, core-library desugaring (`build.gradle.kts`) |
+| Identity | `applicationId` `org.desklink.mobile`; debug build adds `.debug` and `-debug`. `compileSdk 37`, `minSdk 24`, `targetSdk 36`, versionName `0.3.0`, versionCode `20300` (independent of versionName, only ever goes up), JVM target 11, core-library desugaring (`build.gradle.kts`) |
 | Build types | `debug` signed with the checked-in `debug.keystore` (historical compatibility material, never regenerate); `release` minified, ABIs arm64-v8a + armeabi-v7a unless `-PallAbis`, signed only when `DESKLINK_UPLOAD_KEYSTORE` is provided, otherwise `*-release-unsigned.apk` |
 | Relay default | `BuildConfig.DEFAULT_RELAY_URL` from Gradle property or env `DESKLINK_RELAY_URL`, else `""` |
 | OCR | `-Pdesklink.ocr=true` selects source set `src/ocr/java` (Google ML Kit, about +18 MB, proprietary licence); default `false` selects `src/noocr/java` (a stub that answers "not available") |
@@ -938,16 +938,16 @@ Cross-cutting changes: the desktop block (fmt, check, test, clippy `-D warnings`
 
 ### 15.5 Inconsistencies found between documents and code
 
-Found while writing this document; none was fixed. The code is taken as authoritative unless stated.
+Found while writing this document; rows marked **Fixed** were corrected afterwards, the rest were not. The code is taken as authoritative unless stated.
 
 | # | Documents say | Code or tree says |
 |---|---|---|
 | 1 | `docs/protocol/stageD-protocol.md` W18 section 1 names the control channel `desklink-file-control-v2` | `desklink-file-control-v1` on both sides (`webrtc/mod.rs:152`, `WebRtcChannel.kt:16`); only the data channel is v2; `docs/WEBRTC.md` has it right |
-| 2 | `DeskLink/README.md` still lists "a browser for the phone's files" and "a presentation remote" | Both were removed in 0.3 (`docs/WEBRTC.md` "Removed in 0.3") |
+| 2 | `DeskLink/README.md` still lists "a browser for the phone's files" and "a presentation remote" | **Fixed** in the 0.3.0 docs pass (README rewritten; both were removed in 0.3, `docs/WEBRTC.md` "Removed in 0.3") |
 | 3 | `phone_connect/CLAUDE.md`: "lint has abortOnError = false" | `desklink-mobile/build.gradle.kts:142` has `abortOnError = true` with `lint-baseline.xml` (168 entries; the "4 baseline errors" in the status notes are a subset) |
 | 4 | `phone_connect/CLAUDE.md`: meson "regenerates `src/config.rs` from `src/config.rs.in`" | No meson file references `config.rs.in`; `src/config.rs` is hand-written and checked in |
 | 5 | `flatpak/README.md`: runtime GNOME 51 "because DeskLink needs GStreamer 1.28 (`v1_28`)" | `Cargo.toml` uses `v1_22`; CI/Debian/RPM state a 1.22 floor |
-| 6 | `SECURITY.md` supported versions: only 1.0.x; `packaging/obs/_service` has `revision v1.0.0` | Version is 0.3.0 everywhere else |
+| 6 | `SECURITY.md` supported versions: only 1.0.x; `packaging/obs/_service` has `revision v1.0.0` | **Fixed**: SECURITY.md says 0.3.x and `_service` revision is `v0.3.0` |
 | 7 | `webrtc/mod.rs` comment: the `Terminal` channel is "reserved for a future ... feature"; `application/mod.rs` comment: "port 1717"; `daemon/mod.rs` comment: "Android's 120 s idle reaper" | Terminals use the channel (`coordinator/terminal_pump.rs`, `terminal_bridge/`); the TCP range is 1716-1764; Android's `IDLE_TIMEOUT_MILLIS` is 35 s |
 | 8 | `docs/WEBRTC.md`, `CLAUDE.md`: a negotiation not feature-ready within 10 s is rebuilt; `PEER_PROBE_AFTER`/`PEER_DEAD_AFTER` "mirrored on Android" | The 10 s rule and `PEER_DEAD_AFTER_DOZING` exist only on the desk; Android has a 5 s answer watchdog and a 20 s attempt-stall check, and reports `dozing` instead. Android's recovery policy never stops, whereas the desk stops initiating after the sixth rung |
 | 9 | `CLAUDE.md`: redialer dials "last three IPv4s and one IPv6" | Only `MAX_ADDRESSES = 3` plus 2 unverified candidates and a comment were found; no code enforcing an IPv6 slot was located |
@@ -957,7 +957,7 @@ Found while writing this document; none was fixed. The code is taken as authorit
 | 13 | `HandoverCapabilitiesTest` pinned `deskSends` 25 / `deskAccepts` 22 | Fixed: it now lists `filelane.v1` (both) and `activity` (accepts), 27 and 24 like the desk |
 | 14 | - | `MousePadPlugin.onPacketReceived` still reads `"state"` into `isKeyboardEnabled` (dead code from the removed `keyboardstate`) |
 | 15 | Notes caps described as shared | Per-packet items: desk 200 / phone 500; index entries: desk 4000 / phone 5000 (stored caps equal) |
-| 16 | Removed in 0.3 | `RemovedFeatures` markers are named `type_removed_1_4` and `simplified_2_0`; the `versionCode` comment mentions a first build "2.0.0" |
+| 16 | Leftover names | `RemovedFeatures` markers are named `type_removed_1_4` and `simplified_2_0`; the `versionCode` comment mentions a first build "2.0.0" |
 | 17 | `CLAUDE.md`: storage root `~/.config/desklink/` | The config lives under `~/.config/desklink/protocol/` (`IDENTIFIER_COMPATIBILITY.md` has it right) |
 | 18 | `docs/UI-REDESIGN.md` spec: buttons 12 dp, cards 16, rail 80 dp, 64 dp bar, token names `outline`/`hint`/`live*`, both apps on one dark palette, `px` -> `em` on the desk | Phone buttons are stadium (desk buttons are 12 px), cards 20, rail 88 dp, floating 68 dp pill bar, tokens named `hairlineStrong`/`textFaint`/`coral*`; phone dark `bg 111113` vs desk `131315`; two desk token sets coexist; `style.css` has 34 `px` sizes; breakpoints are 860/480/760 sp; the extension tile set is Files/Clipboard/Ring/Lock/Screen/Photo (no Hand off). The spec's harness paths `~/.cache/ui-audit/...` and a `high-contrast` e2e verb do not exist; "switchOutline pinned in TokenContrastTest" was not confirmed |
 | 19 | `docs/FEATURE-STATUS.md`: desk `webrtc-stabilisation` = `f5fd840`; phone work on `phone-int2`, not pushed | The checked-out desk branch is `2a07423` (two wobble-guard commits ahead); the phone's `webrtc-stabilisation` is `255c8da`, ahead of `phone-int2` (`dd18e12`) by the Extend commits. Test counts therefore differ by tree |

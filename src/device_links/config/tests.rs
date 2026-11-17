@@ -65,7 +65,7 @@ fn no_relay_is_wanted_until_one_is_set_up() {
     );
 }
 
-///  0.3 ships LAN-only: with the switch off, even a stored relay address,
+/// 0.3 ships LAN-only: with the switch off, even a stored relay address,
 /// "on" and "Use TURN" (kept untouched in config.json) reach nothing.
 #[test]
 fn the_relay_compiled_out_ignores_every_stored_relay_setting() {
@@ -808,7 +808,7 @@ fn a_failed_save_at_start_is_not_fatal() {
     let _ = fs::remove_dir_all(dir);
 }
 
-///  0.3 cleans up after itself: the old restore-token file and the old
+/// 0.3 cleans up after itself: the old restore-token file and the old
 /// transfer folder go, quietly, once.
 #[test]
 fn leftover_tokens_and_old_transfer_state_are_removed() {

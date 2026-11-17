@@ -215,5 +215,39 @@ mod tests {
         assert!(include_str!("../derx06.desklink.com.json")
             .contains(&format!("\"tag\" : \"v{version}\"")));
         assert!(include_str!("../packaging/obs/_service").contains(&format!("v{version}</param>")));
+        for srcinfo in [
+            include_str!("../packaging/aur/desklink/.SRCINFO"),
+            include_str!("../packaging/aur/desklink-bin/.SRCINFO"),
+        ] {
+            assert!(srcinfo.contains(&format!("pkgver = {version}")), ".SRCINFO");
+            assert!(srcinfo.contains(&format!("v{version}")), ".SRCINFO source");
+        }
+        assert!(
+            include_str!("../README.md").contains(&format!("desklink-{version}-x86_64.flatpak"))
+        );
+        assert!(include_str!("../flatpak/README.md").contains(&format!("v{version}")));
+        // The AppStream release date and the Debian changelog's agree.
+        let date = metainfo
+            .split("<release version=\"")
+            .nth(1)
+            .and_then(|rest| rest.split("date=\"").nth(1))
+            .and_then(|rest| rest.split('"').next())
+            .expect("a release date");
+        let (year, month, day) = {
+            let mut parts = date.split('-');
+            (
+                parts.next().unwrap().to_string(),
+                parts.next().unwrap().parse::<usize>().unwrap(),
+                parts.next().unwrap().parse::<u32>().unwrap(),
+            )
+        };
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let debian = include_str!("../packaging/debian/changelog");
+        assert!(
+            debian.contains(&format!("{day} {} {year}", MONTHS[month - 1])),
+            "the Debian changelog date is the AppStream release date ({date})"
+        );
     }
 }

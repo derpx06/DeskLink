@@ -405,7 +405,7 @@ pub(super) fn clipboard_from_phone_at(
         // The phone's clipboard as of connecting only ever fills an empty
         // clipboard here, whatever it says about its time: a desk that had
         // just started (no time of its own) and a phone that stamps the time
-        // it read its clipboard (builds before 1.3) put the phone's old copy
+        // it read its clipboard (old development builds) put the phone's old copy
         // over the laptop's on every restart. A copy made on the phone while
         // the desk was off is sent again from the phone ("Send clipboard").
         Some(_) => {
