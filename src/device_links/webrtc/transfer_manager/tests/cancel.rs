@@ -133,3 +133,87 @@ fn a_cancel_while_detached_is_remembered_for_the_re_offer() {
         crate::device_links::webrtc::transfer_manager::store::cancelled_while_away(&rig.ids.1, &id)
     );
 }
+
+// ── A finished transfer offered or closed again (audit X9) ─────────────────
+
+/// A manager for the same peer and the same directories, with a link of its
+/// own: the next negotiation attempt after a link loss, or the next run.
+fn reconnected(hand: &Hand) -> (Arc<Manager>, Arc<Pipe>) {
+    let manager = Arc::new(
+        Manager::with(
+            hand.base.join("state"),
+            hand.base.join("dl"),
+            fast(),
+            crate::device_links::webrtc::transfer_manager::FILE_QUEUE_MAX_BYTES,
+        )
+        .unwrap(),
+    );
+    let link = Pipe::new();
+    manager.attach(wire_of("beta", "alpha"), link.clone());
+    (manager, link)
+}
+
+/// The receiver has placed a file and its `complete` never reached the sender
+/// (a link lost in between). After a reconnect (a new manager, as every
+/// negotiation attempt makes) the sender's `done` or its re-offer of the same
+/// id is answered `complete` / accepted at the end, never opened again from
+/// block 1 and placed a second time ("name (2)").
+#[test]
+fn a_finished_transfer_offered_or_closed_again_after_a_reconnect_is_answered_not_received_twice() {
+    let hand = Hand::new("finished-again");
+    let data = payload(50_000, 91); // one frame (at most 61 440 bytes)
+    let hash = hex(&hash_of_hashes(&[openssl::sha::sha256(&data)]));
+    let offer = |name: &str| hand.offer(id(1), name, data.len() as u64);
+    let done = |hash: &str| {
+        let mut done =
+            FileControl::new(&wire_of("alpha", "beta"), FileAction::Done, id(1), "token0");
+        done.file_hash = Some(hash.to_string());
+        done.blocks = Some(1);
+        done.total_size = Some(data.len() as u64);
+        done
+    };
+    hand.send(offer("again.bin"));
+    eventually("the accept", || hand.reply(FileAction::Accept));
+    hand.manager
+        .on_frame(frame_of(id(1), 0, 0, &data, data.len() as u64));
+    hand.send(done(&hash));
+    eventually("the complete", || hand.reply(FileAction::Complete));
+    let placed = names(&hand.base.join("dl"));
+    assert_eq!(placed.len(), 1, "{placed:?}");
+
+    // The link was lost before the sender heard: a new manager, the same
+    // directories.
+    let (manager, link) = reconnected(&hand);
+    let settle = || manager.probe(|_| ());
+    // The sender sends `done` again.
+    manager.on_control(done(&hash));
+    settle();
+    assert_eq!(link.sent(FileAction::Complete).len(), 1, "answered once");
+    assert_eq!(
+        link.sent(FileAction::Complete)[0].file_hash.as_deref(),
+        Some(hash.as_str())
+    );
+    // A `done` for another file under that id is an error, as on the phone.
+    manager.on_control(done(&"cd".repeat(32)));
+    settle();
+    let refusal = &link.sent(FileAction::Error)[0];
+    assert_eq!(refusal.code.as_deref(), Some(code::HASH_MISMATCH));
+    // Or it offers the same transfer again: accepted as already whole.
+    manager.on_control(offer("again.bin"));
+    settle();
+    let accept = &link.sent(FileAction::Accept)[0];
+    assert_eq!(accept.resume_block, Some(1), "resume at the end");
+    assert_eq!(accept.prefix_sha256.as_deref(), Some(hash.as_str()));
+    assert!(manager.probe(|engine| engine.incoming_ids()).is_empty());
+    assert_eq!(names(&hand.base.join("dl")), placed, "no second copy");
+
+    // Not the same file (another name under that id) or another id with the
+    // same bytes: each a transfer of its own, opened and accepted from block 0.
+    manager.on_control(offer("other.bin"));
+    manager.on_control(hand.offer(id(2), "again.bin", data.len() as u64));
+    settle();
+    assert_eq!(link.sent(FileAction::Accept).len(), 3);
+    assert_eq!(link.sent(FileAction::Accept)[1].resume_block, Some(0));
+    assert_eq!(link.sent(FileAction::Accept)[2].resume_block, Some(0));
+    assert_eq!(manager.probe(|engine| engine.incoming_ids()).len(), 2);
+}

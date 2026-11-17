@@ -496,6 +496,24 @@ impl Engine {
                 return refuse(code::REFUSED, Some(why));
             }
         }
+        // Placed already, and its sender never heard (a link lost between):
+        // accepted as whole, from the last block, so it only has to say
+        // `done` and hear `complete`; nothing is opened and no second copy
+        // is placed.
+        if let Some(done) = self
+            .store
+            .find_done(&id, &net.wire.peer_device_id)
+            .filter(|done| {
+                done.token == token && done.total_size == total && done.filename == filename
+            })
+        {
+            let mut accept = net.msg(FileAction::Accept, &id, &token);
+            accept.resume_block = Some(done.blocks);
+            accept.prefix_sha256 = Some(done.file_hash);
+            accept.max_frame_bytes = Some(FRAME_BYTES_PROVEN);
+            net.send(accept);
+            return;
+        }
         // The same transfer offered again: answered from where we are.
         if let Some(existing) = self.incoming.get_mut(&key) {
             if existing.token != token || existing.total != total || existing.filename != filename {
@@ -974,6 +992,29 @@ impl Engine {
             return;
         };
         let Some(incoming) = self.incoming.get_mut(&key) else {
+            // Placed already: the sender did not hear the `complete`, so it
+            // is said again (a different file under that id is an error, as
+            // on the phone).
+            if let Some(done) = self
+                .store
+                .find_done(&message.transfer_id, &net.wire.peer_device_id)
+                .filter(|done| done.token == message.transfer_token)
+            {
+                let same = message.file_hash.as_deref().map(str::to_lowercase)
+                    == Some(done.file_hash.clone())
+                    && message.total_size == Some(done.total_size);
+                if same {
+                    let mut complete =
+                        net.msg(FileAction::Complete, &message.transfer_id, &done.token);
+                    complete.file_hash = Some(done.file_hash);
+                    net.send(complete);
+                } else {
+                    let mut error = net.msg(FileAction::Error, &message.transfer_id, &done.token);
+                    error.code = Some(code::HASH_MISMATCH.to_string());
+                    error.message = Some("That is not the file received.".to_string());
+                    net.send(error);
+                }
+            }
             return;
         };
         if incoming.token != message.transfer_token {
@@ -1054,7 +1095,24 @@ impl Engine {
             }
         };
         let mut complete = net.msg(FileAction::Complete, &id, &incoming.token);
-        complete.file_hash = Some(hex(&hash_of_hashes(&incoming.hashes)));
+        let file_hash = hex(&hash_of_hashes(&incoming.hashes));
+        // Remembered before the `complete` goes out (on this file thread, with
+        // fsync): a reconnect or a restart after it must find the record.
+        if let Err(error) = self.store.save_done(&super::store::DoneRecord {
+            transfer_id: id.clone(),
+            device_id: net.wire.peer_device_id.clone(),
+            token: incoming.token.clone(),
+            filename: incoming.filename.clone(),
+            total_size: incoming.total,
+            blocks: incoming.blocks_total,
+            file_hash: file_hash.clone(),
+            at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as u64),
+        }) {
+            debug_log!("[DeskLink] Could not remember a finished transfer: {error}");
+        }
+        complete.file_hash = Some(file_hash);
         net.send(complete);
         if let Err(error) = self.store.remove_receive(&id) {
             debug_log!("[DeskLink] Could not remove a finished transfer's files: {error}");

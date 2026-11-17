@@ -465,12 +465,16 @@ impl Drop for Rig {
     }
 }
 
+/// What is in `dir`, without the records of placed transfers
+/// (`.desklink-<id>.done`, kept on purpose after a transfer ends so a repeated
+/// `done` or re-offer can be answered: `store::DoneRecord`).
 fn names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .map(|entries| {
             entries
                 .flatten()
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| !name.ends_with(".done"))
                 .collect()
         })
         .unwrap_or_default();

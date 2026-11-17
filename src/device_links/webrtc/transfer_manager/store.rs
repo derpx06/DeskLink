@@ -63,6 +63,26 @@ impl ReceiveCheckpoint {
 /// A checkpoint and the hashes of the blocks it vouches for.
 pub(super) type Held = (ReceiveCheckpoint, Vec<[u8; 32]>);
 
+/// A transfer placed and told `complete`: kept (one small file each, written
+/// before the `complete` goes out) so a sender that never heard it, after a
+/// reconnect or a restart, is answered instead of received a second time
+/// ("name (2)"). The same key set as the phone's `DeliveredTransfers`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct DoneRecord {
+    pub transfer_id: String,
+    pub device_id: String,
+    pub token: String,
+    pub filename: String,
+    pub total_size: u64,
+    pub blocks: u64,
+    pub file_hash: String,
+    pub at_ms: u64,
+}
+
+/// How many placed transfers are remembered, and for how long.
+pub(super) const DONE_KEEP: usize = 50;
+pub(super) const DONE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// What a sender keeps so an interrupted send can be offered again under the
 /// same id and token. The source is read in place, never copied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,6 +453,61 @@ impl Store {
             .map_err(|error| format!("Could not open DeskLink partial file: {error}"))
     }
 
+    /// `.desklink-<id>.done` (not `.json`: the receive-checkpoint scans match that).
+    fn done_name(id: &str) -> String {
+        format!(".desklink-{id}.done")
+    }
+
+    /// Remembers a placed transfer, then keeps the newest [`DONE_KEEP`] and
+    /// nothing older than [`DONE_MAX_AGE`].
+    pub fn save_done(&self, record: &DoneRecord) -> Result<(), String> {
+        let bytes = serde_json::to_vec(record).map_err(|error| error.to_string())?;
+        self.write_atomic(&Self::done_name(&record.transfer_id), &bytes)?;
+        self.prune_done(SystemTime::now());
+        Ok(())
+    }
+
+    /// The placed transfer `id` of `device_id`, if remembered (a record read
+    /// back is untrusted: it must name this id and device).
+    pub fn find_done(&self, id: &str, device_id: &str) -> Option<DoneRecord> {
+        let bytes = self.read_regular(&Self::done_name(id)).ok().flatten()?;
+        serde_json::from_slice::<DoneRecord>(&bytes)
+            .ok()
+            .filter(|record| record.transfer_id == id && record.device_id == device_id)
+    }
+
+    /// Drops the oldest placed-transfer records past the cap, and any older than `now - DONE_MAX_AGE`.
+    pub(super) fn prune_done(&self, now: SystemTime) {
+        let Ok(entries) = fs::read_dir(&self.state_root) else {
+            return;
+        };
+        let mut found: Vec<(SystemTime, PathBuf)> = entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".desklink-") && name.ends_with(".done"))
+            })
+            .filter_map(|entry| {
+                let metadata = fs::symlink_metadata(entry.path()).ok()?;
+                if !metadata.is_file() {
+                    return None;
+                }
+                Some((metadata.modified().ok()?, entry.path()))
+            })
+            .collect();
+        found.sort_by(|a, b| b.0.cmp(&a.0));
+        for (index, (modified, path)) in found.into_iter().enumerate() {
+            let old = now
+                .duration_since(modified)
+                .is_ok_and(|age| age > DONE_MAX_AGE);
+            if index >= DONE_KEEP || old {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
     pub fn save_send(&self, checkpoint: &SendCheckpoint) -> Result<(), String> {
         let bytes = serde_json::to_vec(checkpoint).map_err(|error| error.to_string())?;
         self.write_atomic(&Self::send_name(&checkpoint.transfer_id), &bytes)
@@ -787,7 +862,12 @@ pub(super) fn purge_device(root: &Path, device_id: &str) -> usize {
         let Some(inner) = name.strip_prefix(".desklink-") else {
             continue;
         };
-        if let Some(id) = inner.strip_suffix(".send.json") {
+        if let Some(id) = inner.strip_suffix(".done") {
+            if store.find_done(id, device_id).is_some() && fs::remove_file(root.join(name)).is_ok()
+            {
+                gone += 1;
+            }
+        } else if let Some(id) = inner.strip_suffix(".send.json") {
             if owned_by::<SendCheckpoint>(&store, name, device_id) && store.remove_send(id).is_ok()
             {
                 gone += 1;
@@ -1336,6 +1416,53 @@ mod tests {
             .unwrap();
         assert!(!name.starts_with(".desklink-"), "{name}");
         assert_eq!(store.available_destination_name("a.txt").unwrap(), "a.txt");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// What is remembered is capped: the newest records stay, nothing older than a week.
+    #[test]
+    fn only_the_newest_finished_transfers_are_remembered_and_none_older_than_a_week() {
+        let (store, base) = store("done-cap");
+        let record = |n: usize| DoneRecord {
+            transfer_id: format!("{n:032x}"),
+            device_id: "alpha".to_string(),
+            token: "token0".to_string(),
+            filename: "a.bin".to_string(),
+            total_size: 1,
+            blocks: 1,
+            file_hash: "ab".repeat(32),
+            at_ms: 0,
+        };
+        for n in 0..DONE_KEEP + 5 {
+            store.save_done(&record(n)).unwrap();
+            // Distinct modified times, oldest first.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let kept = (0..DONE_KEEP + 5)
+            .filter(|n| store.find_done(&record(*n).transfer_id, "alpha").is_some())
+            .count();
+        assert_eq!(kept, DONE_KEEP);
+        assert!(
+            store.find_done(&record(0).transfer_id, "alpha").is_none(),
+            "the oldest went"
+        );
+        assert!(store
+            .find_done(&record(DONE_KEEP + 4).transfer_id, "alpha")
+            .is_some());
+        // Another device's record is not found by this one.
+        assert!(store
+            .find_done(&record(DONE_KEEP + 4).transfer_id, "beta")
+            .is_none());
+        // Unpairing the phone takes its records with it.
+        assert!(purge_device(store.state_root(), "alpha") >= 1);
+        assert!(store
+            .find_done(&record(DONE_KEEP + 4).transfer_id, "alpha")
+            .is_none());
+        store.save_done(&record(1)).unwrap();
+        // A week later every record is gone.
+        assert!(store.find_done(&record(1).transfer_id, "alpha").is_some());
+        store.prune_done(SystemTime::now() + DONE_MAX_AGE + Duration::from_secs(60));
+        assert!(store.find_done(&record(1).transfer_id, "alpha").is_none());
         let _ = fs::remove_dir_all(base);
     }
 
