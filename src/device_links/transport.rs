@@ -31,6 +31,12 @@ pub(crate) fn should_surface_send_error(error: &str) -> bool {
         && !error.contains("DeskLink has no outgoing handler for")
 }
 
+/// What a click on a phone that does not answer is told, in these words
+/// everywhere (the window's toast, the top bar's error, the log). Not
+/// swallowed by [`should_surface_send_error`]: the person asked for this.
+pub(crate) const NOT_REACHABLE: &str =
+    "Can't reach the phone. Check that it's on and on your network.";
+
 #[derive(Clone)]
 pub(crate) struct FeatureTransport {
     sessions: Arc<DeviceManager>,
@@ -64,6 +70,64 @@ impl FeatureTransport {
         })
     }
 
+    /// How long this phone has been silent on both paths (the LAN link's
+    /// counts only while its socket is open).
+    fn silence(&self) -> Option<std::time::Duration> {
+        use crate::device_links::webrtc::coordinator::{data_silence, link_silence};
+        let id = &self.snapshot.binding.device_id;
+        let lan = (!self.snapshot.binding.link.is_closed())
+            .then(|| self.sessions.silence(id))
+            .flatten();
+        link_silence(lan, data_silence(id))
+    }
+
+    /// Whether the link is "Checking connection…" (see `is_quiet`).
+    fn is_quiet(&self) -> bool {
+        use crate::device_links::webrtc::coordinator::{
+            data_silence, is_dozing, is_leaving, is_quiet,
+        };
+        let id = &self.snapshot.binding.device_id;
+        let lan = (!self.snapshot.binding.link.is_closed())
+            .then(|| self.sessions.silence(id))
+            .flatten();
+        is_quiet(data_silence(id), lan, is_dozing(id), is_leaving(id))
+    }
+
+    /// The click preflight, for a caller that may wait (the daemon's command
+    /// thread, never the window's): a link silent for more than a probe's
+    /// budget is asked "are you there?" and given `PREFLIGHT_WAIT` to answer.
+    /// No answer: [`NOT_REACHABLE`], and nothing is sent or queued. A dozing
+    /// phone is never held up (it cannot answer; its own rules judge it).
+    pub(crate) fn preflight(&self) -> Result<(), String> {
+        use crate::device_links::webrtc::coordinator::{
+            await_proof, is_dozing, note_preflight_failed, preflight_failed_recently, probe_asap,
+            DESK_PROBE_AFTER, PREFLIGHT_WAIT,
+        };
+        let id = &self.snapshot.binding.device_id;
+        if !self.is_ready() || is_dozing(id) {
+            return Ok(());
+        }
+        if self
+            .silence()
+            .is_none_or(|silence| silence <= DESK_PROBE_AFTER)
+        {
+            return Ok(());
+        }
+        // The command thread is one thread for every phone and for pairing:
+        // a phone that just failed, or is already known quiet, is not waited
+        // for again (it is still asked, so an answer clears the state).
+        if preflight_failed_recently(id, std::time::Instant::now()) || self.is_quiet() {
+            probe_asap(id);
+            return Err(NOT_REACHABLE.to_string());
+        }
+        if await_proof(id, PREFLIGHT_WAIT, || self.silence()) {
+            Ok(())
+        } else {
+            note_preflight_failed(id);
+            Err(NOT_REACHABLE.to_string())
+        }
+    }
+
     pub(crate) fn is_ready(&self) -> bool {
         self.snapshot.web_rtc_ready && self.sessions.is_current(&self.snapshot.binding)
     }
@@ -75,6 +139,15 @@ impl FeatureTransport {
     /// `flush_pending_features` once WebRTC is ready.
     pub(crate) fn send(&self, packet: &NetworkPacket) -> Result<(), String> {
         if self.is_ready() {
+            // A dead channel accepts bytes and loses them in silence: once the
+            // link is quiet, ask it and say so instead (no waiting here: this
+            // is the shared path, some callers are on the window's thread).
+            if self.is_quiet() {
+                crate::device_links::webrtc::coordinator::probe_asap(
+                    &self.snapshot.binding.device_id,
+                );
+                return Err(NOT_REACHABLE.to_string());
+            }
             return crate::device_links::webrtc::coordinator::send_feature_packet(
                 &self.sessions,
                 &self.snapshot,
@@ -96,6 +169,13 @@ impl FeatureTransport {
                 "{} is not enabled in the DeskLink feature profile",
                 packet.packet_type
             ));
+        }
+        if !self
+            .sessions
+            .handover_window_open(&self.snapshot.binding)
+            .map_err(|error| error.to_string())?
+        {
+            return Err(NOT_REACHABLE.to_string());
         }
         let queued = self
             .sessions
@@ -302,5 +382,47 @@ mod tests {
         ));
         assert!(!should_surface_send_error("Device is not connected"));
         assert!(should_surface_send_error("Remote command was rejected"));
+    }
+
+    /// With the handover stalled, a send is refused in the words a click is
+    /// told in; nothing is queued for the 30 s of the old queue.
+    #[test]
+    fn a_stalled_handover_refuses_a_send_instead_of_queueing_it() {
+        use crate::device_links::webrtc::{HandoverRuntime, WebRtcWireBinding};
+        let sessions = Arc::new(DeviceManager::new());
+        let mut link = SessionLink::test_placeholder("phone-1");
+        link.info.incoming_capabilities = vec![PACKET_TYPE_PING.to_string()];
+        sessions
+            .register_link("phone-1".to_string(), link, true)
+            .unwrap();
+        let binding = sessions.current_binding("phone-1").unwrap();
+        sessions
+            .with_session(&binding, |session| {
+                let wire = WebRtcWireBinding::from_attempt(
+                    "desktop",
+                    "phone-1",
+                    "01234567-89ab-cdef-0123-456789abcdef",
+                )
+                .unwrap();
+                let mut handover = HandoverRuntime::new("attempt".to_string(), wire);
+                handover.started_at = std::time::Instant::now()
+                    - crate::device_links::webrtc::coordinator::NEGOTIATION_TIMEOUT;
+                session.webrtc_handover = Some(handover);
+            })
+            .unwrap();
+        let transport = FeatureTransport::for_device(&sessions, "phone-1").unwrap();
+        assert_eq!(
+            transport.send(&NetworkPacket::new(PACKET_TYPE_PING)),
+            Err(NOT_REACHABLE.to_string())
+        );
+        assert!(sessions.take_pending_features(&binding).is_empty());
+    }
+
+    /// A click on a phone that does not answer is told, never swallowed as
+    /// recovery noise.
+    #[test]
+    fn the_unreachable_answer_is_surfaced() {
+        assert!(should_surface_send_error(NOT_REACHABLE));
+        assert!(NOT_REACHABLE.starts_with("Can't reach"));
     }
 }

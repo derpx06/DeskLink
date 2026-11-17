@@ -833,8 +833,13 @@ impl DaemonWorker {
         device_id: &str,
         f: impl FnOnce(&FeatureTransport) -> Result<(), String>,
     ) -> bool {
-        let result = FeatureTransport::for_device(&self.sessions, device_id)
-            .and_then(|transport| f(&transport));
+        let result =
+            FeatureTransport::for_device(&self.sessions, device_id).and_then(|transport| {
+                // Runs on the command thread, which may wait a moment for proof
+                // of life; the window's thread never does.
+                transport.preflight()?;
+                f(&transport)
+            });
         let Err(error) = result else {
             return true;
         };
@@ -842,7 +847,9 @@ impl DaemonWorker {
             CommandFailure::Recovering => {
                 eprintln!("[DeskLink] Feature send deferred during WebRTC recovery: {error}");
             }
-            failure @ (CommandFailure::NotConnected | CommandFailure::Unsupported) => {
+            failure @ (CommandFailure::NotConnected
+            | CommandFailure::Unsupported
+            | CommandFailure::Unreachable) => {
                 let name = self
                     .devices
                     .lock()
@@ -853,6 +860,8 @@ impl DaemonWorker {
                     &self.errors,
                     if failure == CommandFailure::Unsupported {
                         format!("{name} doesn't support this yet (update DeskLink on the phone).")
+                    } else if failure == CommandFailure::Unreachable {
+                        format!("Can't reach {name}. Check that it's on and on your network.")
                     } else {
                         format!("{name} is not connected. Try again once it is.")
                     },
@@ -875,6 +884,8 @@ enum CommandFailure {
     Recovering,
     /// No link to the phone: the user is told so.
     NotConnected,
+    /// The phone does not answer: the user is told so, at once.
+    Unreachable,
     /// The phone's DeskLink does not take this feature (an older build, or
     /// the feature is off between the two): the user is told to update.
     Unsupported,
@@ -883,7 +894,9 @@ enum CommandFailure {
 }
 
 fn command_failure(error: &str) -> CommandFailure {
-    if error.contains("replaced by a newer session generation")
+    if error == crate::device_links::transport::NOT_REACHABLE {
+        CommandFailure::Unreachable
+    } else if error.contains("replaced by a newer session generation")
         || error.contains("Stale DeskLink session")
     {
         CommandFailure::Recovering
@@ -1051,6 +1064,12 @@ mod tests {
         assert_eq!(
             command_failure("The paired device does not accept desklink.x"),
             CommandFailure::Unsupported
+        );
+        // A phone that does not answer: its own toast, with the name; not
+        // recovery noise and not a device error.
+        assert_eq!(
+            command_failure(crate::device_links::transport::NOT_REACHABLE),
+            CommandFailure::Unreachable
         );
     }
 

@@ -202,6 +202,12 @@ pub struct DeviceView {
     /// `status` answers "is this device reachable at all"; this answers "is the
     /// paired feature path fully negotiated", which the two used to conflate.
     pub feature_transport_ready: bool,
+    /// Ready, but the link has been silent for a few seconds (or the phone
+    /// said it is leaving): the UI says "Checking connection…" and greys what
+    /// needs the phone until anything arrives. Derived once a second by the
+    /// reconciler, cleared by any inbound packet, never on the wire.
+    #[serde(default)]
+    pub quiet: bool,
     /// The user's "Allow terminal access" choice for this device. Filled in from
     /// the persisted setting each time the daemon hands out views, never cached
     /// here, so what the switch shows is what is enforced.
@@ -320,6 +326,7 @@ impl DeviceView {
             // only component that knows whether a link is actually alive.
             status: DeviceStatus::Discovered,
             feature_transport_ready: false,
+            quiet: false,
             terminal_access: false,
             terminal_sessions_attached: 0,
             desktop_session: DesktopSession::None,

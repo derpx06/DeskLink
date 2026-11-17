@@ -712,3 +712,45 @@ fn a_new_link_resets_an_exhausted_recovery_ladder() {
         0
     );
 }
+
+/// A click queues behind a handover only while it is young: a stalled attempt
+/// (older than the negotiation timeout) is a phone that is not coming, and
+/// the send says so instead of holding the packet for 30 s. With no attempt
+/// yet, the open bootstrap link is the window.
+#[test]
+fn a_feature_queues_only_in_the_real_handover_window() {
+    let manager = DeviceManager::new();
+    let binding = manager
+        .register_link("phone-1".to_string(), link("phone-1"), true)
+        .unwrap()
+        .binding;
+    assert!(
+        manager.handover_window_open(&binding).unwrap(),
+        "no attempt, link open"
+    );
+    let begin = |started_ago: std::time::Duration| {
+        manager
+            .with_session(&binding, |session| {
+                let wire = WebRtcWireBinding::from_attempt(
+                    "desktop",
+                    "phone-1",
+                    "01234567-89ab-cdef-0123-456789abcdef",
+                )
+                .unwrap();
+                let mut handover = HandoverRuntime::new("attempt".to_string(), wire);
+                handover.started_at = std::time::Instant::now() - started_ago;
+                session.webrtc_handover = Some(handover);
+            })
+            .unwrap();
+    };
+    begin(std::time::Duration::from_secs(1));
+    assert!(
+        manager.handover_window_open(&binding).unwrap(),
+        "a young attempt"
+    );
+    begin(crate::device_links::webrtc::coordinator::NEGOTIATION_TIMEOUT);
+    assert!(
+        !manager.handover_window_open(&binding).unwrap(),
+        "a stalled attempt"
+    );
+}

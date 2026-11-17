@@ -119,7 +119,7 @@ impl DeviceManager {
     pub fn liveness_tick(
         &self,
         now: Instant,
-        idle: std::time::Duration,
+        idle: impl Fn(&str) -> std::time::Duration,
         dead: impl Fn(&str) -> std::time::Duration,
     ) -> LivenessTick {
         let mut tick = LivenessTick::default();
@@ -136,7 +136,7 @@ impl DeviceManager {
             let silence = now.saturating_duration_since(session.last_inbound_at);
             if silence >= dead(&binding.device_id) {
                 tick.dead.push(binding);
-            } else if silence >= idle {
+            } else if silence >= idle(&binding.device_id) {
                 tick.probe.push(binding);
             }
         }
@@ -798,6 +798,11 @@ impl DeviceManager {
                     .webrtc_handover
                     .as_ref()
                     .is_some_and(HandoverRuntime::features_ready),
+                lan_silence: session
+                    .active_link
+                    .as_ref()
+                    .filter(|link| !link.is_closed())
+                    .map(|_| session.last_inbound_at.elapsed()),
             })
             .collect()
     }

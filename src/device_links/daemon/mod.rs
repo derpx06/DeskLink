@@ -23,6 +23,11 @@ fn unix_secs() -> i64 {
 pub(super) const UNPAIRED_LINK_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 pub(crate) const HEARTBEAT_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The LAN probe cadence once a phone that is not dozing has gone suspiciously
+/// quiet on the data channel ([`LAN_ESCALATE_AFTER`]); otherwise, and while it
+/// dozes (the deliberate thaw), [`HEARTBEAT_IDLE`].
+pub(crate) const HEARTBEAT_IDLE_AWAKE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A link quiet this long gives way to one the phone dials (it dials only
 /// when it has no link of its own) and is probed when the phone beacons: a
 /// short Wi-Fi drop leaves the desk holding a socket no FIN ever ended (F20).
@@ -51,6 +56,61 @@ pub(super) fn heartbeat_dead(dozing: bool) -> std::time::Duration {
     } else {
         HEARTBEAT_DEAD
     }
+}
+
+/// Data-channel silence past which a LAN probe goes up from 10 s to 2 s: the
+/// desk's own data probe (sent after 2 s) has had a second to be answered and
+/// was not, so the silence is suspicious. A healthy phone answers it in
+/// milliseconds, never reaches this, and sees the old LAN rate.
+pub(crate) const LAN_ESCALATE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The LAN probe cadence: [`HEARTBEAT_IDLE`] for a dozing phone (the thaw) and
+/// for one whose data channel is answering, [`HEARTBEAT_IDLE_AWAKE`] once the
+/// data channel has been silent past [`LAN_ESCALATE_AFTER`].
+pub(super) fn heartbeat_idle(
+    dozing: bool,
+    data_silence: Option<std::time::Duration>,
+) -> std::time::Duration {
+    if !dozing && data_silence.is_some_and(|silence| silence >= LAN_ESCALATE_AFTER) {
+        HEARTBEAT_IDLE_AWAKE
+    } else {
+        HEARTBEAT_IDLE
+    }
+}
+
+/// How long the LAN link may be silent before the phone is declared gone.
+/// Dozing is never shortened. Awake, the 30 s budget gives way when the data
+/// channel has been silent too ([`FAST_DEAD_AFTER`]: silence on both paths is
+/// the evidence) or when the phone said it is leaving.
+pub(super) fn lan_dead_after(
+    dozing: bool,
+    leaving: bool,
+    data_silence: Option<std::time::Duration>,
+) -> std::time::Duration {
+    use crate::device_links::webrtc::coordinator::{FAST_DEAD_AFTER, LEAVING_DEAD_AFTER};
+    if !dozing && leaving {
+        LEAVING_DEAD_AFTER
+    } else if !dozing && data_silence.is_some_and(|silence| silence >= FAST_DEAD_AFTER) {
+        FAST_DEAD_AFTER
+    } else {
+        heartbeat_dead(dozing)
+    }
+}
+
+/// The sorted ids of devices the UI shows as "Checking connection…".
+fn quiet_devices(devices: &Mutex<HashMap<String, DeviceView>>) -> Vec<String> {
+    let mut quiet: Vec<String> = devices
+        .lock()
+        .map(|devices| {
+            devices
+                .iter()
+                .filter(|(_, device)| device.quiet)
+                .map(|(id, _)| id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    quiet.sort();
+    quiet
 }
 
 /// Whether a DeskLink window is on screen: the route and round trip are then
@@ -149,12 +209,19 @@ fn run_liveness_tick(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     config: &Arc<Mutex<Config>>,
 ) {
+    use crate::device_links::webrtc::coordinator::{data_silence, is_dozing, is_leaving};
     let dead_after = |device_id: &str| {
-        heartbeat_dead(crate::device_links::webrtc::coordinator::is_dozing(
-            device_id,
-        ))
+        lan_dead_after(
+            is_dozing(device_id),
+            is_leaving(device_id),
+            data_silence(device_id),
+        )
     };
-    let tick = sessions.liveness_tick(std::time::Instant::now(), HEARTBEAT_IDLE, dead_after);
+    let tick = sessions.liveness_tick(
+        std::time::Instant::now(),
+        |device_id| heartbeat_idle(is_dozing(device_id), data_silence(device_id)),
+        dead_after,
+    );
 
     for binding in tick.probe {
         let packet = super::packet::NetworkPacket::new(super::packet::PACKET_TYPE_HEARTBEAT);
@@ -178,7 +245,8 @@ fn run_liveness_tick(
 
     for binding in tick.dead {
         eprintln!(
-            "[Daemon] No traffic from {} in {}s; treating the link as dead",
+            "[Daemon] {} No traffic from {} in {}s; treating the link as dead",
+            crate::device_links::webrtc::coordinator::stamp(),
             binding.device_id,
             dead_after(&binding.device_id).as_secs()
         );
@@ -365,6 +433,7 @@ impl DaemonWorker {
             let mut stay_awake = power::StayAwake::default();
             let mut tick: u32 = 0;
             let mut last_reachable: Vec<(String, bool)> = Vec::new();
+            let mut last_quiet: Vec<String> = Vec::new();
             while !shutdown.load(Ordering::Acquire) {
                 tick = tick.wrapping_add(1);
                 // Every second while a window shows them, else every five.
@@ -388,6 +457,14 @@ impl DaemonWorker {
                 run_liveness_tick(&sessions, &devices, &config);
                 let connections = sessions.connection_snapshot();
                 state::reconcile_connection_status(&devices, &connections);
+                // "Checking connection…" shows or clears: the window learns
+                // at once, not at its next tick.
+                let quiet_now = quiet_devices(&devices);
+                if quiet_now != last_quiet {
+                    last_quiet = quiet_now;
+                    state::wake_ui();
+                    state::nudge_tickers();
+                }
                 if let Some(notice) = crate::device_links::vault::take_notice() {
                     state::push_error(&errors, notice);
                 }

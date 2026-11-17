@@ -209,8 +209,8 @@ pub(crate) fn without_candidates(sdp: &str) -> String {
 mod scenarios {
     use super::*;
     use crate::device_links::webrtc::coordinator::{
-        classify_peer_state, PeerStateAction, PEER_DEAD_AFTER, PEER_DEAD_AFTER_DOZING,
-        PEER_PROBE_AFTER,
+        classify_peer_state, PeerStateAction, FAST_DEAD_AFTER, PEER_DEAD_AFTER,
+        PEER_DEAD_AFTER_DOZING, PEER_PROBE_AFTER,
     };
     use crate::device_links::webrtc::peer_connection::tests::{
         loopback_through, process_counts, Loopback, HEAVY,
@@ -443,6 +443,37 @@ mod scenarios {
         linked.close();
     }
 
+    /// The experiment behind "no data-channel close handler": when the other
+    /// side calls `close()`, does this side's own view change (a channel
+    /// leaving `Open`, a connection state) before the liveness rule would
+    /// notice? Observed, not asserted: the result is printed so the
+    /// module docs stay true.
+    #[test]
+    #[ignore = "6 s, an observation not a contract; run with --ignored a_remote_close --nocapture"]
+    fn a_remote_close_is_or_is_not_seen_before_liveness() {
+        let chaos = Chaos::new(23);
+        let linked = link(&chaos);
+        assert!(linked.offerer.required_channels_open());
+        let closed_at = Instant::now();
+        linked.answerer.close();
+        let mut seen = None;
+        while closed_at.elapsed() < Duration::from_secs(6) {
+            if !linked.offerer.required_channels_open() {
+                seen = Some(closed_at.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!(
+            "[chaos] remote close: channels seen closed after {seen:?}; states {:?}",
+            linked.offerer_states.lock().unwrap().states
+        );
+        // Measured (2026-11-17, GStreamer 1.2x): not seen within 6 s, so no
+        // `on_close` handler. A soft observation: a GStreamer upgrade that
+        // delivers it is news for the liveness docs, not a suite failure.
+        linked.offerer.close();
+    }
+
     /// A hiccup shorter than the dead time (a Wi-Fi roam, a busy router):
     /// what was sent into it arrives in order once it ends, on the same
     /// connection, and nothing on the way asks for a rebuild.
@@ -470,8 +501,9 @@ mod scenarios {
 
     /// A peer that answers nothing (a frozen phone, a dead Wi-Fi): the
     /// connection's own state never asks for a rebuild before the liveness
-    /// rule's [`PEER_DEAD_AFTER`], so liveness is always the first judge of
-    /// an awake phone. Measured: ICE consent freshness fails the connection
+    /// rule's corroborated verdict ([`FAST_DEAD_AFTER`], 8 s: data and LAN
+    /// both silent; data alone is still [`PEER_DEAD_AFTER`]), so liveness is
+    /// always the first judge of an awake phone. Measured: ICE consent freshness fails the connection
     /// at 30 s of silence, *before* [`PEER_DEAD_AFTER_DOZING`] (35 s), so a
     /// dozing phone's real allowance is 30 s (reported in
     /// docs/testing/CONNECTION-HARDENING.md; a failed connection cannot be
@@ -493,7 +525,7 @@ mod scenarios {
         assert!(
             rebuild
                 .as_ref()
-                .is_none_or(|(_, after)| *after >= PEER_DEAD_AFTER),
+                .is_none_or(|(_, after)| *after >= FAST_DEAD_AFTER),
             "{rebuild:?}"
         );
         if rebuild

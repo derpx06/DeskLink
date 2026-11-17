@@ -152,6 +152,7 @@ pub(super) fn spawn_event_worker(
             ) {
                 last_inbound = std::time::Instant::now();
                 note_data_inbound(&binding.device_id);
+                crate::device_links::daemon::state::clear_quiet(&devices, &binding.device_id);
             }
             let ready = sessions
                 .webrtc_features_ready(&binding, &attempt_id)
@@ -162,6 +163,7 @@ pub(super) fn spawn_event_worker(
                 note_data_inbound(&binding.device_id);
             }
             if ready && !was_ready {
+                clear_leaving(&binding.device_id);
                 ready_at = Some(std::time::Instant::now());
             } else if !ready {
                 ready_at = None;
@@ -210,15 +212,43 @@ pub(super) fn spawn_event_worker(
                         eprintln!("[DeskLink] WebRTC wake probe failed: {error}");
                     }
                 }
-                let silence = effective_silence(
+                if take_probe_asap(&binding.device_id) {
+                    last_probe = std::time::Instant::now();
+                    if let Err(error) =
+                        send_keepalive(&binding, &attempt_id, &wire, &sessions, false)
+                    {
+                        eprintln!("[DeskLink] WebRTC asked probe failed: {error}");
+                    }
+                }
+                let leaving = is_leaving(&binding.device_id);
+                // `None`: the LAN socket is closed (the retained-FIN case).
+                let lan = (!binding.link.is_closed())
+                    .then(|| sessions.silence(&binding.device_id))
+                    .flatten();
+                let silence = effective_silence(last_inbound.elapsed(), lan, dozing);
+                let dead_fast = fast_dead(
                     last_inbound.elapsed(),
-                    sessions.silence(&binding.device_id),
+                    lan,
+                    probe_unanswered(last_probe > last_inbound, last_probe.elapsed()),
                     dozing,
+                    leaving,
                 );
-                match liveness(silence, last_probe.elapsed(), dozing) {
+                let verdict = if dead_fast {
+                    Liveness::Dead
+                } else {
+                    liveness(silence, last_probe.elapsed(), dozing)
+                };
+                match verdict {
                     Liveness::Fine => {}
                     Liveness::Probe => {
                         last_probe = std::time::Instant::now();
+                        debug_log!(
+                            "[DL-LIVE] {} probe {}: data silent {:?}, lan {:?}",
+                            stamp(),
+                            binding.device_id,
+                            last_inbound.elapsed(),
+                            lan
+                        );
                         if let Err(error) =
                             send_keepalive(&binding, &attempt_id, &wire, &sessions, false)
                         {
@@ -226,18 +256,26 @@ pub(super) fn spawn_event_worker(
                         }
                     }
                     Liveness::Dead => {
+                        debug_log!(
+                            "[DL-LIVE] {} dead {}: data silent {:?}, lan {:?}, fast {dead_fast}",
+                            stamp(),
+                            binding.device_id,
+                            last_inbound.elapsed(),
+                            lan
+                        );
                         rebuild_peer(
                             &binding,
                             &attempt_id,
                             format!(
                                 "WebRTC peer silent for {}s on every data channel{}",
+                                last_inbound.elapsed().as_secs(),
                                 if dozing {
-                                    PEER_DEAD_AFTER_DOZING
+                                    " (dozing)"
+                                } else if dead_fast {
+                                    " (corroborated)"
                                 } else {
-                                    PEER_DEAD_AFTER
+                                    ""
                                 }
-                                .as_secs(),
-                                if dozing { " (dozing)" } else { "" }
                             ),
                             &sessions,
                             &config,

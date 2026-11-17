@@ -245,6 +245,7 @@ use super::{
     ExpiredRequest, Liveness, OfferAttemptDisposition, RECOVERY_BACKOFF_MILLIS,
     SHARING_STOPPED_AT_DESK,
 };
+use super::{await_proof, fast_dead, forget_liveness, is_leaving, is_quiet, PREFLIGHT_WAIT};
 use crate::device_links::config::Config;
 use crate::device_links::packet::NetworkPacket;
 use crate::device_links::webrtc::remote_session::SessionState;
@@ -1145,15 +1146,158 @@ fn motion_is_coalesced_without_crossing_clicks() {
 }
 
 #[test]
-fn liveness_probes_after_five_seconds_and_declares_dead_after_fifteen() {
+fn liveness_probes_after_two_seconds_and_declares_dead_after_fifteen() {
     use std::time::Duration;
     let s = Duration::from_secs;
-    assert_eq!(liveness(s(4), s(60), false), Liveness::Fine);
-    assert_eq!(liveness(s(5), s(60), false), Liveness::Probe);
+    assert_eq!(liveness(s(1), s(60), false), Liveness::Fine);
+    assert_eq!(liveness(s(2), s(60), false), Liveness::Probe);
+    assert_eq!(liveness(s(4), s(60), false), Liveness::Probe);
     // One probe per interval, not one per 500 ms worker tick.
-    assert_eq!(liveness(s(7), s(2), false), Liveness::Fine);
-    assert_eq!(liveness(s(14), s(5), false), Liveness::Probe);
+    assert_eq!(liveness(s(7), s(1), false), Liveness::Fine);
+    assert_eq!(liveness(s(8), s(2), false), Liveness::Probe);
+    assert_eq!(liveness(s(14), s(2), false), Liveness::Probe);
+    // Data-only evidence is still the old 15 s: the corroborated verdict is
+    // `fast_dead`'s.
     assert_eq!(liveness(s(15), s(0), false), Liveness::Dead);
+}
+
+/// The corroborated fast verdict at 2/4/8/15 s, awake and dozing: dozing is
+/// never shortened (35 s data / 90 s LAN stay).
+#[test]
+fn the_fast_verdict_needs_both_paths_and_never_applies_to_a_dozing_phone() {
+    use std::time::Duration;
+    let s = Duration::from_secs;
+    let lan = Some;
+    // LAN open and answering: data silence alone stays the 15 s rule.
+    for data in [2, 4, 8, 14] {
+        assert!(
+            !fast_dead(s(data), lan(s(1)), true, false, false),
+            "{data} s"
+        );
+    }
+    // Silent on both: 8 s.
+    assert!(!fast_dead(s(7), lan(s(7)), true, false, false));
+    assert!(fast_dead(s(8), lan(s(8)), true, false, false));
+    // Data silent, LAN heard a moment ago: not dead.
+    assert!(!fast_dead(s(15), lan(s(2)), true, false, false));
+    // Dozing: never, at any silence short of the 35 s rule.
+    for data in [2, 4, 8, 15, 34] {
+        assert!(
+            !fast_dead(s(data), None, true, true, true),
+            "dozing {data} s"
+        );
+        assert_eq!(liveness(s(data), s(60), true), Liveness::Fine);
+    }
+    assert_eq!(liveness(s(35), s(0), true), Liveness::Dead);
+    let _ = Duration::ZERO;
+}
+
+/// A LAN FIN while features are ready is evidence, not a verdict: dead only
+/// after 3 s of data silence with the probe unanswered. A recycled bootstrap
+/// socket with a healthy data path (probe answered, or data heard a moment
+/// ago) does not kill the peer.
+#[test]
+fn a_closed_lan_socket_is_corroborated_by_the_data_path_before_it_kills_the_peer() {
+    let ms = std::time::Duration::from_millis;
+    // The socket was recycled and the data path is healthy: heard 200 ms ago.
+    assert!(!fast_dead(ms(200), None, false, false, false));
+    // Heard 2.9 s ago, a probe is out, nothing back yet: not yet.
+    assert!(!fast_dead(ms(2_900), None, true, false, false));
+    // 3 s of silence but no probe was sent after the last thing heard: wait
+    // for the probe (it goes out within the worker's pass).
+    assert!(!fast_dead(ms(3_000), None, false, false, false));
+    // 3 s, probe unanswered: the peer is gone.
+    assert!(fast_dead(ms(3_000), None, true, false, false));
+    // Dozing: the FIN rule never applies (its own 35 s).
+    assert!(!fast_dead(ms(30_000), None, true, true, false));
+}
+
+#[test]
+fn the_ui_says_checking_after_four_silent_seconds_but_never_while_dozing() {
+    let s = std::time::Duration::from_secs;
+    assert!(!is_quiet(Some(s(3)), Some(s(3)), false, false));
+    assert!(is_quiet(Some(s(4)), Some(s(5)), false, false));
+    // Either path hearing the phone clears it.
+    assert!(!is_quiet(Some(s(9)), Some(s(1)), false, false));
+    assert!(!is_quiet(Some(s(1)), Some(s(9)), false, false));
+    // The LAN socket closed (`None`): the data path alone.
+    assert!(is_quiet(Some(s(4)), None, false, false));
+    assert!(
+        !is_quiet(None, None, false, false),
+        "never heard: not 'checking'"
+    );
+    // A sleeping phone is silent by design.
+    assert!(!is_quiet(Some(s(60)), Some(s(60)), true, true));
+    // The phone said it is leaving: at once.
+    assert!(is_quiet(Some(s(0)), Some(s(0)), false, true));
+}
+
+/// `leaving` is a state report on the heartbeat, like `dozing`: it asks for a
+/// probe at once (without restarting the silence clock), the next missed
+/// probe is the verdict, and any later heartbeat without it says the phone is
+/// still here - a forged one costs a rebuild at most.
+#[test]
+fn a_leaving_report_asks_for_a_probe_and_any_later_heartbeat_withdraws_it() {
+    let device = "leaving-phone";
+    forget_liveness(device);
+    let mut bye = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT);
+    bye.set("leaving", true);
+    bye.set("reason", "wifi-off");
+    assert!(!is_leaving(device));
+    note_heartbeat(device, &bye);
+    assert!(is_leaving(device));
+    assert!(super::liveness::take_probe_asap(device), "probed at once");
+    assert!(!super::liveness::take_probe_asap(device), "once");
+    // Leaving: dead after one missed probe (3 s), not before.
+    let s = std::time::Duration::from_secs;
+    assert!(!fast_dead(s(2), Some(s(2)), true, false, true));
+    assert!(fast_dead(s(3), Some(s(3)), true, false, true));
+    // Dozing is never overridden by a leaving report.
+    assert!(!fast_dead(s(3), Some(s(3)), true, true, true));
+    // The reply to the probe carries no `leaving`: still here.
+    let mut reply = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT);
+    reply.set("reply", true);
+    note_heartbeat(device, &reply);
+    assert!(!is_leaving(device));
+    // Not a boolean is not leaving (old builds never send it).
+    let mut odd = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT);
+    odd.set("leaving", "yes");
+    note_heartbeat(device, &odd);
+    assert!(!is_leaving(device));
+    forget_liveness(device);
+}
+
+/// The click preflight: a link heard from a moment ago proceeds without
+/// waiting; a silent one is asked (a probe is requested) and proceeds only
+/// if anything arrives inside the wait.
+#[test]
+fn the_preflight_proceeds_on_proof_and_fails_without_it() {
+    use std::cell::Cell;
+    use std::time::Duration;
+    let device = "preflight-phone";
+    forget_liveness(device);
+    // Fresh: no wait, no probe.
+    assert!(await_proof(device, PREFLIGHT_WAIT, || Some(
+        Duration::from_millis(300)
+    )));
+    assert!(!super::liveness::take_probe_asap(device));
+    // Silent and it stays so: asked, then false after the wait.
+    let started = std::time::Instant::now();
+    assert!(!await_proof(device, Duration::from_millis(200), || Some(
+        Duration::from_secs(9)
+    )));
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert!(
+        super::liveness::take_probe_asap(device),
+        "the phone was asked"
+    );
+    // Silent, then something arrives: proof.
+    let calls = Cell::new(0);
+    assert!(await_proof(device, PREFLIGHT_WAIT, || {
+        calls.set(calls.get() + 1);
+        Some(Duration::from_secs(if calls.get() < 3 { 9 } else { 0 }))
+    }));
+    forget_liveness(device);
 }
 
 #[test]
@@ -1542,7 +1686,7 @@ fn waking_restarts_the_silence_clock_instead_of_judging_the_doze() {
     assert_eq!(restarted, now);
     let silence = now + secs(1) - restarted;
     assert_eq!(super::liveness(silence, secs(1), false), Liveness::Fine);
-    assert_eq!(super::liveness(secs(5), secs(5), false), Liveness::Probe);
+    assert_eq!(super::liveness(secs(2), secs(2), false), Liveness::Probe);
     assert_eq!(
         super::liveness(now + secs(15) - restarted, secs(5), false),
         Liveness::Dead,
@@ -1933,4 +2077,90 @@ fn after_a_failure_only_held_inputs_are_released() {
         "{:?}",
         desk.applied.borrow()
     );
+}
+
+/// A probe sent a moment ago is not "unanswered": with the LAN-FIN rule a
+/// `probe_asap` pass could otherwise declare the peer dead with no time for
+/// the reply.
+#[test]
+fn a_probe_counts_as_unanswered_only_after_a_second() {
+    let ms = std::time::Duration::from_millis;
+    assert!(!crate::device_links::webrtc::coordinator::probe_unanswered(
+        true,
+        ms(0)
+    ));
+    assert!(!crate::device_links::webrtc::coordinator::probe_unanswered(
+        true,
+        ms(999)
+    ));
+    assert!(crate::device_links::webrtc::coordinator::probe_unanswered(
+        true,
+        ms(1_000)
+    ));
+    assert!(
+        !crate::device_links::webrtc::coordinator::probe_unanswered(false, ms(5_000)),
+        "answered since"
+    );
+    // With it, a fresh probe on a closed LAN socket is not yet a verdict.
+    assert!(!crate::device_links::webrtc::coordinator::fast_dead(
+        ms(3_500),
+        None,
+        crate::device_links::webrtc::coordinator::probe_unanswered(true, ms(100)),
+        false,
+        false
+    ));
+    assert!(crate::device_links::webrtc::coordinator::fast_dead(
+        ms(3_500),
+        None,
+        crate::device_links::webrtc::coordinator::probe_unanswered(true, ms(1_100)),
+        false,
+        false
+    ));
+}
+
+/// A failed click preflight is remembered for two seconds (so repeated clicks
+/// do not each make the single command thread wait), and forgotten with the
+/// device.
+#[test]
+fn a_failed_preflight_is_remembered_for_two_seconds() {
+    let device = "preflight-memory-phone";
+    crate::device_links::webrtc::coordinator::forget_liveness(device);
+    let now = std::time::Instant::now();
+    assert!(!crate::device_links::webrtc::coordinator::preflight_failed_recently(device, now));
+    crate::device_links::webrtc::coordinator::note_preflight_failed(device);
+    assert!(
+        crate::device_links::webrtc::coordinator::preflight_failed_recently(
+            device,
+            now + std::time::Duration::from_millis(1_900)
+        )
+    );
+    assert!(
+        !crate::device_links::webrtc::coordinator::preflight_failed_recently(
+            device,
+            now + std::time::Duration::from_millis(2_100)
+        )
+    );
+    crate::device_links::webrtc::coordinator::forget_liveness(device);
+    assert!(!crate::device_links::webrtc::coordinator::preflight_failed_recently(device, now));
+}
+
+/// What a phone said about leaving is history once it is here again (a new
+/// link, a ready peer): the stale flag would show "Checking" on the new link.
+#[test]
+fn leaving_is_cleared_when_the_phone_is_back() {
+    let device = "leaving-back-phone";
+    crate::device_links::webrtc::coordinator::forget_liveness(device);
+    let mut bye = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT);
+    bye.set("leaving", true);
+    bye.set(
+        "reason",
+        "wifi\n-off-and-a-very-long-reason-text-that-goes-on-and-on",
+    );
+    crate::device_links::webrtc::coordinator::note_heartbeat(device, &bye);
+    assert!(crate::device_links::webrtc::coordinator::is_leaving(device));
+    crate::device_links::webrtc::coordinator::clear_leaving(device);
+    assert!(!crate::device_links::webrtc::coordinator::is_leaving(
+        device
+    ));
+    crate::device_links::webrtc::coordinator::forget_liveness(device);
 }

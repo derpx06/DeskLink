@@ -488,6 +488,15 @@ fn queue_send(
             return false;
         }
     };
+    // A click on a phone that does not answer fails now, not after the
+    // transfer's own timeouts. (Not for a flush of waiting files: the phone
+    // just became ready, and that runs on the daemon's tick.)
+    if !from_waiting {
+        if let Err(error) = transport.preflight() {
+            push_error(errors, error);
+            return false;
+        }
+    }
     if QUEUED.fetch_add(1, Ordering::AcqRel) >= MAX_QUEUED {
         QUEUED.fetch_sub(1, Ordering::AcqRel);
         if !from_waiting {

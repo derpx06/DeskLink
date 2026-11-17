@@ -306,6 +306,7 @@ pub(super) fn apply_lan_packet(
     // so every other path that dispatches a packet — the two-peer harness, and
     // any future transport — silently lost it.
     sessions.note_inbound(&device_id);
+    super::state::clear_quiet(&devices, &device_id);
 
     // A heartbeat is liveness and nothing else: it carries no body, expects no
     // reply, and must never reach the feature path. Falling through would let
@@ -325,7 +326,11 @@ pub(super) fn apply_lan_packet(
             return;
         }
         // Its one field is a state report: whether the phone is dozing.
-        if crate::device_links::webrtc::coordinator::note_heartbeat(&device_id, &packet) {
+        let woke = crate::device_links::webrtc::coordinator::note_heartbeat(&device_id, &packet);
+        if crate::device_links::webrtc::coordinator::is_leaving(&device_id) {
+            super::state::set_quiet(&devices, &device_id);
+        }
+        if woke {
             // The phone woke: a sign of it, so a link that dropped while it
             // slept comes back at once.
             crate::device_links::webrtc::coordinator::recovery_sign(

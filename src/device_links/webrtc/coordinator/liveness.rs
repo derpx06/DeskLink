@@ -1,6 +1,17 @@
 //! Data-channel liveness: peer-state classification and its constants, the
-//! inbound and silence clocks, dozing reports, probes, keepalives, and
-//! forgetting a device's clocks.
+//! inbound and silence clocks, dozing and leaving reports, probes,
+//! keepalives, the corroborated fast verdict ([`fast_dead`]), the "Checking
+//! connection..." tier ([`is_quiet`]), the click preflight ([`await_proof`])
+//! and forgetting a device's clocks.
+//!
+//! The desk-only numbers ([`DESK_PROBE_AFTER`], [`QUIET_AFTER`],
+//! [`FAST_DEAD_AFTER`], [`LAN_FIN_DEAD_AFTER`], [`LEAVING_DEAD_AFTER`],
+//! [`PREFLIGHT_WAIT`]) are not mirrored: the phone already answers LAN and data
+//! probes. None of them applies while the phone dozes. There is no data-channel
+//! `on_close` handler on purpose: `chaos::a_remote_close_is_or_is_not_seen_before_liveness`
+//! measured, with two real peers, that after one side's `close()` the other's
+//! required channels were still `Open` 6 s later, so neither a callback nor a
+//! polled `ready_state` would beat these rules.
 //!
 //! Sibling edges: none (the parent's helpers only). Outside: `packet`,
 //! `peer_connection`.
@@ -43,11 +54,43 @@ pub(crate) const PEER_DEAD_AFTER: std::time::Duration = std::time::Duration::fro
 /// and every missed thaw rebuilt the peer.
 pub(crate) const PEER_DEAD_AFTER_DOZING: std::time::Duration = std::time::Duration::from_secs(35);
 
+/// Silence after which this desk (never the phone: its own `PEER_PROBE_AFTER`
+/// stays 5 s) probes a phone that is *not* dozing. The probe rides the
+/// liveness channel, separate from files and events, and a dozing phone is
+/// never data-probed, so this costs one tiny reply per 2 s of idle while the
+/// phone's screen is on and nothing while it sleeps.
+pub(crate) const DESK_PROBE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+/// Silence (not dozing) after which the UI says "Checking connection…": a
+/// display state only, cleared by any inbound packet, tearing nothing down.
+pub(crate) const QUIET_AFTER: std::time::Duration = std::time::Duration::from_secs(4);
+/// Data-channel silence *and* LAN silence (not dozing) after which the peer
+/// is judged gone. Data-only evidence stays [`PEER_DEAD_AFTER`]: a stall on
+/// one path is not a verdict, silence on both is.
+pub(crate) const FAST_DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
+/// Data silence after the LAN socket closed while features were ready (not
+/// dozing), with a probe sent and unanswered. The retained-FIN rule keeps
+/// the peer through a bootstrap-socket recycle; a healthy data path answers
+/// the probe well inside this, so only a peer that is really gone reaches it.
+pub(crate) const LAN_FIN_DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+/// After the phone said it is `leaving`: it is probed at once, and silence
+/// this long (one missed probe) means it went.
+pub(crate) const LEAVING_DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long a click waits for any sign of life from a quiet phone.
+pub(crate) const PREFLIGHT_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// `desklink.heartbeat {dozing}`: whether the sender says it is dozing. A
 /// state report, never a command; absent or not a boolean is awake (older
 /// builds never send it).
 pub(super) fn reports_dozing(packet: &NetworkPacket) -> bool {
     packet.get_bool("dozing") == Some(true)
+}
+
+/// `desklink.heartbeat {leaving}`: the sender says it is about to go away
+/// (Wi-Fi switching off, airplane mode, service stopping). A state report like
+/// `dozing`, never a command; absent or not a boolean is not leaving. `reason`
+/// is for logs only.
+pub(super) fn reports_leaving(packet: &NetworkPacket) -> bool {
+    packet.get_bool("leaving") == Some(true)
 }
 
 /// When each phone last sent anything on its data channel: features travel
@@ -66,6 +109,15 @@ fn data_inbound() -> &'static Mutex<std::collections::HashMap<String, std::time:
 pub(super) fn note_data_inbound(device_id: &str) {
     if let Ok(mut heard) = data_inbound().lock() {
         heard.insert(device_id.to_string(), std::time::Instant::now());
+    }
+}
+
+/// [`note_data_inbound`] as if it had been `ago` ago (tests step the clock by
+/// moving the past, never by sleeping).
+#[cfg(test)]
+pub(crate) fn note_data_inbound_ago(device_id: &str, ago: std::time::Duration) {
+    if let Ok(mut heard) = data_inbound().lock() {
+        heard.insert(device_id.to_string(), std::time::Instant::now() - ago);
     }
 }
 
@@ -89,6 +141,15 @@ pub(super) fn forget(device_id: &str) {
     if let Ok(mut woke) = probe_now().lock() {
         woke.remove(device_id);
     }
+    if let Ok(mut leaving) = leaving_devices().lock() {
+        leaving.remove(device_id);
+    }
+    if let Ok(mut asked) = probe_asap_set().lock() {
+        asked.remove(device_id);
+    }
+    if let Ok(mut failed) = preflight_failures().lock() {
+        failed.remove(device_id);
+    }
 }
 
 /// The silence of a link seen through both clocks: whichever heard the phone
@@ -104,6 +165,19 @@ pub(crate) fn link_silence(
     }
 }
 
+fn leaving_devices() -> &'static Mutex<std::collections::HashSet<String>> {
+    static LEAVING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    LEAVING.get_or_init(Default::default)
+}
+
+/// Whether `device_id` said it is leaving and has not spoken since.
+pub(crate) fn is_leaving(device_id: &str) -> bool {
+    leaving_devices()
+        .lock()
+        .is_ok_and(|devices| devices.contains(device_id))
+}
+
 fn dozing_devices() -> &'static Mutex<std::collections::HashSet<String>> {
     static DOZING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
@@ -115,6 +189,25 @@ fn dozing_devices() -> &'static Mutex<std::collections::HashSet<String>> {
 /// data channel at once: its link may have died while it slept.
 /// Whether the phone just woke (a sign of it: see [`recovery_sign`]).
 pub(crate) fn note_heartbeat(device_id: &str, packet: &NetworkPacket) -> bool {
+    // A phone that says it is leaving is probed at once; the next missed
+    // probe is the verdict ([`LEAVING_DEAD_AFTER`]). Any later heartbeat
+    // without the field (its reply to that probe) says it is still here.
+    let leaving = reports_leaving(packet);
+    if let Ok(mut devices) = leaving_devices().lock() {
+        if leaving {
+            devices.insert(device_id.to_string());
+        } else {
+            devices.remove(device_id);
+        }
+    }
+    if leaving {
+        debug_log!(
+            "[DL-LIVE] {} reports leaving ({})",
+            device_id,
+            log_reason(packet.get_str("reason"))
+        );
+        probe_asap(device_id);
+    }
     let woke = set_dozing(device_id, reports_dozing(packet));
     if woke {
         if let Ok(mut woke) = probe_now().lock() {
@@ -131,6 +224,83 @@ pub(crate) fn probe_soon(device_id: &str) {
     if let Ok(mut woke) = probe_now().lock() {
         woke.insert(device_id.to_string());
     }
+}
+
+/// A phone's `reason`, for the log only: printable, at most 32 characters.
+fn log_reason(reason: Option<&str>) -> String {
+    let text: String = reason
+        .unwrap_or("no reason")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(32)
+        .collect();
+    text
+}
+
+/// A new link or a ready peer is the phone being here again: whatever it said
+/// about leaving is history (it would otherwise show "Checking" on the new
+/// link and give it only [`LEAVING_DEAD_AFTER`]).
+pub(crate) fn clear_leaving(device_id: &str) {
+    if let Ok(mut devices) = leaving_devices().lock() {
+        devices.remove(device_id);
+    }
+}
+
+/// How long a failed click preflight is remembered: the next click on the
+/// same dead phone fails at once instead of making the command thread wait
+/// again.
+pub(crate) const PREFLIGHT_MEMORY: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn preflight_failures() -> &'static Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static FAILED: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    FAILED.get_or_init(Default::default)
+}
+
+pub(crate) fn note_preflight_failed(device_id: &str) {
+    if let Ok(mut failed) = preflight_failures().lock() {
+        failed.insert(device_id.to_string(), std::time::Instant::now());
+    }
+}
+
+/// Whether a preflight for `device_id` failed within [`PREFLIGHT_MEMORY`] of `now`.
+pub(crate) fn preflight_failed_recently(device_id: &str, now: std::time::Instant) -> bool {
+    preflight_failures().lock().is_ok_and(|failed| {
+        failed
+            .get(device_id)
+            .is_some_and(|at| now.saturating_duration_since(*at) < PREFLIGHT_MEMORY)
+    })
+}
+
+/// A probe counts as unanswered only once it has had [`PROBE_ANSWER_WAIT`] to
+/// be answered (`probe_after_inbound`: it was sent after the last thing heard).
+pub(crate) const PROBE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+pub(crate) fn probe_unanswered(probe_after_inbound: bool, probe_age: std::time::Duration) -> bool {
+    probe_after_inbound && probe_age >= PROBE_ANSWER_WAIT
+}
+
+/// Asks for a probe at the next pass *without* restarting the silence clock
+/// (unlike [`probe_soon`]): the question is "are you there?", and not
+/// hearing back must still count. A click and a `leaving` report use this.
+pub(crate) fn probe_asap(device_id: &str) {
+    if let Ok(mut asked) = probe_asap_set().lock() {
+        asked.insert(device_id.to_string());
+    }
+}
+
+fn probe_asap_set() -> &'static Mutex<std::collections::HashSet<String>> {
+    static ASAP: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    ASAP.get_or_init(Default::default)
+}
+
+/// Whether a probe was asked for since this was last called (and forgets it).
+pub(super) fn take_probe_asap(device_id: &str) -> bool {
+    probe_asap_set()
+        .lock()
+        .is_ok_and(|mut asked| asked.remove(device_id))
 }
 
 /// The silence clock after the phone woke: restarted, so the silence that
@@ -217,11 +387,89 @@ pub(crate) fn liveness(
     };
     if silence >= dead_after {
         Liveness::Dead
-    } else if !dozing && silence >= PEER_PROBE_AFTER && since_probe >= PEER_PROBE_AFTER {
+    } else if !dozing && silence >= DESK_PROBE_AFTER && since_probe >= DESK_PROBE_AFTER {
         Liveness::Probe
     } else {
         Liveness::Fine
     }
+}
+
+/// The corroborated fast verdict, never while `dozing` (a frozen phone
+/// answers nothing and its numbers stay 35 s / 90 s). `lan` is the LAN link's
+/// silence, `None` when its socket is closed; `unanswered` says a probe was
+/// sent after the last thing heard.
+///
+/// - LAN socket closed: [`LAN_FIN_DEAD_AFTER`] of data silence with the probe
+///   unanswered (the FIN is evidence, not a verdict: a recycled bootstrap
+///   socket with a healthy data path answers the probe and stays).
+/// - LAN open: [`FAST_DEAD_AFTER`] of silence on both paths.
+/// - `leaving`: [`LEAVING_DEAD_AFTER`] of silence on both.
+pub(crate) fn fast_dead(
+    data: std::time::Duration,
+    lan: Option<std::time::Duration>,
+    unanswered: bool,
+    dozing: bool,
+    leaving: bool,
+) -> bool {
+    if dozing {
+        return false;
+    }
+    let both = |limit| data >= limit && lan.is_none_or(|lan| lan >= limit);
+    (lan.is_none() && unanswered && data >= LAN_FIN_DEAD_AFTER)
+        || both(FAST_DEAD_AFTER)
+        || (leaving && both(LEAVING_DEAD_AFTER))
+}
+
+/// Whether the UI should say "Checking connection…": the link has been
+/// silent on both paths for [`QUIET_AFTER`], or the phone said it is leaving.
+/// Display only; never while dozing (a sleeping phone is silent by design).
+pub(crate) fn is_quiet(
+    data: Option<std::time::Duration>,
+    lan: Option<std::time::Duration>,
+    dozing: bool,
+    leaving: bool,
+) -> bool {
+    !dozing && (leaving || link_silence(lan, data).is_some_and(|silence| silence >= QUIET_AFTER))
+}
+
+/// A wall-clock stamp (UTC, `HH:MM:SS.mmm`) for liveness debug lines: the
+/// live logs carry none, so a real run could not be measured.
+pub(crate) fn stamp() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() % 86_400_000);
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        millis / 3_600_000,
+        millis / 60_000 % 60,
+        millis / 1000 % 60,
+        millis % 1000
+    )
+}
+
+/// Waits up to `wait` for any sign of life from `device_id` (a probe is sent
+/// at once; any inbound packet on either path counts) and says whether it
+/// came. `silence` reads the link's current silence.
+pub(crate) fn await_proof(
+    device_id: &str,
+    wait: std::time::Duration,
+    silence: impl Fn() -> Option<std::time::Duration>,
+) -> bool {
+    let fresh = |silence: Option<std::time::Duration>| {
+        silence.is_some_and(|silence| silence < DESK_PROBE_AFTER)
+    };
+    if fresh(silence()) {
+        return true;
+    }
+    probe_asap(device_id);
+    let started = std::time::Instant::now();
+    while started.elapsed() < wait {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if fresh(silence()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Sends a data-channel heartbeat; `reply` marks an answer, which is never

@@ -425,6 +425,7 @@ pub(crate) fn attach_bootstrap_link(
     let registration = sessions
         .register_link(device_id.to_string(), link, paired)
         .map_err(|error| error.to_string())?;
+    crate::device_links::webrtc::coordinator::clear_leaving(device_id);
     if let Some(replaced) = registration.replaced_link {
         replaced.close();
     }

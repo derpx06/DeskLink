@@ -1122,6 +1122,12 @@ impl DaemonWorker {
                     }
                     match result {
                             Ok(_) => {}
+                            // A quiet link is retried on the next poll (nothing is
+                            // remembered as sent); telling the person once a second
+                            // for the seconds it lasts would be noise.
+                            Err(error) if error == crate::device_links::transport::NOT_REACHABLE => {
+                                eprintln!("[DeskLink] Clipboard synchronization waiting for the phone: {error}");
+                            }
                             Err(error) if should_surface_send_error(&error) => {
                                 push_error(
                                     &errors,

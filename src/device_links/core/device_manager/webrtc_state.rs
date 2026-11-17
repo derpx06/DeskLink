@@ -213,6 +213,24 @@ impl DeviceManager {
         })
     }
 
+    /// Whether a feature may be queued for the handover now: one is under
+    /// way and younger than the negotiation timeout, or there is none yet and
+    /// the bootstrap link is open. A stalled attempt, or a closed link with
+    /// no attempt, is a phone that is not coming: say so, do not queue. A stale
+    /// binding is the session error, as for every other send (recovery).
+    pub fn handover_window_open(&self, binding: &SessionBinding) -> Result<bool, SessionError> {
+        self.with_session(binding, |session| match session.webrtc_handover.as_ref() {
+            Some(handover) => {
+                handover.started_at.elapsed()
+                    < crate::device_links::webrtc::coordinator::NEGOTIATION_TIMEOUT
+            }
+            None => session
+                .active_link
+                .as_ref()
+                .is_some_and(|link| !link.is_closed()),
+        })
+    }
+
     /// Drains the queue, dropping anything older than `PENDING_FEATURE_MAX_AGE`.
     pub fn take_pending_features(
         &self,

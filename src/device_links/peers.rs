@@ -86,6 +86,9 @@ mod tests {
             "device_links/webrtc/coordinator/liveness.rs:HEARD",
             "device_links/webrtc/screen/inbound.rs:PARKED",
             "device_links/webrtc/coordinator/liveness.rs:PROBE_NOW",
+            "device_links/webrtc/coordinator/liveness.rs:ASAP",
+            "device_links/webrtc/coordinator/liveness.rs:FAILED",
+            "device_links/webrtc/coordinator/liveness.rs:LEAVING",
             "device_links/webrtc/coordinator/recovery.rs:STREAKS",
             "device_links/glide/mod.rs:ALLOWED",
             "device_links/asks.rs:ASKS",
@@ -272,12 +275,14 @@ mod tests {
         crate::device_links::sync::note_received(&id, Some("inst"), "contacts", &snapshot);
         let mut beat = crate::device_links::packet::NetworkPacket::new("desklink.heartbeat");
         beat.set("dozing", true);
+        beat.set("leaving", true);
         crate::device_links::webrtc::coordinator::note_heartbeat(&id, &beat);
         let mut allowed =
             crate::device_links::packet::NetworkPacket::new("desklink.shareinputdevices");
         allowed.set("allowed", true);
         crate::device_links::glide::on_phone_packet(&id, &allowed);
         assert!(crate::device_links::webrtc::coordinator::is_dozing(&id));
+        assert!(crate::device_links::webrtc::coordinator::is_leaving(&id));
         assert_eq!(crate::device_links::glide::phone_allows(&id), Some(true));
         forget_peer(&id);
         let holds = crate::device_links::sync::have_packet(&id, Some("inst"))
@@ -287,6 +292,7 @@ mod tests {
             .is_some_and(|have| !have.is_empty());
         assert!(!holds);
         assert!(!crate::device_links::webrtc::coordinator::is_dozing(&id));
+        assert!(!crate::device_links::webrtc::coordinator::is_leaving(&id));
         assert_eq!(crate::device_links::glide::phone_allows(&id), None);
     }
 }

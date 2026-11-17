@@ -624,6 +624,67 @@ fn no_peer_is_built_over_a_closed_bootstrap_link_and_none_asks_a_server() {
     );
 }
 
+/// The LAN link's budget when the phone is awake: probed every 10 s, every 2 s
+/// once its data channel went quiet (10 s while dozing: the deliberate thaw), buried after 30 s, or 8 s
+/// when the data channel has been silent as well, or 3 s when it said it is
+/// leaving. Dozing keeps 90 s whatever else is true.
+#[test]
+fn an_awake_phone_is_probed_every_two_seconds_and_judged_on_both_paths() {
+    use crate::device_links::daemon::{
+        heartbeat_idle, lan_dead_after, HEARTBEAT_DEAD, HEARTBEAT_DEAD_DOZING, HEARTBEAT_IDLE,
+        HEARTBEAT_IDLE_AWAKE,
+    };
+    use std::time::Duration;
+    let s = Duration::from_secs;
+    // A healthy phone sees the old LAN rate; only a data channel that did not
+    // answer the desk's probe escalates it.
+    assert_eq!(heartbeat_idle(false, None), HEARTBEAT_IDLE);
+    assert_eq!(
+        heartbeat_idle(false, Some(s(2))),
+        HEARTBEAT_IDLE,
+        "answering"
+    );
+    assert_eq!(heartbeat_idle(false, Some(s(3))), HEARTBEAT_IDLE_AWAKE);
+    assert_eq!(
+        heartbeat_idle(true, Some(s(60))),
+        HEARTBEAT_IDLE,
+        "the thaw stays 10 s"
+    );
+    assert_eq!(lan_dead_after(false, false, None), HEARTBEAT_DEAD);
+    assert_eq!(lan_dead_after(false, false, Some(s(7))), HEARTBEAT_DEAD);
+    assert_eq!(lan_dead_after(false, false, Some(s(8))), s(8));
+    assert_eq!(lan_dead_after(false, true, Some(s(0))), s(3));
+    assert_eq!(
+        lan_dead_after(true, true, Some(s(60))),
+        HEARTBEAT_DEAD_DOZING
+    );
+
+    let net = TestNetwork::new();
+    let (desktop, _phone) = peer_pair(&net, "desktop-1", "phone-1");
+    let tick = |silence: Duration, dozing: bool, data: Option<Duration>| {
+        desktop.sessions.liveness_tick(
+            std::time::Instant::now() + silence,
+            |_| heartbeat_idle(dozing, data),
+            |_| lan_dead_after(dozing, false, data),
+        )
+    };
+    assert!(tick(s(1), false, None).probe.is_empty());
+    assert_eq!(
+        tick(s(2), false, None).probe.len(),
+        1,
+        "awake: probed at 2 s"
+    );
+    assert!(tick(s(2), true, None).probe.is_empty(), "dozing: 10 s");
+    assert_eq!(tick(s(10), true, None).probe.len(), 1);
+    assert!(tick(s(8), false, None).dead.is_empty(), "LAN alone: 30 s");
+    assert_eq!(
+        tick(s(8), false, Some(s(9))).dead.len(),
+        1,
+        "both silent: 8 s"
+    );
+    assert!(tick(s(8), true, Some(s(9))).dead.is_empty(), "dozing: 90 s");
+}
+
 /// A dozing phone (frozen by its OS) gets 90 s of LAN silence before its
 /// link is buried; an awake one keeps the 30 s budget.
 #[test]
@@ -636,11 +697,11 @@ fn a_dozing_phone_keeps_its_lan_link_for_ninety_seconds() {
     let net = TestNetwork::new();
     let (desktop, _phone) = peer_pair(&net, "desktop-1", "phone-1");
     let after = |silence: Duration, dozing: bool| {
-        desktop
-            .sessions
-            .liveness_tick(std::time::Instant::now() + silence, HEARTBEAT_IDLE, |_| {
-                heartbeat_dead(dozing)
-            })
+        desktop.sessions.liveness_tick(
+            std::time::Instant::now() + silence,
+            |_| HEARTBEAT_IDLE,
+            |_| heartbeat_dead(dozing),
+        )
     };
     assert_eq!(after(HEARTBEAT_DEAD, false).dead.len(), 1, "awake: 30 s");
     let dozing = after(Duration::from_secs(60), true);

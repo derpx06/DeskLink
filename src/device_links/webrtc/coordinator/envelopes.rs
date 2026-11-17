@@ -101,6 +101,9 @@ pub(super) fn handle_peer_envelope(
         if packet.packet_type == crate::device_links::packet::PACKET_TYPE_HEARTBEAT {
             // Liveness only: arriving at all refreshed the worker's clock.
             note_heartbeat(&wire.peer_device_id, &packet);
+            if is_leaving(&wire.peer_device_id) {
+                crate::device_links::daemon::state::set_quiet(devices, &wire.peer_device_id);
+            }
             return if packet.get_bool("reply").unwrap_or(false) {
                 Ok(())
             } else {

@@ -99,6 +99,9 @@ pub struct DeviceConnection {
     pub linked: bool,
     pub paired: bool,
     pub feature_transport_ready: bool,
+    /// How long the LAN link has been silent; `None` when its socket is
+    /// closed (or there is none): the retained-FIN case.
+    pub lan_silence: Option<std::time::Duration>,
 }
 
 impl DeviceConnection {

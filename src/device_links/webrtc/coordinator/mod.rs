@@ -97,11 +97,23 @@ pub(crate) use file_link::{
     cancel_file_transfer, start_clipboard_transfer, start_file_transfer, start_folder_transfer,
 };
 pub(crate) use ice_setup::ice_config_for;
+#[cfg(test)]
+pub(crate) use liveness::note_data_inbound_ago;
 pub(crate) use liveness::{
-    classify_peer_state, data_silence, is_dozing, link_silence, liveness, note_heartbeat,
-    probe_soon, Liveness, PeerStateAction, NEGOTIATION_TIMEOUT, PEER_DEAD_AFTER,
-    PEER_DEAD_AFTER_DOZING, PEER_PROBE_AFTER, TRANSIENT_DISCONNECT_GRACE,
+    await_proof, classify_peer_state, clear_leaving, data_silence, fast_dead, is_dozing,
+    is_leaving, is_quiet, link_silence, liveness, note_heartbeat, note_preflight_failed,
+    preflight_failed_recently, probe_asap, probe_soon, probe_unanswered, stamp, Liveness,
+    PeerStateAction, DESK_PROBE_AFTER, FAST_DEAD_AFTER, LEAVING_DEAD_AFTER, NEGOTIATION_TIMEOUT,
+    PEER_PROBE_AFTER, PREFLIGHT_WAIT, TRANSIENT_DISCONNECT_GRACE,
 };
+#[cfg(test)]
+pub(crate) use liveness::{
+    LAN_FIN_DEAD_AFTER, PEER_DEAD_AFTER, PEER_DEAD_AFTER_DOZING, QUIET_AFTER,
+};
+#[cfg(test)]
+pub(crate) fn reports_leaving_for_test(packet: &NetworkPacket) -> bool {
+    liveness::reports_leaving(packet)
+}
 pub(crate) use peer_worker::rebuild_peers_off_the_network;
 pub(crate) use phone_remote::{
     audio_switch, capture_request, has_remote_control_lease, request_phone_control,

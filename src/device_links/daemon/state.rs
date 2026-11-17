@@ -214,6 +214,20 @@ pub(crate) fn reconcile_connection_status(
             device.last_seen = None;
         }
         device.feature_transport_ready = ready;
+        // Ready but silent: "Checking connection…" until anything arrives
+        // (the packet handler clears it at once; this raises and re-derives).
+        {
+            use crate::device_links::webrtc::coordinator::{
+                data_silence, is_dozing, is_leaving, is_quiet,
+            };
+            device.quiet = ready
+                && is_quiet(
+                    data_silence(device_id),
+                    connection.and_then(|connection| connection.lan_silence),
+                    is_dozing(device_id),
+                    is_leaving(device_id),
+                );
+        }
         // A phone on another major.minor that has not become ready is most
         // likely an update away (J15); said in the words the ladder uses.
         if reachable
@@ -393,6 +407,31 @@ pub(crate) fn push_event(events: &Arc<Mutex<Vec<DaemonEvent>>>, event: DaemonEve
         }
     }
     wake_ui();
+}
+
+/// Any packet from `device_id` ends "Checking connection…" at once, without
+/// waiting for the next reconcile.
+pub(crate) fn clear_quiet(devices: &Arc<Mutex<HashMap<String, DeviceView>>>, device_id: &str) {
+    let cleared = devices.lock().is_ok_and(|mut devices| {
+        devices
+            .get_mut(device_id)
+            .is_some_and(|device| std::mem::take(&mut device.quiet))
+    });
+    if cleared {
+        wake_ui();
+    }
+}
+
+/// The phone said it is leaving: "Checking connection…" at once.
+pub(crate) fn set_quiet(devices: &Arc<Mutex<HashMap<String, DeviceView>>>, device_id: &str) {
+    let raised = devices.lock().is_ok_and(|mut devices| {
+        devices.get_mut(device_id).is_some_and(|device| {
+            device.feature_transport_ready && !std::mem::replace(&mut device.quiet, true)
+        })
+    });
+    if raised {
+        wake_ui();
+    }
 }
 
 /// Tells every main-loop ticker to look now (who is reachable changed): the
@@ -839,7 +878,56 @@ mod tests {
             linked,
             paired: true,
             feature_transport_ready: ready,
+            lan_silence: None,
         }
+    }
+
+    /// "Checking connection…": a ready phone silent on both paths for 4 s is
+    /// quiet (derived once a second, nothing torn down), any packet clears it
+    /// at once, and a dozing phone is never quiet.
+    #[test]
+    fn a_ready_phone_silent_for_four_seconds_is_checking_and_any_packet_clears_it() {
+        use crate::device_links::webrtc::coordinator as c;
+        use std::time::Duration;
+        let info = DeviceInfo::local(
+            "quietphone0000000000000000000001".to_string(),
+            "DeskLink".to_string(),
+        );
+        let devices = Arc::new(Mutex::new(HashMap::new()));
+        upsert_device(&devices, &info, "127.0.0.1".to_string(), true);
+        let quiet = |lan: u64, data: u64, ready: bool| {
+            let mut connection = connection(&info.id, true, ready);
+            connection.lan_silence = Some(Duration::from_secs(lan));
+            c::note_data_inbound_ago(&info.id, Duration::from_secs(data));
+            reconcile_connection_status(&devices, &[connection]);
+            let devices = devices.lock().unwrap();
+            let device = &devices[&info.id];
+            (
+                device.quiet,
+                device.status.clone(),
+                device.feature_transport_ready,
+            )
+        };
+        assert_eq!(quiet(1, 1, true), (false, DeviceStatus::Paired, true));
+        assert!(!quiet(3, 3, true).0, "3 s is a hiccup");
+        assert_eq!(
+            quiet(5, 5, true),
+            (true, DeviceStatus::Paired, true),
+            "4 s+"
+        );
+        assert!(!quiet(9, 1, true).0, "the data path heard it");
+        assert!(!quiet(1, 9, true).0, "the LAN link heard it");
+        // Raised, then cleared at once by any inbound packet.
+        assert!(quiet(5, 5, true).0);
+        clear_quiet(&devices, &info.id);
+        assert!(!devices.lock().unwrap()[&info.id].quiet);
+        // Never while not ready ("Connecting…" says it), nor while dozing.
+        assert!(!quiet(60, 60, false).0);
+        let mut asleep = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT);
+        asleep.set("dozing", true);
+        c::note_heartbeat(&info.id, &asleep);
+        assert!(!quiet(60, 60, true).0, "dozing is silent by design");
+        c::forget_liveness(&info.id);
     }
 
     /// The reported symptom: the app kept showing "Connected" for a paired
@@ -1321,6 +1409,7 @@ mod tests {
             linked: ready,
             paired: true,
             feature_transport_ready: ready,
+            lan_silence: None,
         };
         reconcile_connection_status(&devices, &[connection(true)]);
         assert_eq!(devices.lock().unwrap()[&info.id].last_seen, None);
@@ -1356,6 +1445,7 @@ mod tests {
             linked: true,
             paired: true,
             feature_transport_ready: false,
+            lan_silence: None,
         };
         let mut skewed = info.clone();
         skewed.app_version = Some("0.9.0".into());
@@ -1427,6 +1517,7 @@ mod tests {
             linked: ready,
             paired: true,
             feature_transport_ready: ready,
+            lan_silence: None,
         };
         reconcile_connection_status(&devices, &[connection(true)]);
         devices

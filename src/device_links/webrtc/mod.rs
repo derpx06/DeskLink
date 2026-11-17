@@ -464,7 +464,37 @@ mod tests {
             crate::device_links::core::PENDING_FEATURE_LIMIT as u64,
             f["pendingFeatureLimit"]["desktop"].as_u64().unwrap()
         );
+        // Desk-only numbers (the phone answers LAN and data probes already).
+        assert_eq!(
+            c::DESK_PROBE_AFTER.as_millis() as u64,
+            ms("deskProbeAfterMillis")
+        );
+        assert_eq!(c::QUIET_AFTER.as_millis() as u64, ms("quietAfterMillis"));
+        assert_eq!(
+            c::FAST_DEAD_AFTER.as_millis() as u64,
+            ms("fastDeadAfterMillis")
+        );
+        assert_eq!(
+            c::LAN_FIN_DEAD_AFTER.as_millis() as u64,
+            ms("lanFinDeadAfterMillis")
+        );
+        assert_eq!(
+            c::LEAVING_DEAD_AFTER.as_millis() as u64,
+            ms("leavingDeadAfterMillis")
+        );
+        assert_eq!(
+            c::PREFLIGHT_WAIT.as_millis() as u64,
+            ms("preflightWaitMillis")
+        );
         use crate::device_links::daemon as d;
+        assert_eq!(
+            d::LAN_ESCALATE_AFTER.as_millis() as u64,
+            ms("lanEscalateAfterMillis")
+        );
+        assert_eq!(
+            d::HEARTBEAT_IDLE_AWAKE.as_millis() as u64,
+            ms("desktopHeartbeatIdleAwakeMillis")
+        );
         assert_eq!(
             d::HEARTBEAT_IDLE.as_millis() as u64,
             ms("desktopHeartbeatIdleMillis")
@@ -477,6 +507,14 @@ mod tests {
             d::HEARTBEAT_DEAD_DOZING.as_millis() as u64,
             ms("desktopHeartbeatDeadDozingMillis")
         );
+        // `desklink.heartbeat {leaving}`: the one optional state report both
+        // apps agree on (`dozing`'s sibling); absent is not leaving.
+        let mut bye = crate::device_links::packet::NetworkPacket::new(
+            crate::device_links::packet::PACKET_TYPE_HEARTBEAT,
+        );
+        assert!(!c::reports_leaving_for_test(&bye));
+        bye.set(f["heartbeatLeavingField"].as_str().unwrap(), true);
+        assert!(c::reports_leaving_for_test(&bye));
         // The phone's reader gives up a little after the desk does, never before.
         assert!(ms("androidLanReaderIdleMillis") > ms("desktopHeartbeatDeadMillis"));
         assert_eq!(f["bundlePolicy"], "max-bundle");

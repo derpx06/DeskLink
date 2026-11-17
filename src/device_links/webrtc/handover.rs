@@ -36,6 +36,9 @@ impl HandoverState {
 #[derive(Debug, Clone)]
 pub struct HandoverRuntime {
     pub attempt_id: String,
+    /// When this attempt began: a click queues behind it only while it is
+    /// young ([`NEGOTIATION_TIMEOUT`](crate::device_links::webrtc::coordinator::NEGOTIATION_TIMEOUT)).
+    pub started_at: std::time::Instant,
     pub wire_binding: WebRtcWireBinding,
     pub state: HandoverState,
     pub offer_sdp: Option<String>,
@@ -55,6 +58,7 @@ impl HandoverRuntime {
     pub fn new(attempt_id: String, wire_binding: WebRtcWireBinding) -> Self {
         Self {
             attempt_id,
+            started_at: std::time::Instant::now(),
             wire_binding,
             state: HandoverState::Negotiating,
             offer_sdp: None,

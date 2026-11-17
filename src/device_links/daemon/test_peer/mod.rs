@@ -361,7 +361,7 @@ impl TestPeer {
     pub(crate) fn liveness(&self, after: std::time::Duration) -> LivenessTick {
         self.sessions.liveness_tick(
             std::time::Instant::now() + after,
-            super::HEARTBEAT_IDLE,
+            |_| super::HEARTBEAT_IDLE,
             |_| super::HEARTBEAT_DEAD,
         )
     }
