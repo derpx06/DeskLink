@@ -100,7 +100,13 @@ impl Skipped {
 /// The folders holding DeskLink's own keys and state: never sent.
 fn protected_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![glib::user_config_dir().join("desklink")];
-    dirs.push(glib::user_state_dir().join("desklink"));
+    dirs.push(
+        std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+            .unwrap_or_default()
+            .join("desklink"),
+    );
     dirs.push(glib::user_cache_dir().join("desklink"));
     // The symlink-resolved forms count too.
     let real: Vec<PathBuf> = dirs.iter().filter_map(|d| d.canonicalize().ok()).collect();
@@ -790,11 +796,11 @@ mod tests {
             assert!(name.starts_with("Send to "), "{name}");
             assert_eq!(dolphin.keys(&format!("Desktop Action phone{i}")).unwrap().len(), 3);
         }
-        assert_eq!(dolphin.groups().0.len(), clean.len() + 1, "no injected groups");
+        assert_eq!(dolphin.groups().len(), clean.len() + 1, "no injected groups");
         // Thunar
         for (id, name) in &clean {
             let entry = keyfile(&super::super::thunar_sendto(exe, id, name));
-            assert_eq!(entry.groups().0.len(), 1, "no injected group");
+            assert_eq!(entry.groups().len(), 1, "no injected group");
             assert_eq!(entry.keys("Desktop Entry").unwrap().len(), 6);
         }
         // Nemo
