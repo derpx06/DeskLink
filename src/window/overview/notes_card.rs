@@ -94,12 +94,18 @@ pub(super) fn notes_card(win: &DesklinkWindow, device: &DeviceView) -> gtk::Box 
     // A redraw gives the focus back with `grab_focus`, which selects all of
     // an entry's text: the next key would replace the draft. The cursor goes
     // to the end instead, once the focus change is done.
-    entry.connect_has_focus_notify(|entry| {
-        if entry.has_focus() && !entry.text().is_empty() {
+    // (A GtkEntry's focus is its inner GtkText's.)
+    if let Some(inner) = entry.delegate() {
+        inner.connect_notify_local(Some("has-focus"), {
             let entry = entry.clone();
-            gtk::glib::idle_add_local_once(move || entry.set_position(-1));
-        }
-    });
+            move |_, _| {
+                if !entry.text().is_empty() {
+                    let entry = entry.clone();
+                    gtk::glib::idle_add_local_once(move || entry.set_position(-1));
+                }
+            }
+        });
+    }
     entry.connect_changed(|entry| {
         DRAFT.with(|draft| *draft.borrow_mut() = entry.text().to_string())
     });

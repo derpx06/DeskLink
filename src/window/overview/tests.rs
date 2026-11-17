@@ -797,7 +797,11 @@ fn a_half_typed_note_survives_a_redraw_unselected() {
                 .expect("the quick entry")
         };
         let first = entry();
-        first.grab_focus();
+        gtk::prelude::GtkWindowExt::set_focus(&window, Some(&first));
+        let focused = |entry: &gtk::Entry| {
+            gtk::prelude::RootExt::focus(&window).is_some_and(|focus| focus.is_ancestor(entry))
+        };
+        assert!(focused(&first));
         first.set_text("half typed");
         first.set_position(-1);
         // A note arrives from elsewhere: Home is redrawn.
@@ -807,7 +811,7 @@ fn a_half_typed_note_survives_a_redraw_unselected() {
         let second = entry();
         assert_ne!(first, second, "Home was redrawn");
         assert_eq!(second.text(), "half typed", "the draft is kept");
-        assert!(second.has_focus(), "the focus is back in the entry");
+        assert!(focused(&second), "the focus is back in the entry");
         assert_eq!(second.selection_bounds(), None, "nothing is selected");
         assert_eq!(second.position(), 10, "the cursor is at the end");
         window.close();
