@@ -237,7 +237,7 @@ fn make(key: String, path: &Path, kind: FileKind) -> Reply {
             duration,
         };
     }
-    if none.exists()
+    if marker_fresh(&none)
         || on_fuse(path)
         || !matches!(kind, FileKind::Image | FileKind::Video | FileKind::Pdf)
     {
@@ -270,8 +270,8 @@ fn make(key: String, path: &Path, kind: FileKind) -> Reply {
     let result = match spawned {
         Ok(_) => made
             .recv_timeout(DECODE_TIMEOUT)
-            .unwrap_or_else(|_| Err("The preview took too long".into())),
-        Err(error) => Err(error.to_string()),
+            .unwrap_or_else(|_| Err(TOO_SLOW.into())),
+        Err(error) => Err(format!("{SPAWN_FAILED}{error}")),
     };
     let _ = crate::device_links::private_fs::create_dir_all(&dir);
     match result {
@@ -299,10 +299,38 @@ fn make(key: String, path: &Path, kind: FileKind) -> Reply {
         }
         Err(error) => {
             debug_log!("[UI] No preview for {}: {error}", path.display());
-            let _ = std::fs::write(&none, error);
+            // A decoder's verdict is remembered; "too slow" (a busy disk) and a thread that could not be
+            // started are not: the file would show no preview until a prune, long after the cause went.
+            if permanent_failure(&error) {
+                let _ = std::fs::write(&none, error);
+            }
             Reply::Failed { key }
         }
     }
+}
+
+/// What a decode that ran out of time says (not a verdict on the file).
+const TOO_SLOW: &str = "The preview took too long";
+/// What the video watchdog says when the file did not open in time (a slow disk, a network file).
+const VIDEO_TOO_SLOW: &str = "The video took too long to open";
+/// Prefix of the error of a decode thread that could not be started.
+const SPAWN_FAILED: &str = "Could not start the preview: ";
+/// How long a "no preview" marker holds: a missing codec plugin installed later, or a file
+/// that was half written when first looked at, gets another try after this.
+const NONE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Whether a failed decode says something lasting about the file.
+fn permanent_failure(error: &str) -> bool {
+    error != TOO_SLOW && error != VIDEO_TOO_SLOW && !error.starts_with(SPAWN_FAILED)
+}
+
+/// A "no preview" marker younger than [`NONE_TTL`].
+fn marker_fresh(none: &Path) -> bool {
+    std::fs::metadata(none)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < NONE_TTL)
 }
 
 /// Drops cached previews unused for the retention period. Run once at
@@ -519,7 +547,7 @@ fn video_frame(path: &Path) -> Result<(Pixbuf, Option<Duration>), String> {
                     gst::ClockTime::from_nseconds(VIDEO_TIMEOUT.as_nanos() as u64),
                     &[gst::MessageType::AsyncDone, gst::MessageType::Error],
                 )
-                .ok_or("The video took too long to open")?;
+                .ok_or(VIDEO_TOO_SLOW)?;
             match message.view() {
                 gst::MessageView::Error(error) => Err(error.error().to_string()),
                 _ => Ok(()),
@@ -587,6 +615,35 @@ fn video_frame(path: &Path) -> Result<(Pixbuf, Option<Duration>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A decode that ran out of time or could not start says nothing about the file: no "no
+    /// preview" marker for it; a decoder's verdict is remembered, for a day.
+    #[test]
+    fn a_slow_decode_is_never_remembered_as_no_preview_and_a_verdict_expires() {
+        assert!(!permanent_failure(TOO_SLOW));
+        assert!(
+            !permanent_failure(VIDEO_TOO_SLOW),
+            "the video watchdog's timeout too"
+        );
+        assert!(!permanent_failure(&format!("{SPAWN_FAILED}out of threads")));
+        assert!(permanent_failure("Unrecognized image file format"));
+        let dir =
+            std::env::temp_dir().join(format!("desklink-thumb-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let none = dir.join("k.none");
+        assert!(!marker_fresh(&none), "no marker");
+        std::fs::write(&none, "x").unwrap();
+        assert!(marker_fresh(&none), "just written");
+        let old = std::time::SystemTime::now() - NONE_TTL - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&none)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(!marker_fresh(&none), "a day later it is tried again");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn files_are_told_apart_by_their_extension() {

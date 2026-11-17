@@ -364,7 +364,11 @@ impl Worker {
                         .filter(|live| live.pair.device == device)
                     {
                         // Scan now; the manifest follows the scan.
-                        live.dirty = Some(Instant::now() - SETTLE);
+                        live.dirty = Some(
+                            Instant::now()
+                                .checked_sub(SETTLE)
+                                .unwrap_or_else(Instant::now),
+                        );
                         live.scanned = None;
                     }
                 } else {
@@ -458,7 +462,11 @@ impl Worker {
                 }
                 send(&device, &folders_packet("accept", json!({"id": id})));
                 if let Some(index) = self.index_of(&device, &id) {
-                    self.pairs[index].dirty = Some(Instant::now() - SETTLE);
+                    self.pairs[index].dirty = Some(
+                        Instant::now()
+                            .checked_sub(SETTLE)
+                            .unwrap_or_else(Instant::now),
+                    );
                 }
                 self.publish();
             }
@@ -496,7 +504,11 @@ impl Worker {
                 if let Some(index) = self.index_of(&device, &id) {
                     let live = &mut self.pairs[index];
                     live.allow_empty = true;
-                    live.dirty = Some(Instant::now() - SETTLE);
+                    live.dirty = Some(
+                        Instant::now()
+                            .checked_sub(SETTLE)
+                            .unwrap_or_else(Instant::now),
+                    );
                 }
             }
             Message::TurnOnBucket { device } => self.turn_on_bucket(&device),

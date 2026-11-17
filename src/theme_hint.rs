@@ -108,11 +108,16 @@ fn follow_xfconf(set: impl Fn(&str) + 'static) {
         Some("xsettings"),
         gio::DBusSignalFlags::NONE,
         move |_, _, _, _, _, args| {
-            let (channel, property) = (args.child_value(0), args.child_value(1));
+            // A signal with fewer than three children is ignored, never a panic.
+            let (Some(channel), Some(property)) =
+                (args.try_child_value(0), args.try_child_value(1))
+            else {
+                return;
+            };
             if channel.str() == Some("xsettings") && property.str() == Some(PROPERTY) {
                 if let Some(name) = args
-                    .child_value(2)
-                    .as_variant()
+                    .try_child_value(2)
+                    .and_then(|value| value.as_variant())
                     .and_then(|value| value.get::<String>())
                 {
                     set(&name);

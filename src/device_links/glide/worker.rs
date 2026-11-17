@@ -486,7 +486,9 @@ fn run(
     connection: &gio::DBusConnection,
     state: &mut State,
 ) {
-    let mut checked = Instant::now() - CHECK_EVERY;
+    let mut checked = Instant::now()
+        .checked_sub(CHECK_EVERY)
+        .unwrap_or_else(Instant::now);
     loop {
         if SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) {
             break;

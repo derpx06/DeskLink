@@ -332,7 +332,11 @@ impl Worker {
         if removed && scan(&live.pair).is_ok_and(|(found, ..)| found.is_empty()) {
             live.allow_empty = true;
         }
-        live.dirty = Some(Instant::now() - SETTLE);
+        live.dirty = Some(
+            Instant::now()
+                .checked_sub(SETTLE)
+                .unwrap_or_else(Instant::now),
+        );
         self.save_book(index);
         self.publish();
     }

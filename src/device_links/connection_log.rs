@@ -260,6 +260,51 @@ pub(crate) fn append_line(path: &PathBuf, entry: &impl Serialize) {
     {
         let _ = file.write_all(&line);
     }
+    // The cap held only after a restart: a desk running for weeks grew the file without bound inside one run,
+    // and every append makes the readers parse it all again. Every TRIM_EVERY appends to *this* file the file is
+    // cut to its newest MAX_LOG_ENTRIES lines (no parsing: a count of lines), so it never holds more than the
+    // cap plus one interval.
+    if appended_to(path) % TRIM_EVERY == 0 {
+        trim_to_newest_lines(path, MAX_LOG_ENTRIES);
+    }
+}
+
+/// How many appends to one log pass between two trims.
+const TRIM_EVERY: u64 = 256;
+
+/// How many appends this file has had in this run (per path: the connection log and the received-files
+/// log do not share a count, so neither can starve the other of its trim).
+fn appended_to(path: &std::path::Path) -> u64 {
+    static COUNTS: Mutex<Option<HashMap<PathBuf, u64>>> = Mutex::new(None);
+    let Ok(mut counts) = COUNTS.lock() else {
+        return 1;
+    };
+    let count = counts
+        .get_or_insert_with(HashMap::new)
+        .entry(path.to_path_buf())
+        .or_insert(0);
+    *count += 1;
+    *count
+}
+
+/// Cuts the JSON-lines file at `path` to its last `max` lines when it has more. The caller holds `FILE_LOCK`.
+fn trim_to_newest_lines(path: &PathBuf, max: usize) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let lines = text.lines().count();
+    if lines <= max {
+        return;
+    }
+    let mut kept = String::with_capacity(text.len());
+    for line in text.lines().skip(lines - max) {
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    let temporary = path.with_extension("jsonl.tmp");
+    if super::private_fs::write(&temporary, kept.as_bytes()).is_ok() {
+        let _ = fs::rename(&temporary, path);
+    }
 }
 
 /// Every entry from the last [`RETENTION`], newest first.
@@ -403,6 +448,31 @@ mod tests {
             path: None,
             detail: None,
         }
+    }
+
+    /// The cap holds while the desk runs, not only at the next start: the file never has more
+    /// than the cap plus one trim interval of lines.
+    #[test]
+    fn a_log_never_grows_past_its_cap_plus_one_trim_interval_in_one_run() {
+        let dir = std::env::temp_dir().join(format!("desklink-log-live-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("connections.jsonl");
+        let now = 100 * 24 * 60 * 60;
+        for n in 0..(MAX_LOG_ENTRIES as u64 * 2) {
+            append(
+                &path,
+                &entry(now - 100 + n % 50, ConnectionEvent::Connected),
+            );
+        }
+        let lines = fs::read_to_string(&path).unwrap().lines().count();
+        assert!(
+            lines <= MAX_LOG_ENTRIES + TRIM_EVERY as usize,
+            "{lines} lines"
+        );
+        assert!(
+            lines >= MAX_LOG_ENTRIES,
+            "a trim keeps the cap, not less: {lines}"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// A flapping phone's thousands of entries are cut to the newest

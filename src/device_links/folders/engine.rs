@@ -73,7 +73,11 @@ impl Worker {
     /// Something was added: scan the Bucket soon.
     pub(super) fn touched(&mut self, device: &str) {
         if let Some(index) = self.index_of(device, BUCKET_ID) {
-            self.pairs[index].dirty = Some(Instant::now() - SETTLE);
+            self.pairs[index].dirty = Some(
+                Instant::now()
+                    .checked_sub(SETTLE)
+                    .unwrap_or_else(Instant::now),
+            );
         }
     }
 
@@ -175,7 +179,11 @@ impl Worker {
                     },
                     Book::default(),
                 );
-                live.dirty = Some(Instant::now() - SETTLE);
+                live.dirty = Some(
+                    Instant::now()
+                        .checked_sub(SETTLE)
+                        .unwrap_or_else(Instant::now),
+                );
                 self.pairs.push(live);
                 self.save_pairs();
                 self.publish();
