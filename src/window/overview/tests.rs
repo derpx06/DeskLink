@@ -1063,6 +1063,23 @@ fn no_palette_open(window: &super::super::DesklinkWindow) {
     assert!(!super::super::palette::is_open(), "a palette is stuck open");
 }
 
+/// Pumps the main loop until `done` (at most 5 s): a page maps over a few
+/// passes, and more under load.
+fn wait_until(done: impl Fn() -> bool) {
+    let context = gtk::glib::MainContext::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !done() && std::time::Instant::now() < deadline {
+        while context.iteration(false) {}
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn page_search_showing(window: &super::super::DesklinkWindow) -> bool {
+    named_widgets(window.upcast_ref(), "page-search")
+        .iter()
+        .any(|widget| widget.is_mapped())
+}
+
 fn ctrl_f(window: &super::super::DesklinkWindow) {
     gtk::prelude::ActionGroupExt::activate_action(window, "toggle-search", None);
     spin();
@@ -1094,7 +1111,9 @@ fn ctrl_f_searches_the_page_on_screen() {
         ] {
             assert!(window.show_page(page), "{page}");
             spin();
+            wait_until(|| page_search_showing(&window));
             ctrl_f(&window);
+            wait_until(|| focused_search(&window).is_some());
             let entry =
                 focused_search(&window).unwrap_or_else(|| panic!("{page}: no search focused"));
             assert_eq!(entry.placeholder_text().as_deref(), Some(label), "{page}");
@@ -1102,6 +1121,7 @@ fn ctrl_f_searches_the_page_on_screen() {
             entry.set_text("abc");
             entry.set_position(1);
             ctrl_f(&window);
+            wait_until(|| entry.selection_bounds() == Some((0, 3)));
             assert_eq!(entry.selection_bounds(), Some((0, 3)), "{page}: selected");
             entry.emit_by_name::<()>("stop-search", &[]);
             assert_eq!(entry.text(), "", "{page}: Escape clears");
