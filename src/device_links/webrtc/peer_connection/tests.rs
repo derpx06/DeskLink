@@ -2139,6 +2139,10 @@ fn two_peers_connect_over_loopback_and_carry_data_both_ways() {
 /// sending. Before the fix this aborted about one run in thirteen under
 /// load. It runs in a process of its own (the inner test below), so an
 /// abort fails this test instead of taking every other test with it.
+// If the inner process dies with exit status 139 (a segfault, not the sctpdec
+// abort this guards), it is the upstream libnice use-after-free in
+// docs/IMPROVEMENTS.md W14 (about one teardown in 3000 on a starved core):
+// run the test again. It stays in the default suite as the detector.
 #[test]
 fn real_peers_torn_down_with_traffic_in_flight_never_abort_the_process() {
     let exe = std::env::current_exe().unwrap();
