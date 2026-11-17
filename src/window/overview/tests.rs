@@ -819,3 +819,51 @@ fn a_half_typed_note_survives_a_redraw_unselected() {
         window.close();
     });
 }
+
+/// A populated wide Home: its two columns end near each other (the owner's
+/// right column was nearly empty beside a long left), and every card is
+/// there once. (Needs a display.)
+#[test]
+fn the_wide_homes_columns_are_balanced_and_every_card_is_there_once() {
+    use adw::subclass::prelude::ObjectSubclassIsExt;
+    let _shelf = fresh_notes();
+    for body in [
+        "Grocery list\nOat milk",
+        "Call the landlord\nAbout the heating",
+    ] {
+        crate::device_links::notes::new_note(body).unwrap();
+    }
+    crate::test_display::run(|| {
+        for width in [1440, 1920, 2560] {
+            let window = home_window("paired", width);
+            let imp = window.imp();
+            imp.compact.set(false);
+            imp.wide.set(true);
+            window.show_page("home");
+            window.refresh_devices();
+            spin();
+            spin();
+            let split = shown(&window, "home-split")
+                .and_downcast::<gtk::Box>()
+                .expect("Home's columns");
+            let left = split.first_child().expect("the left column");
+            let right = split.last_child().expect("the right column");
+            let (left_height, right_height) = (left.height(), right.height());
+            let total = left_height + right_height;
+            assert!(
+                (left_height - right_height).abs() <= (total / 4).max(300),
+                "{width}: the columns end {left_height} and {right_height} px down"
+            );
+            let all = named_widgets(window.upcast_ref(), "");
+            for card in ["notifications", "files", "notes", "terminals"] {
+                let class = format!("home-card-{card}");
+                assert_eq!(
+                    all.iter().filter(|w| w.has_css_class(&class)).count(),
+                    1,
+                    "{width}: the {card} card is there once"
+                );
+            }
+            window.close();
+        }
+    });
+}

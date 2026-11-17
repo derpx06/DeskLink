@@ -149,5 +149,6 @@ pub(super) fn notes_card(win: &DesklinkWindow, device: &DeviceView) -> gtk::Box 
         false,
     );
     card.set_widget_name("home-notes");
+    card.add_css_class("home-card-notes");
     card
 }

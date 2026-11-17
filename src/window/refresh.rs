@@ -658,6 +658,18 @@ impl DesklinkWindow {
                 "settings-back" => widget.set_visible(!wide),
                 // Contacts: the chosen contact beside the list on a big window.
                 "contacts-pane" => widget.set_visible(wide),
+                // Everything DeskLink does: its groups in two columns on a big window.
+                "everything-groups" => {
+                    if let Some(groups) = widget.downcast_ref::<gtk::Box>() {
+                        groups.set_orientation(if wide {
+                            gtk::Orientation::Horizontal
+                        } else {
+                            gtk::Orientation::Vertical
+                        });
+                        groups.set_homogeneous(wide);
+                        groups.set_spacing(if wide { 24 } else { 8 });
+                    }
+                }
                 "home-clamp" => {
                     if let Some(clamp) = widget.downcast_ref::<adw::Clamp>() {
                         clamp.set_maximum_size(if wide {

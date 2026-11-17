@@ -904,29 +904,90 @@ pub(super) fn section(daemon: &DaemonHandle, device: &DeviceView, rows: &[Row]) 
     title.update_property(&[gtk::accessible::Property::Level(2)]);
     section.append(&title);
     section.append(&label(SUBTITLE, &["dl-secondary"]));
-    for group in Group::ALL {
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["dl-row-group", "dl-needs"])
-            .build();
-        for row in rows.iter().filter(|row| row.group == group) {
-            list.append(&row_widget(row, daemon, device));
-        }
-        if list.first_child().is_none() {
-            continue;
-        }
-        let header = ui_kit::section_header(group.title());
-        header.set_margin_top(12);
-        list.update_property(&[gtk::accessible::Property::Label(group.title())]);
-        section.append(&header);
-        section.append(&list);
+    // The groups in two columns on a big window (`apply_layout`), one below
+    // it: the first columns' worth of groups on the left, in the same order,
+    // so the one-column reading order is what it always was.
+    let groups_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+    groups_box.set_widget_name("everything-groups");
+    let columns = [(); 2].map(|_| {
+        gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .hexpand(true)
+            .valign(gtk::Align::Start)
+            .build()
+    });
+    let blocks: Vec<(usize, gtk::Box)> = Group::ALL
+        .iter()
+        .filter_map(|group| {
+            let list = gtk::ListBox::builder()
+                .selection_mode(gtk::SelectionMode::None)
+                .css_classes(["dl-row-group", "dl-needs"])
+                .build();
+            let mut count = 0;
+            for row in rows.iter().filter(|row| row.group == *group) {
+                list.append(&row_widget(row, daemon, device));
+                count += 1;
+            }
+            if count == 0 {
+                return None;
+            }
+            let header = ui_kit::section_header(group.title());
+            header.set_margin_top(12);
+            list.update_property(&[gtk::accessible::Property::Label(group.title())]);
+            let block = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(8)
+                .build();
+            block.append(&header);
+            block.append(&list);
+            Some((count, block))
+        })
+        .collect();
+    let split = split_at(&blocks.iter().map(|(count, _)| *count).collect::<Vec<_>>());
+    for (at, (_, block)) in blocks.iter().enumerate() {
+        columns[usize::from(at >= split)].append(block);
     }
+    for column in &columns {
+        groups_box.append(column);
+    }
+    section.append(&groups_box);
     section
+}
+
+/// How many of the groups (their row counts, in order) go in the first
+/// column so the two columns hold about the same number of rows.
+pub(super) fn split_at(counts: &[usize]) -> usize {
+    let total: usize = counts.iter().sum();
+    let mut best = (usize::MAX, 0);
+    let mut first: usize = 0;
+    for at in 0..=counts.len() {
+        let gap = first.abs_diff(total - first);
+        if gap <= best.0 {
+            best = (gap, at);
+        }
+        if at < counts.len() {
+            first += counts[at];
+        }
+    }
+    best.1
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first column takes groups until the rows are about even.
+    #[test]
+    fn the_groups_split_into_two_even_columns_in_order() {
+        assert_eq!(split_at(&[2, 3, 3, 2, 4, 1]), 3);
+        assert_eq!(split_at(&[5]), 1);
+        assert_eq!(split_at(&[]), 0);
+        assert_eq!(split_at(&[4, 4]), 1);
+    }
     use crate::device_links::packet::PACKET_TYPE_SETTINGS_REQUEST;
     use crate::platform::{evaluate, Distro, Probe};
 

@@ -90,23 +90,11 @@ pub(super) fn reconnecting_row(device: &DeviceView) -> gtk::Box {
     .root
 }
 
-/// Notifications and Files side by side, or stacked when narrow.
-pub(super) fn columns(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
-    let columns = gtk::Box::builder()
-        .spacing(16)
-        .homogeneous(true)
-        .valign(gtk::Align::Start)
-        .build();
-    columns.set_widget_name("responsive");
-    columns.append(&notifications_card(device));
-    columns.append(&files_card(daemon, device));
-    columns
-}
-
 /// The Files card: the Bucket's summary and drop target, and the transfer
 /// moving now, if one is.
-fn files_card(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
+pub(super) fn files_card(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
     let card = crate::window::bucket::overview_card(device);
+    card.add_css_class("home-card-files");
     if let Some(progress) = transfer_progress(daemon, device) {
         card.append(&progress);
     }
@@ -217,6 +205,7 @@ pub(super) fn terminals_card(win: &DesklinkWindow, device: &DeviceView) -> gtk::
         // Only the header and its button: nothing to show below.
         card.remove(&body);
     }
+    card.add_css_class("home-card-terminals");
     card
 }
 
@@ -240,7 +229,7 @@ pub(in crate::window) fn preview_line(text: &str) -> String {
 
 /// The Notifications card: the newest two, each with Reply when the phone
 /// takes one; or why there is nothing.
-fn notifications_card(device: &DeviceView) -> gtk::Box {
+pub(super) fn notifications_card(device: &DeviceView) -> gtk::Box {
     let shown = crate::device_links::config::app_settings().shows_notifications(&device.id);
     let mut words = match (shown, device.notifications.len()) {
         (false, _) => "Hidden on this computer".to_string(),
@@ -305,13 +294,15 @@ fn notifications_card(device: &DeviceView) -> gtk::Box {
         turn_on.set_action_target_value(Some(&"settings".to_variant()));
         body.append(&turn_on);
     }
-    feature_card(
+    let card = feature_card(
         "Notifications",
         &words,
         Some(page_button("View all", "notifications").upcast_ref()),
         &body,
         shown && !device.feature_transport_ready,
-    )
+    );
+    card.add_css_class("home-card-notifications");
+    card
 }
 
 fn transfer_progress(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Box> {

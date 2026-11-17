@@ -34,6 +34,7 @@ use crate::device_links::webrtc::terminal_bridge::attached_devices;
 use crate::device_links::webrtc::transfer_board::TransferRow;
 use crate::link_glyph::{battery_ring, presence_dot, LinkState, Presentation};
 
+mod balance;
 mod cards;
 mod hero;
 mod links;
@@ -112,6 +113,8 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         settings.shows_notifications(&device.id),
         crate::device_links::folders::bucket_on(&device.id),
         gliding_onto(&device.id),
+        // Crossing the wide breakpoint places the cards again.
+        imp.wide.get(),
         // The Notes card shows what is stored here (or sent by the phone).
         crate::device_links::notes::generation(),
     ))
@@ -178,11 +181,20 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
                 right.append(&card);
             }
         }
-        // What came in sits under the actions: the two columns end near each
-        // other instead of the left stopping after the tiles.
-        left.append(&columns(daemon, device));
-        right.append(&notes_card(win, device));
-        right.append(&terminals_card(win, device));
+        // What came in sits under the actions; which column each card takes is
+        // decided by height (`balance`), so the two end near each other.
+        balance::place(
+            win,
+            &device.id,
+            &left,
+            &right,
+            vec![
+                ("notifications", notifications_card(device).upcast()),
+                ("files", files_card(daemon, device).upcast()),
+                ("notes", notes_card(win, device).upcast()),
+                ("terminals", terminals_card(win, device).upcast()),
+            ],
+        );
         let split = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(16)
