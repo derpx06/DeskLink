@@ -857,7 +857,37 @@ mod tests {
         for (id, name) in &clean {
             let entry = keyfile(&super::super::thunar_sendto(exe, id, name));
             assert_eq!(entry.groups().len(), 1, "no injected group");
-            assert_eq!(entry.keys("Desktop Entry").unwrap().len(), 6);
+            let mut keys: Vec<String> = entry
+                .keys("Desktop Entry")
+                .unwrap()
+                .iter()
+                .map(|k| k.to_string())
+                .collect();
+            keys.sort();
+            assert_eq!(
+                keys,
+                ["Exec", "Icon", "Name", "Type", "Version"],
+                "no injected key"
+            );
+            let argv =
+                glib::shell_parse_argv(entry.string("Desktop Entry", "Exec").unwrap().as_str())
+                    .unwrap();
+            let argv: Vec<String> = argv
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let spec_exe = exe.to_str().unwrap().replace('%', "%%");
+            assert_eq!(
+                argv,
+                [
+                    spec_exe.as_str(),
+                    "--send-files",
+                    "--to",
+                    id.as_str(),
+                    "--",
+                    "%F"
+                ]
+            );
         }
         // Nemo
         let action = nemo_action(exe, "p0");
@@ -1083,13 +1113,13 @@ mod tests {
     fn nautilus_python_is_found_by_its_library_and_a_working_typelib() {
         let dir = tmp();
         assert!(
-            !python_nautilus_present(&[dir.clone()], || true),
+            !python_nautilus_present(std::slice::from_ref(&dir), || true),
             "no library"
         );
         std::fs::write(dir.join("libnautilus-python.so"), "").unwrap();
-        assert!(python_nautilus_present(&[dir.clone()], || true));
+        assert!(python_nautilus_present(std::slice::from_ref(&dir), || true));
         assert!(
-            !python_nautilus_present(&[dir.clone()], || false),
+            !python_nautilus_present(std::slice::from_ref(&dir), || false),
             "no typelib"
         );
         std::fs::remove_dir_all(&dir).ok();
