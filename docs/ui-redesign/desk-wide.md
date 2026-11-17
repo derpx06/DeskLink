@@ -97,7 +97,7 @@ Sidebar, 860-1000 sp (rail)        Hero (kept)                      Files (later
 
 | Item | Plan | Status |
 |---|---|---|
-| Compact sidebar | Below 1000sp and above the 860sp overlay the sidebar is a 76 px rail: icons, counts, the phone's dot; names in tooltips (batch 6) | done |
+| Compact sidebar | Below 1000sp and above the 860sp overlay the sidebar is a rail of about 76 px (measured by a test: at most 90): page icons and counts, the phone's dot; names in tooltips, the phone card's tooltip names the phone. The header's title and its pair and search buttons (which kept the sidebar ~205 px wide) are hidden in the rail: the phone card's menu pairs and the search field finds (Ctrl+K). Shots: light, dark, high contrast, large text, RTL, popover, and 1100 px (full list again) | done (batch 6, fixed after review) |
 | Hero | Already: phone silhouette, status pill, battery ring, one detail line, activity card right under it. A live screen thumbnail needs the Phone Screen frame path, which 3.4/3.6 still change: **skipped** | skipped |
 | Files grid/list toggle | History as one row per file, remembered | not done |
 | Transitions, loading states | Pages already crossfade (reduced motion respected by GTK); skeletons would add per-tick work: **skipped** | skipped |

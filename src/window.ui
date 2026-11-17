@@ -112,6 +112,8 @@
                                   <object class="AdwHeaderBar" id="sidebar_header">
                                     <child type="start">
                                       <object class="GtkButton">
+                                        <!-- Hidden in the rail (`Sidebar::set_rail`): the phone card's menu pairs too. -->
+                                        <property name="name">rail-hide</property>
                                         <property name="icon-name">desklink-add-symbolic</property>
                                         <property name="tooltip-text" translatable="yes">Pair another phone (Ctrl+N)</property>
                                         <property name="action-name">win.pair-new</property>
@@ -122,6 +124,8 @@
                                     </child>
                                     <child type="start">
                                       <object class="GtkButton">
+                                        <!-- Hidden in the rail: the search field below it stays. -->
+                                        <property name="name">rail-hide</property>
                                         <property name="icon-name">desklink-search-symbolic</property>
                                         <property name="tooltip-text" translatable="yes">Find anything (Ctrl+K)</property>
                                         <property name="action-name">win.palette</property>

@@ -49,6 +49,17 @@ pub(super) struct Sidebar {
     /// The words that move with the round trip, set in place: the card's
     /// detail, and each switcher row's (device id, row, detail).
     switcher_details: RefCell<Vec<(String, gtk::ListBoxRow, gtk::Label)>>,
+    /// What the rail was last applied for (rail, card, rows): the tree is
+    /// walked only when it changes.
+    rail_key: RefCell<String>,
+    /// The phone card's words for a screen reader, which the rail also uses
+    /// as its tooltip.
+    card_label: RefCell<String>,
+    /// Rows whose tooltip the rail set (so leaving it clears only those).
+    rail_tips: RefCell<Vec<String>>,
+    /// Whether the header showed its title before the rail hid it (a crowded
+    /// window-button layout hides it on its own).
+    title_before: std::cell::Cell<Option<bool>>,
 }
 
 /// What the device card is drawn from: not the round trip.
@@ -228,6 +239,10 @@ impl Sidebar {
             switcher_key: RefCell::default(),
             switcher,
             switcher_details: RefCell::default(),
+            rail_key: RefCell::default(),
+            card_label: RefCell::default(),
+            rail_tips: RefCell::default(),
+            title_before: std::cell::Cell::new(None),
         }
     }
 
@@ -236,6 +251,15 @@ impl Sidebar {
     /// tooltip instead (a row greyed for a reason keeps its own tooltip).
     pub(super) fn set_rail(&self, win: &DesklinkWindow, rail: bool) {
         let imp = win.imp();
+        let key = format!(
+            "{rail}|{}|{}",
+            self.card_key.borrow(),
+            self.rows_key.borrow()
+        );
+        if *self.rail_key.borrow() == key {
+            return;
+        }
+        self.rail_key.replace(key);
         for widget in [
             imp.nav_list.upcast_ref::<gtk::Widget>(),
             imp.footer_list.upcast_ref(),
@@ -246,6 +270,22 @@ impl Sidebar {
                 widget.remove_css_class("rail");
             }
         }
+        // The header: its title and the two buttons that would keep the
+        // sidebar wider than the rail (the phone card pairs, the search field
+        // below finds).
+        if rail {
+            if self.title_before.get().is_none() {
+                self.title_before
+                    .set(Some(imp.sidebar_header.shows_title()));
+            }
+            imp.sidebar_header.set_show_title(false);
+        } else if let Some(before) = self.title_before.take() {
+            imp.sidebar_header.set_show_title(before);
+        }
+        for button in super::named_widgets(imp.sidebar_header.upcast_ref(), "rail-hide") {
+            button.set_visible(!rail);
+        }
+        let mut tips = self.rail_tips.borrow_mut();
         for (page, row, _) in &self.rows {
             let title = PAGES
                 .iter()
@@ -256,13 +296,26 @@ impl Sidebar {
                     label.set_visible(!rail);
                 }
             }
+            // The icon and its count centred in the rail.
+            if let Some(content) = row.child() {
+                content.set_halign(if rail {
+                    gtk::Align::Center
+                } else {
+                    gtk::Align::Fill
+                });
+            }
             if rail && row.tooltip_text().is_none() {
                 row.set_tooltip_text(Some(title));
-            } else if !rail && row.tooltip_text().as_deref() == Some(title) {
+                tips.push(page.clone());
+            } else if !rail && tips.contains(page) {
                 row.set_tooltip_text(None);
             }
         }
-        // The phone's card and the search: their words go, their glyphs stay.
+        if !rail {
+            tips.clear();
+        }
+        // The phone's card and the search: their words go, their glyphs stay;
+        // the card's tooltip says who it is.
         for button in [
             imp.device_card.upcast_ref::<gtk::Widget>(),
             imp.sidebar_search.upcast_ref(),
@@ -271,8 +324,12 @@ impl Sidebar {
                 label.set_visible(!rail);
             }
         }
-        imp.sidebar_search
-            .set_tooltip_text(Some("Find anything (Ctrl+K)"));
+        let tip = if rail {
+            self.card_label.borrow().clone()
+        } else {
+            "Switch phone".to_string()
+        };
+        imp.device_card.set_tooltip_text(Some(&tip));
     }
 
     /// Selects page `name`'s row, and no row in the other list.
@@ -393,6 +450,7 @@ impl Sidebar {
         let label = format!("{}, {}. Switch phone", device.name, words.spoken());
         card.set_tooltip_text(Some("Switch phone"));
         card.update_property(&[gtk::accessible::Property::Label(&label)]);
+        self.card_label.replace(label.clone());
     }
 
     /// The counts at the end of the page rows.

@@ -594,14 +594,17 @@ fn the_other_pages_use_a_big_window() {
     });
 }
 
-/// Between the overlay (860sp) and 1000sp the sidebar is a rail: the page
-/// names are hidden and said in tooltips, the counts stay, and it goes back
-/// to the full list. (Needs a display.)
+/// Between the overlay (860sp) and 1000sp the sidebar is a narrow rail: the
+/// breakpoint applies when the window is resized into that range, the
+/// sidebar really is narrow (the header's title and two buttons would keep
+/// it wide), the page names are hidden and said in tooltips, the phone card's
+/// tooltip names the phone, and it all goes back above 1000sp. (Needs a
+/// display; the window is 900 px wide at text scale 1.)
 #[test]
-fn the_sidebar_is_a_rail_on_a_middling_window() {
+fn the_sidebar_is_a_narrow_rail_on_a_middling_window() {
     use adw::subclass::prelude::ObjectSubclassIsExt;
     crate::test_display::run(|| {
-        let window = home_window("paired", 1280);
+        let window = home_window("paired", 900);
         let imp = window.imp();
         let names = || {
             named_widgets(imp.nav_list.upcast_ref(), "")
@@ -609,23 +612,48 @@ fn the_sidebar_is_a_rail_on_a_middling_window() {
                 .filter(|w| w.has_css_class("nav-label"))
                 .collect::<Vec<_>>()
         };
-        assert!(!names().is_empty());
-        imp.rail.set(true);
-        window.apply_layout();
+        let search_buttons = || named_widgets(imp.sidebar_header.upcast_ref(), "rail-hide");
+        assert_eq!(imp.wide_breakpoint.condition().is_some(), true);
+        assert!(imp.rail.get(), "the breakpoint applied at 900 px");
         assert!(
             names().iter().all(|label| !label.is_visible()),
             "names hidden"
+        );
+        assert!(
+            search_buttons().iter().all(|b| !b.is_visible()),
+            "header buttons hidden"
+        );
+        assert!(!imp.sidebar_header.shows_title(), "no title");
+        assert!(
+            imp.nav_list.width() <= 90,
+            "the rail is {} px wide",
+            imp.nav_list.width()
         );
         let home = named_widgets(imp.nav_list.upcast_ref(), "home")
             .into_iter()
             .next()
             .expect("the Home row");
         assert_eq!(home.tooltip_text().as_deref(), Some("Home"));
+        let tip = imp.device_card.tooltip_text().expect("the card's tooltip");
+        assert!(tip.contains("Pixel 9"), "the card says who: {tip}");
         assert!(imp.nav_list.has_css_class("rail"));
-        imp.rail.set(false);
-        window.apply_layout();
+        window.set_default_size(1280, 700);
+        window.present();
+        for _ in 0..60 {
+            while gtk::glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!imp.rail.get(), "the full list above 1000 px");
         assert!(names().iter().all(|label| label.is_visible()), "names back");
+        assert!(
+            search_buttons().iter().all(|b| b.is_visible()),
+            "header buttons back"
+        );
         assert_eq!(home.tooltip_text(), None);
+        assert_eq!(
+            imp.device_card.tooltip_text().as_deref(),
+            Some("Switch phone")
+        );
         window.close();
     });
 }
