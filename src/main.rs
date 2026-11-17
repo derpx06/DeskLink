@@ -109,6 +109,7 @@ mod thumbnails;
 mod ticker;
 mod transfer_notice;
 mod tray;
+mod update;
 mod window;
 
 use self::application::DesklinkApplication;

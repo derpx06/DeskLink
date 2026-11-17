@@ -1,0 +1,6 @@
+{
+  "v": 1,
+  "kid": "test1",
+  "payload": "eyJzY2hlbWFWZXJzaW9uIjoxLCJjaGFubmVscyI6e319",
+  "sig": "XTzEDKKbjNoxkU2AyOoC0xXRwUpdEHKv7Fumws02uQTwjSCuMA6jkvoOeS0V4zfCZ3c7PxsPQXjNDVOHSDaPAQ"
+}

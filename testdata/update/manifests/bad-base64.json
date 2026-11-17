@@ -1,0 +1,6 @@
+{
+  "v": 1,
+  "kid": "test1",
+  "payload": "not base64!",
+  "sig": "zi314aOIPxOKHbqDDnWbAorJkC798CSIkHeChDM1qb3Gus71pRyTgpP7-mT-jx1K0BYOEZc_fHS7V1vP8ziMDg"
+}

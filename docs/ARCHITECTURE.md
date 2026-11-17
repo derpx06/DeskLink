@@ -232,6 +232,7 @@ window/ (GTK pages)  ──DaemonCommand──►  daemon/  ──►  features 
 | `device_links/webrtc/remote_session/` | constants, field names, registry | `message` (pure), `session` |
 | `device_links/notes/` | limits, sealed store, packet entry, relaying | `model`, `merge`, `wire`, `edits` |
 | `device_links/daemon/test_peer/` | the two-peer test harness | `tests` |
+| `update/` | the update check (a leaf: nothing in pairing, transport or the features calls it; it knows no phone) | `model` (verify, decide: pure), `strict_json`, `open` (when the popup may show: pure), `schedule`, `skew`, `install_source` (what to tell, never run), `url`; `fetch` (one HTTPS GET), `store` (`update.json`), `engine` (one check), `service` (thread and handle), `keys` |
 
 Accepted large items: `platform::evaluate` and `window::debug_verbs::debug_ui_verb` are single long functions (a rule table and a verb `match`); splitting them is a logic edit, left for a later change with its own tests.
 

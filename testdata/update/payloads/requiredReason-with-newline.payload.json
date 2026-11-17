@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "issuedAt": 1795000000,
+  "expires": 1796814400,
+  "channels": {
+    "beta": {
+      "desktop": {
+        "version": "0.4.0",
+        "released": "2026-12-08",
+        "minSupported": "0.4.0",
+        "rollout": 100,
+        "notes": [
+          {
+            "title": "Files has a list view",
+            "detail": "Switch between grid and list.",
+            "glyph": "files"
+          },
+          {
+            "title": "Faster reconnects",
+            "detail": "Back online in seconds after a Wi-Fi change.",
+            "glyph": "refresh"
+          },
+          {
+            "title": "Clearer Terminals",
+            "detail": "A plain message when the computer is offline.",
+            "glyph": "terminal"
+          },
+          {
+            "title": "Pairing fixed",
+            "glyph": "swap"
+          }
+        ],
+        "notesUrl": "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0",
+        "downloads": {
+          "tarball": {
+            "url": "https://github.com/derpx06/DeskLink/releases/download/v0.4.0/desklink-0.4.0-x86_64.tar.gz",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "releaseUrl": "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0"
+        },
+        "requiredReason": "line one\nline two"
+      },
+      "android": {
+        "version": "0.4.0",
+        "versionCode": 20400,
+        "released": "2026-12-08",
+        "minSupported": "0.4.0",
+        "rollout": 100,
+        "notes": [
+          {
+            "title": "Files has a list view",
+            "detail": "Switch between grid and list.",
+            "glyph": "files"
+          },
+          {
+            "title": "Faster reconnects",
+            "detail": "Back online in seconds after a Wi-Fi change.",
+            "glyph": "refresh"
+          },
+          {
+            "title": "Clearer Terminals",
+            "detail": "A plain message when the computer is offline.",
+            "glyph": "terminal"
+          },
+          {
+            "title": "Pairing fixed",
+            "glyph": "swap"
+          }
+        ],
+        "size": 41234567,
+        "downloads": {
+          "apk": {
+            "url": "https://github.com/derpx06/desklink-mobile/releases/download/v0.4.0/desklink-0.4.0.apk",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "size": 41234567
+          },
+          "releaseUrl": "https://github.com/derpx06/desklink-mobile/releases/tag/v0.4.0",
+          "play": {
+            "id": "org.desklink.mobile"
+          }
+        },
+        "requiredReason": "line one\nline two"
+      }
+    }
+  }
+}

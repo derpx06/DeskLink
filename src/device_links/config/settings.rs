@@ -106,6 +106,11 @@ pub struct AppSettings {
     /// Play a soft sound here while a phone rings (on by default; quiet in
     /// Do Not Disturb or with "Show calls" off).
     pub ring_on_computer: bool,
+    /// Ask the update server for the newest version once a day (on by
+    /// default; the update module reads it, nothing else does).
+    pub update_check: bool,
+    /// "beta", "stable" or "" (the default for the line: beta below 1.0).
+    pub update_channel: String,
 }
 
 impl Default for AppSettings {
@@ -139,6 +144,8 @@ impl Default for AppSettings {
             calls_on_computer: true,
             caller_on_lock_screen: false,
             ring_on_computer: true,
+            update_check: true,
+            update_channel: String::new(),
         }
     }
 }

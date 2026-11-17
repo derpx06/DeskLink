@@ -21,6 +21,12 @@ pub(super) fn call(
             perform(app, device, &action);
             Ok(())
         }
+        "ShowUpdate" => {
+            // No arguments, nothing read from the caller, nothing started:
+            // it only brings DeskLink's window (and its update popup) up.
+            let _ = main_window(app);
+            Ok(())
+        }
         "SeekMedia" => {
             let (device_id, position_ms) = params.get::<(String, i64)>().unwrap_or_default();
             let devices = current(app);

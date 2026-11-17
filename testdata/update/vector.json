@@ -1,0 +1,11 @@
+{
+  "_comment": "TEST ONLY. Ed25519 (RFC 8032) over the payload bytes; deterministic.",
+  "alg": "ed25519",
+  "kid": "test1",
+  "publicKeyHex": "d44484fd310292482ea7291abdaf44865c95ef30fd3d9465a36dafda3368292d",
+  "publicKeyBase64url": "1ESE_TECkkgupykava9EhlyV7zD9PZRlo22v2jNoKS0",
+  "payloadUtf8": "DeskLink update test vector 1",
+  "payloadBase64url": "RGVza0xpbmsgdXBkYXRlIHRlc3QgdmVjdG9yIDE",
+  "signatureHex": "8e62f21a528575e1493b9e68eccea7905a6bf98722e537ab2ed7769a2d56bbff1223ad691bfba77b3f20fc1f969d4aa41b8163b5de10f3c3f742deb21540c30e",
+  "signatureBase64url": "jmLyGlKFdeFJO55o7M6nkFpr-Yci5TerLtd2mi1Wu_8SI61pG_unez8g_B-WnUqkG4Fjtd4Q88P3Qt6yFUDDDg"
+}

@@ -1,0 +1,3554 @@
+{
+  "_comment": "Table-driven client tests (v3). Verdicts: UpToDate | Offer:<v> | Required:<v> | Skipped:<v> | Snoozed:<v> | Ignore:<reason>. A run's `expect` is a verdict string for the whole manifest, or {desktop, android}. Run fields default to `defaults`. See README.md.",
+  "schema": 3,
+  "keysFile": "keys.json",
+  "maxBodyBytes": 65536,
+  "maxDepth": 32,
+  "futureToleranceSeconds": 3600,
+  "maxWindowSeconds": 1900800,
+  "defaults": {
+    "installed": {
+      "desktop": "0.3.0",
+      "android": "0.3.0",
+      "androidCode": 20300
+    },
+    "channel": "beta",
+    "now": 1795003600,
+    "lastSeenIssuedAt": 1795000000,
+    "installId": "01010101010101010101010101010101",
+    "manual": false,
+    "prefs": {},
+    "keys": [
+      "test1",
+      "test2"
+    ]
+  },
+  "checkOrder": "size, strict JSON profile (UTF-8, no BOM, depth<=32, no duplicate keys, no NaN, no lone surrogate), envelope keys exactly v/kid/payload/sig and v==1, kid (case-sensitive), canonical base64url, signature (S<L), payload strict JSON, schemaVersion (int; <1 parse; >1 schema), issuedAt/expires i64 ints (parse), issuedAt<=now+3600 (expired), 0<expires-issuedAt<=22d (expired), now<=expires (expired), issuedAt>=lastSeenIssuedAt (replay)",
+  "ratchetVectors": [
+    {
+      "issuedAt": 1795000000,
+      "now": 1795003600,
+      "stored": 1795000000
+    },
+    {
+      "issuedAt": 1795007200,
+      "now": 1795003600,
+      "stored": 1795003600
+    },
+    {
+      "issuedAt": 1795003600,
+      "now": 1795003600,
+      "stored": 1795003600
+    }
+  ],
+  "urlContextChecks": [
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0",
+      "desktop",
+      "notesUrl",
+      "0.4.0",
+      true
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0",
+      "desktop",
+      "releaseUrl",
+      "0.4.0",
+      true
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0",
+      "desktop",
+      "tarball",
+      "0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/download/v0.4.0/desklink-0.4.0-x86_64.tar.gz",
+      "desktop",
+      "tarball",
+      "0.4.0",
+      true
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/download/v0.4.0/desklink-0.4.0-x86_64.tar.gz",
+      "desktop",
+      "notesUrl",
+      "0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/download/v0.4.0/desklink-0.4.0-x86_64.tar.gz",
+      "desktop",
+      "releaseUrl",
+      "0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/desklink-mobile/releases/download/v0.4.0/desklink-0.4.0.apk",
+      "desktop",
+      "tarball",
+      "0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/desklink-mobile/releases/download/v0.4.0/desklink-0.4.0.apk",
+      "android",
+      "apk",
+      "0.4.0",
+      true
+    ],
+    [
+      "https://github.com/derpx06/desklink-mobile/releases/download/v0.4.0/desklink-0.4.0.apk",
+      "android",
+      "notesUrl",
+      "0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/download/v0.4.0/desklink-0.4.0-x86_64.tar.gz",
+      "android",
+      "apk",
+      "0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/desklink-mobile/releases/tag/v0.4.0",
+      "android",
+      "notesUrl",
+      "0.4.0",
+      true
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0",
+      "android",
+      "notesUrl",
+      "0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/desklink-mobile/releases/tag/v0.4.0",
+      "desktop",
+      "notesUrl",
+      "0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0",
+      "desktop",
+      "notesUrl",
+      "0.5.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/download/v0.4.0/desklink-0.4.0-x86_64.tar.gz",
+      "desktop",
+      "tarball",
+      "0.4.1",
+      false
+    ],
+    [
+      "https://github.com/derpx06/desklink-mobile/releases/download/v0.4.0/desklink-0.4.0.apk",
+      "android",
+      "apk",
+      "0.4.1",
+      false
+    ],
+    [
+      "https://play.google.com/store/apps/details?id=org.desklink.mobile",
+      "android",
+      "play",
+      null,
+      true
+    ],
+    [
+      "https://play.google.com/store/apps/details?id=org.desklink.mobile",
+      "desktop",
+      "play",
+      null,
+      false
+    ],
+    [
+      "https://play.google.com/store/apps/details?id=org.desklink.mobile",
+      "android",
+      "notesUrl",
+      "0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0",
+      "desktop",
+      "notesUrl",
+      null,
+      true
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/download/v0.4.0/desklink-0.4.0-x86_64.tar.gz",
+      "desktop",
+      null,
+      "0.4.0",
+      true
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/download/v0.4.1/desklink-0.4.0-x86_64.tar.gz",
+      "desktop",
+      null,
+      null,
+      false
+    ]
+  ],
+  "installIdChecks": [
+    [
+      "0102030405060708090a0b0c0d0e0f10",
+      true
+    ],
+    [
+      "0102030405060708090A0B0C0D0E0F10",
+      false
+    ],
+    [
+      "0102030405060708090a0b0c0d0e0f",
+      false
+    ],
+    [
+      "0102030405060708090a0b0c0d0e0f1011",
+      false
+    ],
+    [
+      "0102030405060708090a0b0c0d0e0fzz",
+      false
+    ],
+    [
+      "",
+      false
+    ],
+    [
+      " 0102030405060708090a0b0c0d0e0f10",
+      false
+    ],
+    [
+      "0102030405060708090a0b0c0d0e0f10\n",
+      false
+    ]
+  ],
+  "bucketVectors": [
+    {
+      "installId": "01010101010101010101010101010101",
+      "component": "desktop",
+      "version": "0.4.0",
+      "bucket": 48
+    },
+    {
+      "installId": "01010101010101010101010101010101",
+      "component": "android",
+      "version": "0.4.0",
+      "bucket": 40
+    },
+    {
+      "installId": "02020202020202020202020202020202",
+      "component": "desktop",
+      "version": "0.4.0",
+      "bucket": 38
+    },
+    {
+      "installId": "02020202020202020202020202020202",
+      "component": "android",
+      "version": "0.4.0",
+      "bucket": 21
+    },
+    {
+      "installId": "03030303030303030303030303030303",
+      "component": "desktop",
+      "version": "0.4.0",
+      "bucket": 76
+    },
+    {
+      "installId": "03030303030303030303030303030303",
+      "component": "android",
+      "version": "0.4.0",
+      "bucket": 55
+    },
+    {
+      "installId": "04040404040404040404040404040404",
+      "component": "desktop",
+      "version": "0.4.0",
+      "bucket": 72
+    },
+    {
+      "installId": "04040404040404040404040404040404",
+      "component": "android",
+      "version": "0.4.0",
+      "bucket": 33
+    },
+    {
+      "installId": "05050505050505050505050505050505",
+      "component": "desktop",
+      "version": "0.4.0",
+      "bucket": 17
+    },
+    {
+      "installId": "05050505050505050505050505050505",
+      "component": "android",
+      "version": "0.4.0",
+      "bucket": 41
+    },
+    {
+      "installId": "06060606060606060606060606060606",
+      "component": "desktop",
+      "version": "0.4.0",
+      "bucket": 8
+    },
+    {
+      "installId": "06060606060606060606060606060606",
+      "component": "android",
+      "version": "0.4.0",
+      "bucket": 8
+    },
+    {
+      "installId": "07070707070707070707070707070707",
+      "component": "desktop",
+      "version": "0.4.0",
+      "bucket": 21
+    },
+    {
+      "installId": "07070707070707070707070707070707",
+      "component": "android",
+      "version": "0.4.0",
+      "bucket": 64
+    },
+    {
+      "installId": "08080808080808080808080808080808",
+      "component": "desktop",
+      "version": "0.4.0",
+      "bucket": 19
+    },
+    {
+      "installId": "08080808080808080808080808080808",
+      "component": "android",
+      "version": "0.4.0",
+      "bucket": 15
+    },
+    {
+      "installId": "09090909090909090909090909090909",
+      "component": "desktop",
+      "version": "0.4.0",
+      "bucket": 26
+    },
+    {
+      "installId": "09090909090909090909090909090909",
+      "component": "android",
+      "version": "0.4.0",
+      "bucket": 74
+    },
+    {
+      "installId": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "component": "desktop",
+      "version": "0.4.0",
+      "bucket": 16
+    },
+    {
+      "installId": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "component": "android",
+      "version": "0.4.0",
+      "bucket": 84
+    },
+    {
+      "installId": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "component": "desktop",
+      "version": "0.4.0",
+      "bucket": 16
+    },
+    {
+      "installId": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "component": "android",
+      "version": "0.4.0",
+      "bucket": 71
+    },
+    {
+      "installId": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "component": "desktop",
+      "version": "0.4.0",
+      "bucket": 79
+    },
+    {
+      "installId": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "component": "android",
+      "version": "0.4.0",
+      "bucket": 12
+    },
+    {
+      "installId": "01010101010101010101010101010101",
+      "component": "desktop",
+      "version": "0.5.0",
+      "bucket": 60
+    }
+  ],
+  "urlChecks": [
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0",
+      true
+    ],
+    [
+      "https://github.com/derpx06/desklink-mobile/releases/tag/v0.4.0",
+      true
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/download/v0.4.0/desklink-0.4.0-x86_64.tar.gz",
+      true
+    ],
+    [
+      "https://github.com/derpx06/desklink-mobile/releases/download/v0.4.0/desklink-0.4.0.apk",
+      true
+    ],
+    [
+      "https://play.google.com/store/apps/details?id=org.desklink.mobile",
+      true
+    ],
+    [
+      "https://GITHUB.COM/derpx06/DeskLink/releases/tag/v0.4.0",
+      true
+    ],
+    [
+      "HTTPS://github.com/derpx06/DeskLink/releases/tag/v0.4.0",
+      true
+    ],
+    [
+      "https://github.com:443/derpx06/DeskLink/releases/tag/v0.4.0",
+      true
+    ],
+    [
+      "http://github.com/derpx06/DeskLink/releases/tag/v0.4.0",
+      false
+    ],
+    [
+      "https://github.com:8443/derpx06/DeskLink/releases/tag/v0.4.0",
+      false
+    ],
+    [
+      "https://user@github.com/derpx06/DeskLink/releases/tag/v0.4.0",
+      false
+    ],
+    [
+      "https://user:pw@github.com/derpx06/DeskLink/releases/tag/v0.4.0",
+      false
+    ],
+    [
+      "https://github.com./derpx06/DeskLink/releases/tag/v0.4.0",
+      false
+    ],
+    [
+      "https://github.com.evil.example/derpx06/DeskLink/releases/tag/v0.4.0",
+      false
+    ],
+    [
+      "https://notgithub.com/derpx06/DeskLink/releases/tag/v0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0#x",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0?x=1",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/latest",
+      false
+    ],
+    [
+      "https://github.com/evil/DeskLink/releases/tag/v0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/deskLink/releases/tag/v0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.04.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0/../v0.3.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/../releases/tag/v0.4.0",
+      false
+    ],
+    [
+      "https://github.com//derpx06/DeskLink/releases/tag/v0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/./tag/v0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0%2f..",
+      false
+    ],
+    [
+      "https://github.com/derpx06%2fDeskLink/releases/tag/v0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0%5c",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0\\x",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0 ",
+      false
+    ],
+    [
+      " https://github.com/derpx06/DeskLink/releases/tag/v0.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0\n",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0\t",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0\u0000",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v٠.4.0",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0é",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/tag/v0.4.0‮",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/download/v0.4.0/evil.tar.gz",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/download/v0.4.0/desklink-0.5.0-x86_64.tar.gz",
+      false
+    ],
+    [
+      "https://github.com/derpx06/DeskLink/releases/download/v0.4.0/desklink-0.4.0.apk",
+      false
+    ],
+    [
+      "https://github.com/derpx06/desklink-mobile/releases/download/v0.4.0/desklink-0.4.0-x86_64.tar.gz",
+      false
+    ],
+    [
+      "https://github.com/derpx06/desklink-mobile/releases/download/v0.4.0/desklink-0.4.0.apk.sig",
+      false
+    ],
+    [
+      "https://github.com/derpx06/desklink-mobile/releases/download/v0.4.0/sub/desklink-0.4.0.apk",
+      false
+    ],
+    [
+      "https://objects.githubusercontent.com/a/b",
+      false
+    ],
+    [
+      "https://f-droid.org/packages/org.desklink.mobile/",
+      false
+    ],
+    [
+      "https://flathub.org/apps/derx06.desklink.com",
+      false
+    ],
+    [
+      "https://desklink-updates.web.app/latest.json",
+      false
+    ],
+    [
+      "https://play.google.com/store/apps/details?id=com.evil.app",
+      false
+    ],
+    [
+      "https://play.google.com/store/apps/details?id=org.desklink.mobile&x=1",
+      false
+    ],
+    [
+      "https://play.google.com/store/apps/details",
+      false
+    ],
+    [
+      "https://play.google.com/store/apps/details?id=org.desklink.mobile.debug",
+      false
+    ],
+    [
+      "ftp://github.com/x",
+      false
+    ],
+    [
+      "//github.com/x",
+      false
+    ],
+    [
+      "javascript:alert(1)",
+      false
+    ],
+    [
+      "market://details?id=org.desklink.mobile",
+      false
+    ],
+    [
+      "",
+      false
+    ]
+  ],
+  "cases": [
+    {
+      "id": "valid-beta",
+      "file": "manifests/valid-beta.json",
+      "description": "Beta offer 0.3.0 -> 0.4.0 (Android versionCode 20400), rollout 100.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectReleased": "2026-12-08",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "manual",
+          "manual": true,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "already-installed",
+          "installed": {
+            "desktop": "0.4.0",
+            "android": "0.4.0",
+            "androidCode": 20400
+          },
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "installed-newer",
+          "installed": {
+            "desktop": "0.5.0",
+            "android": "0.5.0",
+            "androidCode": 20500
+          },
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "stable-channel-has-nothing",
+          "channel": "stable",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "skipped",
+          "prefs": {
+            "skipped": "0.4.0"
+          },
+          "expect": {
+            "desktop": "Skipped:0.4.0",
+            "android": "Skipped:0.4.0"
+          }
+        },
+        {
+          "name": "skipped-manual-offers",
+          "prefs": {
+            "skipped": "0.4.0"
+          },
+          "manual": true,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "older-skip-cleared-by-newer",
+          "prefs": {
+            "skipped": "0.3.5"
+          },
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "snoozed",
+          "prefs": {
+            "snoozedVersion": "0.4.0",
+            "snoozedUntil": 1795003601
+          },
+          "expect": {
+            "desktop": "Snoozed:0.4.0",
+            "android": "Snoozed:0.4.0"
+          }
+        },
+        {
+          "name": "snooze-expired",
+          "prefs": {
+            "snoozedVersion": "0.4.0",
+            "snoozedUntil": 1795003600
+          },
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "snooze-other-version",
+          "prefs": {
+            "snoozedVersion": "0.3.9",
+            "snoozedUntil": 1795103599
+          },
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "clock-far-in-past",
+          "now": 1000,
+          "expect": "Ignore:expired"
+        },
+        {
+          "name": "installed-desktop-version-malformed",
+          "installed": {
+            "desktop": "banana",
+            "android": "0.3.0",
+            "androidCode": 20300
+          },
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "installed-android-version-malformed",
+          "installed": {
+            "desktop": "0.3.0",
+            "android": "0.3",
+            "androidCode": 20300
+          },
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "keyset-without-test1-rejects",
+          "keys": [
+            "test2"
+          ],
+          "expect": "Ignore:signature"
+        },
+        {
+          "name": "keyset-test1-only-accepts",
+          "keys": [
+            "test1"
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "issuedAt-equal-last-seen",
+      "file": "manifests/issuedAt-equal-last-seen.json",
+      "description": "issuedAt == lastSeenIssuedAt is accepted.",
+      "runs": [
+        {
+          "name": "accepted",
+          "lastSeenIssuedAt": 1795000000,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "issuedAt-lt-last-seen-by-1",
+      "file": "manifests/issuedAt-lt-last-seen-by-1.json",
+      "description": "issuedAt one second older than the last seen one.",
+      "runs": [
+        {
+          "name": "replay",
+          "expect": "Ignore:replay"
+        }
+      ]
+    },
+    {
+      "id": "valid-up-to-date",
+      "file": "manifests/valid-up-to-date.json",
+      "description": "Offered version equals installed.",
+      "runs": [
+        {
+          "name": "up-to-date",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "stable-both-older-than-beta",
+      "file": "manifests/stable-both-older-than-beta.json",
+      "description": "beta 0.5.0, stable 0.4.0: the beta channel offers the beta entry.",
+      "runs": [
+        {
+          "name": "beta-channel-beta-wins",
+          "expect": {
+            "desktop": "Offer:0.5.0",
+            "android": "Offer:0.5.0"
+          }
+        },
+        {
+          "name": "stable-channel",
+          "channel": "stable",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "stable-newer-than-beta",
+      "file": "manifests/stable-newer-than-beta.json",
+      "description": "beta 0.4.0, stable 1.0.0: beta falls back to stable only when stable is newer.",
+      "runs": [
+        {
+          "name": "beta-channel",
+          "expect": {
+            "desktop": "Offer:1.0.0",
+            "android": "Offer:1.0.0"
+          }
+        },
+        {
+          "name": "stable-channel",
+          "channel": "stable",
+          "expect": {
+            "desktop": "Offer:1.0.0",
+            "android": "Offer:1.0.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rotated-key",
+      "file": "manifests/rotated-key.json",
+      "description": "Signed with the next key test2 (kid test2): must verify.",
+      "runs": [
+        {
+          "name": "offer",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "rotated-to-test2-after-test1-removed",
+          "keys": [
+            "test2"
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "client-without-test2",
+          "keys": [
+            "test1"
+          ],
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "required",
+      "file": "manifests/required.json",
+      "description": "minSupported 0.4.0 above installed 0.3.0 (rollout 25: Required and manual ignore partial rollouts).",
+      "runs": [
+        {
+          "name": "required",
+          "expectRequiredReason": "This version cannot connect to DeskLink 1.4 on your computer.",
+          "expect": {
+            "desktop": "Required:0.4.0",
+            "android": "Required:0.4.0"
+          }
+        },
+        {
+          "name": "ignores-skip-snooze-rollout",
+          "prefs": {
+            "skipped": "0.4.0",
+            "snoozedVersion": "0.4.0",
+            "snoozedUntil": 1795008600
+          },
+          "installId": "06060606060606060606060606060606",
+          "expect": {
+            "desktop": "Required:0.4.0",
+            "android": "Required:0.4.0"
+          }
+        },
+        {
+          "name": "installed-meets-min",
+          "installed": {
+            "desktop": "0.4.0",
+            "android": "0.4.0",
+            "androidCode": 20400
+          },
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "below-min-by-a-patch",
+          "installed": {
+            "desktop": "0.3.9",
+            "android": "0.3.9",
+            "androidCode": 20399
+          },
+          "expect": {
+            "desktop": "Required:0.4.0",
+            "android": "Required:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "required-paused",
+      "file": "manifests/required-paused.json",
+      "description": "Required but rollout 0: a PAUSE is a hard stop, even for Required and manual checks.",
+      "runs": [
+        {
+          "name": "paused",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "paused-manual",
+          "manual": true,
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rollout-0",
+      "file": "manifests/rollout-0.json",
+      "description": "rollout 0 for both components; offered iff bucket < 0 (bucket == rollout is NOT offered); 0 = pause.",
+      "runs": [
+        {
+          "name": "a",
+          "installId": "01010101010101010101010101010101",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "desktop-bucket-0",
+          "installId": "0000000000000000000000000000001b",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "desktop-bucket-49",
+          "installId": "00000000000000000000000000000029",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "desktop-bucket-50",
+          "installId": "00000000000000000000000000000014",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "desktop-bucket-99",
+          "installId": "00000000000000000000000000000073",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "android-bucket-0",
+          "installId": "00000000000000000000000000000001",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "android-bucket-49",
+          "installId": "00000000000000000000000000000050",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "android-bucket-50",
+          "installId": "0000000000000000000000000000009e",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "android-bucket-99",
+          "installId": "0000000000000000000000000000000c",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "manual-cannot-pass-a-pause",
+          "installId": "00000000000000000000000000000073",
+          "manual": true,
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rollout-50",
+      "file": "manifests/rollout-50.json",
+      "description": "rollout 50 for both components; offered iff bucket < 50 (bucket == rollout is NOT offered); 0 = pause.",
+      "runs": [
+        {
+          "name": "a",
+          "installId": "01010101010101010101010101010101",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "desktop-bucket-0",
+          "installId": "0000000000000000000000000000001b",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "desktop-bucket-49",
+          "installId": "00000000000000000000000000000029",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "desktop-bucket-50",
+          "installId": "00000000000000000000000000000014",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "desktop-bucket-99",
+          "installId": "00000000000000000000000000000073",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "android-bucket-0",
+          "installId": "00000000000000000000000000000001",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "android-bucket-49",
+          "installId": "00000000000000000000000000000050",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "android-bucket-50",
+          "installId": "0000000000000000000000000000009e",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "android-bucket-99",
+          "installId": "0000000000000000000000000000000c",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "manual-ignores-partial-rollout",
+          "installId": "00000000000000000000000000000073",
+          "manual": true,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rollout-100",
+      "file": "manifests/rollout-100.json",
+      "description": "rollout 100 for both components; offered iff bucket < 100 (bucket == rollout is NOT offered); 0 = pause.",
+      "runs": [
+        {
+          "name": "a",
+          "installId": "01010101010101010101010101010101",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "desktop-bucket-0",
+          "installId": "0000000000000000000000000000001b",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "desktop-bucket-49",
+          "installId": "00000000000000000000000000000029",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "desktop-bucket-50",
+          "installId": "00000000000000000000000000000014",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "desktop-bucket-99",
+          "installId": "00000000000000000000000000000073",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "android-bucket-0",
+          "installId": "00000000000000000000000000000001",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "android-bucket-49",
+          "installId": "00000000000000000000000000000050",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "android-bucket-50",
+          "installId": "0000000000000000000000000000009e",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "android-bucket-99",
+          "installId": "0000000000000000000000000000000c",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "manual-ignores-partial-rollout",
+          "installId": "00000000000000000000000000000073",
+          "manual": true,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "expired",
+      "file": "manifests/expired.json",
+      "description": "expires < now.",
+      "runs": [
+        {
+          "name": "expired",
+          "lastSeenIssuedAt": 0,
+          "expect": "Ignore:expired"
+        },
+        {
+          "name": "order-expired-over-replay",
+          "lastSeenIssuedAt": 1795000000,
+          "expect": "Ignore:expired"
+        }
+      ]
+    },
+    {
+      "id": "boundary-expires-equals-now",
+      "file": "manifests/boundary-expires-equals-now.json",
+      "description": "now == expires is still valid (reject only now > expires).",
+      "runs": [
+        {
+          "name": "offer",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "issued-plus-1h",
+      "file": "manifests/issued-plus-1h.json",
+      "description": "issuedAt = now + 3600 s is accepted (tolerance 1 h).",
+      "runs": [
+        {
+          "name": "offer",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "issued-plus-1h-1s",
+      "file": "manifests/issued-plus-1h-1s.json",
+      "description": "issuedAt = now + 3601 s: clock-skew guard (reported as expired).",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:expired"
+        }
+      ]
+    },
+    {
+      "id": "legit-after-future-ish",
+      "file": "manifests/legit-after-future-ish.json",
+      "description": "issuedAt now+30 after a client accepted issuedAt now+3600 at `now`: the ratchet stores min(issuedAt, now), so this is NOT a replay.",
+      "runs": [
+        {
+          "name": "after-ratchet",
+          "now": 1795003660,
+          "lastSeenIssuedAt": 1795003600,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        },
+        {
+          "name": "without-ratchet-would-wrongly-block",
+          "now": 1795003660,
+          "lastSeenIssuedAt": 1795007200,
+          "expect": "Ignore:replay"
+        }
+      ]
+    },
+    {
+      "id": "replayed",
+      "file": "manifests/replayed.json",
+      "description": "issuedAt older than the last seen one (rollback of the manifest).",
+      "runs": [
+        {
+          "name": "replay",
+          "expect": "Ignore:replay"
+        },
+        {
+          "name": "first-ever-check-is-fine",
+          "lastSeenIssuedAt": 0,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "downgrade-version-with-higher-issuedAt",
+      "file": "manifests/downgrade-version-with-higher-issuedAt.json",
+      "description": "A newer manifest that names an older version: never offered.",
+      "runs": [
+        {
+          "name": "up-to-date",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "expires-before-issuedAt",
+      "file": "manifests/expires-before-issuedAt.json",
+      "description": "expires < issuedAt.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:expired"
+        }
+      ]
+    },
+    {
+      "id": "expires-window-gt-22d",
+      "file": "manifests/expires-window-gt-22d.json",
+      "description": "expires - issuedAt = 22 d + 1 s.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:expired"
+        },
+        {
+          "name": "order-window-over-replay",
+          "lastSeenIssuedAt": 1795009999,
+          "expect": "Ignore:expired"
+        }
+      ]
+    },
+    {
+      "id": "expires-window-22d",
+      "file": "manifests/expires-window-22d.json",
+      "description": "expires - issuedAt = 22 d is accepted.",
+      "runs": [
+        {
+          "name": "offer",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "schema-2",
+      "file": "manifests/schema-2.json",
+      "description": "schemaVersion 2, correctly signed: never half-parsed.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:schema"
+        },
+        {
+          "name": "order-schema-over-replay",
+          "lastSeenIssuedAt": 1795999999,
+          "expect": "Ignore:schema"
+        }
+      ]
+    },
+    {
+      "id": "order-schema-over-types",
+      "file": "manifests/order-schema-over-types.json",
+      "description": "schemaVersion 2 AND a string issuedAt: the schema check comes first.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:schema"
+        }
+      ]
+    },
+    {
+      "id": "schema-0",
+      "file": "manifests/schema-0.json",
+      "description": "schemaVersion 0.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "schema-1.5",
+      "file": "manifests/schema-1.5.json",
+      "description": "schemaVersion 1.5 (a fraction: whole payload is a parse error).",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "missing-fields",
+      "file": "manifests/missing-fields.json",
+      "description": "Signed JSON without issuedAt/expires.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "issuedAt-float",
+      "file": "manifests/issuedAt-float.json",
+      "description": "issuedAt = 1795000000.0: a fraction is outside the number grammar.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "issuedAt-string",
+      "file": "manifests/issuedAt-string.json",
+      "description": "issuedAt = '1795000000': wrong type.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "issuedAt-bool",
+      "file": "manifests/issuedAt-bool.json",
+      "description": "issuedAt = True: wrong type.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "issuedAt-2pow63",
+      "file": "manifests/issuedAt-2pow63.json",
+      "description": "issuedAt = 9223372036854775808: above the i64 range.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "issuedAt-negative",
+      "file": "manifests/issuedAt-negative.json",
+      "description": "issuedAt = -1: a sign is outside the number grammar.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "tampered-payload",
+      "file": "manifests/tampered-payload.json",
+      "description": "Valid envelope whose payload was replaced after signing.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "tampered-signature",
+      "file": "manifests/tampered-signature.json",
+      "description": "One bit of the signature flipped.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "short-signature",
+      "file": "manifests/short-signature.json",
+      "description": "63-byte signature.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "bad-base64",
+      "file": "manifests/bad-base64.json",
+      "description": "payload is not base64url.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "bad-sig-noncanonical-b64",
+      "file": "manifests/bad-sig-noncanonical-b64.json",
+      "description": "Signature text with non-zero trailing bits: same bytes under a lenient decoder, must be rejected.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "bad-payload-noncanonical-b64",
+      "file": "manifests/bad-payload-noncanonical-b64.json",
+      "description": "Payload text with non-zero trailing bits (signature is valid for the decoded bytes).",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "sig-padded",
+      "file": "manifests/sig-padded.json",
+      "description": "Signature with '=' padding.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "sig-high-S",
+      "file": "manifests/sig-high-S.json",
+      "description": "Malleable signature (R, S + L): verifies under a lax verifier, must be rejected (S >= L).",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "wrong-kid",
+      "file": "manifests/wrong-kid.json",
+      "description": "kid k9 is not in keys.json.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "kid-case",
+      "file": "manifests/kid-case.json",
+      "description": "kid TEST1 (kid is case-sensitive).",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "kid-mismatch",
+      "file": "manifests/kid-mismatch.json",
+      "description": "Signed with test2 but labelled test1.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "envelope-v2",
+      "file": "manifests/envelope-v2.json",
+      "description": "Envelope v = 2.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "envelope-v-true",
+      "file": "manifests/envelope-v-true.json",
+      "description": "Envelope v = true.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "envelope-extra-keys",
+      "file": "manifests/envelope-extra-keys.json",
+      "description": "Envelope keys must be EXACTLY v, kid, payload, sig: an extra key is rejected (not ignored).",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "envelope-missing-key",
+      "file": "manifests/envelope-missing-key.json",
+      "description": "Envelope without sig.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "envelope-dup-kid",
+      "file": "manifests/envelope-dup-kid.json",
+      "description": "Duplicate key `kid` (the second names a valid key).",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "envelope-bom",
+      "file": "manifests/envelope-bom.json",
+      "description": "UTF-8 BOM before the envelope.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "envelope-utf16",
+      "file": "manifests/envelope-utf16.json",
+      "description": "The envelope encoded as UTF-16.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "malformed-envelope-json",
+      "file": "manifests/malformed-envelope-json.json",
+      "description": "Body is not JSON.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "envelope-depth-32000",
+      "file": "manifests/envelope-depth-32000.json",
+      "description": "Body nested 32000 deep (fits in 64 KiB): rejected without recursing.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "body-exactly-65536",
+      "file": "manifests/body-exactly-65536.json",
+      "description": "A valid manifest padded with trailing whitespace to exactly 65536 bytes: accepted.",
+      "runs": [
+        {
+          "name": "accepted",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "body-65537",
+      "file": "manifests/body-65537.json",
+      "description": "The same, 65537 bytes: rejected before parsing.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:oversized"
+        }
+      ]
+    },
+    {
+      "id": "oversized",
+      "file": "manifests/oversized.json",
+      "description": "Correctly signed but the body is > 64 KiB: rejected before any parsing.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:oversized"
+        }
+      ]
+    },
+    {
+      "id": "malformed-payload-json",
+      "file": "manifests/malformed-payload-json.json",
+      "description": "Signature valid but the payload is not JSON.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-invalid-utf8",
+      "file": "manifests/payload-invalid-utf8.json",
+      "description": "Signed payload with an invalid UTF-8 byte.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-bom",
+      "file": "manifests/payload-bom.json",
+      "description": "Signed payload starting with a UTF-8 BOM.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-dup-keys",
+      "file": "manifests/payload-dup-keys.json",
+      "description": "Signed payload with a duplicate key.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-nan",
+      "file": "manifests/payload-nan.json",
+      "description": "Signed payload with NaN as issuedAt.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "rollout-NaN",
+      "file": "manifests/rollout-NaN.json",
+      "description": "rollout is NaN: the whole payload is rejected by the strict profile.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-lone-surrogate",
+      "file": "manifests/payload-lone-surrogate.json",
+      "description": "A note title containing the lone surrogate escape \\ud800.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-depth-20000",
+      "file": "manifests/payload-depth-20000.json",
+      "description": "A signed payload with a 20000-deep array.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-trailing-comma",
+      "file": "manifests/payload-trailing-comma.json",
+      "description": "Trailing comma in the object.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-comment",
+      "file": "manifests/payload-comment.json",
+      "description": "A /* comment */ in the JSON.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-leading-zero",
+      "file": "manifests/payload-leading-zero.json",
+      "description": "issuedAt 01795000000 (leading zero).",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-plus-sign",
+      "file": "manifests/payload-plus-sign.json",
+      "description": "issuedAt +1795000000.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-dot-five",
+      "file": "manifests/payload-dot-five.json",
+      "description": "rollout .5.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-single-quotes",
+      "file": "manifests/payload-single-quotes.json",
+      "description": "Single-quoted string.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-unquoted-key",
+      "file": "manifests/payload-unquoted-key.json",
+      "description": "Unquoted key.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-leading-garbage",
+      "file": "manifests/payload-leading-garbage.json",
+      "description": "Garbage before the JSON.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-trailing-garbage",
+      "file": "manifests/payload-trailing-garbage.json",
+      "description": "Garbage after the JSON.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-trailing-whitespace-ok",
+      "file": "manifests/payload-trailing-whitespace-ok.json",
+      "description": "Trailing JSON whitespace (space, tab, CR, LF) is fine.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "payload-depth-32",
+      "file": "manifests/payload-depth-32.json",
+      "description": "Payload nested exactly 32 deep (the root object is depth 1, arrays and objects both count): accepted.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "payload-depth-33",
+      "file": "manifests/payload-depth-33.json",
+      "description": "Payload nested 33 deep: rejected.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-depth-mixed-32",
+      "file": "manifests/payload-depth-mixed-32.json",
+      "description": "Objects and arrays mixed, 32 deep: accepted.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "payload-depth-mixed-33",
+      "file": "manifests/payload-depth-mixed-33.json",
+      "description": "Objects and arrays mixed, 33 deep: rejected.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "envelope-trailing-comma",
+      "file": "manifests/envelope-trailing-comma.json",
+      "description": "Trailing comma in the envelope.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "envelope-unknown-kid-nonstring-payload",
+      "file": "manifests/envelope-unknown-kid-nonstring-payload.json",
+      "description": "Unknown kid AND a non-string payload: the kid lookup comes first, so the reason is `signature` (never `parse`).",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "envelope-known-kid-nonstring-payload",
+      "file": "manifests/envelope-known-kid-nonstring-payload.json",
+      "description": "Known kid, payload is a number: `signature` (the shape check only requires the four keys and a string kid).",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "envelope-known-kid-nonstring-sig",
+      "file": "manifests/envelope-known-kid-nonstring-sig.json",
+      "description": "Known kid, sig is null: `signature`.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "envelope-nonstring-kid",
+      "file": "manifests/envelope-nonstring-kid.json",
+      "description": "kid is a number: `parse` (the envelope shape is wrong before any lookup).",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "envelope-v-1.0",
+      "file": "manifests/envelope-v-1.0.json",
+      "description": "Envelope v = 1.0.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "envelope-v-1e0",
+      "file": "manifests/envelope-v-1e0.json",
+      "description": "Envelope v = 1e0.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "envelope-v-string",
+      "file": "manifests/envelope-v-string.json",
+      "description": "Envelope v = \"1\".",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "envelope-dup-escaped",
+      "file": "manifests/envelope-dup-escaped.json",
+      "description": "Duplicate key through an escape: \"kid\" and \"k\\u0069d\" (the second names a valid key).",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-dup-nested",
+      "file": "manifests/payload-dup-nested.json",
+      "description": "A duplicate key inside a component object.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "payload-dup-escaped",
+      "file": "manifests/payload-dup-escaped.json",
+      "description": "A duplicate through an escape (\"version\" and \"vers\\u0069on\") in a component.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "base64url-alphabet-edges",
+      "file": "manifests/base64url-alphabet-edges.json",
+      "description": "The payload text contains both '-' and '_' (the base64url characters that differ from standard base64): accepted.",
+      "runs": [
+        {
+          "name": "accepted",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "base64-standard-alphabet",
+      "file": "manifests/base64-standard-alphabet.json",
+      "description": "The same payload text with '+' and '/' instead of '-' and '_': rejected.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "sig-empty",
+      "file": "manifests/sig-empty.json",
+      "description": "sig is the empty string.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "payload-empty",
+      "file": "manifests/payload-empty.json",
+      "description": "payload is the empty string (openssl cannot sign zero bytes, so the signature is another message's): rejected as a signature failure, the empty bytes are never parsed first.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:signature"
+        }
+      ]
+    },
+    {
+      "id": "empty-channels",
+      "file": "manifests/empty-channels.json",
+      "description": "channels is {}: nothing to offer.",
+      "runs": [
+        {
+          "name": "up-to-date",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "null-beta",
+      "file": "manifests/null-beta.json",
+      "description": "beta is null.",
+      "runs": [
+        {
+          "name": "up-to-date",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "downgrade",
+      "file": "manifests/downgrade.json",
+      "description": "Offered 0.2.0 / code 20200 below installed.",
+      "runs": [
+        {
+          "name": "up-to-date",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "android-code-lower",
+      "file": "manifests/android-code-lower.json",
+      "description": "Android entry named 0.4.0 but versionCode 20100 < installed 20300: not offered; desktop is.",
+      "runs": [
+        {
+          "name": "code-wins",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "android-code-higher",
+      "file": "manifests/android-code-higher.json",
+      "description": "Android name 0.2.9 but versionCode 20400: the code decides (Offer, shown as 0.2.9).",
+      "runs": [
+        {
+          "name": "code-wins",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.2.9"
+          }
+        }
+      ]
+    },
+    {
+      "id": "android-code-same-name-higher",
+      "file": "manifests/android-code-same-name-higher.json",
+      "description": "Android name equals the installed name (0.3.0) but versionCode 20400: Offer.",
+      "runs": [
+        {
+          "name": "code-wins",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.3.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "desktop-only",
+      "file": "manifests/desktop-only.json",
+      "description": "Only the desktop component is present.",
+      "runs": [
+        {
+          "name": "offer",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rollout--1",
+      "file": "manifests/rollout--1.json",
+      "description": "rollout -1: a sign is outside the integer grammar.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "rollout--0",
+      "file": "manifests/rollout--0.json",
+      "description": "rollout -0.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "rollout-50.5",
+      "file": "manifests/rollout-50.5.json",
+      "description": "rollout 50.5.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "rollout-100.0",
+      "file": "manifests/rollout-100.0.json",
+      "description": "rollout 100.0.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "rollout-5e1",
+      "file": "manifests/rollout-5e1.json",
+      "description": "rollout 5e1.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "rollout-1e999",
+      "file": "manifests/rollout-1e999.json",
+      "description": "rollout 1e999 (explicit parse error, never an infinity).",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "rollout-101",
+      "file": "manifests/rollout-101.json",
+      "description": "rollout 101. The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rollout-string",
+      "file": "manifests/rollout-string.json",
+      "description": "rollout \"50\". The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rollout-bool",
+      "file": "manifests/rollout-bool.json",
+      "description": "rollout true. The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rollout-null",
+      "file": "manifests/rollout-null.json",
+      "description": "rollout null (null is INVALID, not absent). The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "minSupported-null",
+      "file": "manifests/minSupported-null.json",
+      "description": "minSupported null (null is INVALID, not absent). The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "version-leading-zero",
+      "file": "manifests/version-leading-zero.json",
+      "description": "version 0.04.0. The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "version-build-meta",
+      "file": "manifests/version-build-meta.json",
+      "description": "version 0.4.0+1. The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "version-prerelease",
+      "file": "manifests/version-prerelease.json",
+      "description": "version 0.4.0-beta. The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "version-4-parts",
+      "file": "manifests/version-4-parts.json",
+      "description": "version 0.4.0.1. The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "version-huge",
+      "file": "manifests/version-huge.json",
+      "description": "version 99999999999.0.0 (parts must be <= 2^31-1). The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "version-part-overflow",
+      "file": "manifests/version-part-overflow.json",
+      "description": "version 2147483648.0.0 (2^31). The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "version-unicode-digits",
+      "file": "manifests/version-unicode-digits.json",
+      "description": "version with Arabic-Indic digits. The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "minSupported-gt-version",
+      "file": "manifests/minSupported-gt-version.json",
+      "description": "minSupported 0.5.0 > version 0.4.0 (rule: invalid, so never a Required verdict). The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "minSupported-bad",
+      "file": "manifests/minSupported-bad.json",
+      "description": "minSupported 'x'. The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "version-max-part",
+      "file": "manifests/version-max-part.json",
+      "description": "version 2147483647.0.0 (the largest part) is accepted.",
+      "runs": [
+        {
+          "name": "max",
+          "expect": {
+            "desktop": "Offer:2147483647.0.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "version-numeric-compare",
+      "file": "manifests/version-numeric-compare.json",
+      "description": "0.10.0 vs 0.9.0: parts compare as numbers, never as text.",
+      "runs": [
+        {
+          "name": "0.9.0-is-older",
+          "installed": {
+            "desktop": "0.9.0",
+            "android": "0.9.0",
+            "androidCode": 20300
+          },
+          "expect": {
+            "desktop": "Offer:0.10.0",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "0.10.0-is-current",
+          "installed": {
+            "desktop": "0.10.0",
+            "android": "0.10.0",
+            "androidCode": 20300
+          },
+          "expect": {
+            "desktop": "UpToDate",
+            "android": "UpToDate"
+          }
+        },
+        {
+          "name": "0.9.9-is-older",
+          "installed": {
+            "desktop": "0.9.9",
+            "android": "0.9.9",
+            "androidCode": 20300
+          },
+          "expect": {
+            "desktop": "Offer:0.10.0",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "versionCode-overflow",
+      "file": "manifests/versionCode-overflow.json",
+      "description": "versionCode 2^31. The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "versionCode-string",
+      "file": "manifests/versionCode-string.json",
+      "description": "versionCode \"20400\". The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "versionCode-negative",
+      "file": "manifests/versionCode-negative.json",
+      "description": "versionCode -1: a sign is outside the integer grammar.",
+      "runs": [
+        {
+          "name": "ignored",
+          "expect": "Ignore:parse"
+        }
+      ]
+    },
+    {
+      "id": "versionCode-missing-android",
+      "file": "manifests/versionCode-missing-android.json",
+      "description": "Android entry without versionCode. The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "versionCode-max",
+      "file": "manifests/versionCode-max.json",
+      "description": "versionCode 2100000000 is accepted, 2100000001 is not (see versionCode-above-max).",
+      "runs": [
+        {
+          "name": "max",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "versionCode-above-max",
+      "file": "manifests/versionCode-above-max.json",
+      "description": "versionCode 2100000001. The component is DROPPED; the other one is still offered.",
+      "runs": [
+        {
+          "name": "dropped",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "UpToDate"
+          }
+        }
+      ]
+    },
+    {
+      "id": "unknown-fields-everywhere",
+      "file": "manifests/unknown-fields-everywhere.json",
+      "description": "Unknown fields at the top level, in channels (an unknown channel), components, notes and downloads are IGNORED (no deny_unknown_fields). The ENVELOPE is the opposite: exact keys.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "Files has a list view",
+              "detail": "Switch between grid and list.",
+              "glyph": "files"
+            },
+            {
+              "title": "Faster reconnects",
+              "detail": "Back online in seconds after a Wi-Fi change.",
+              "glyph": "refresh"
+            }
+          ],
+          "expectNotesAndroid": [
+            {
+              "title": "Files has a list view",
+              "detail": "Switch between grid and list.",
+              "glyph": "files"
+            },
+            {
+              "title": "Faster reconnects",
+              "detail": "Back online in seconds after a Wi-Fi change.",
+              "glyph": "refresh"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-unicode",
+      "file": "manifests/notes-unicode.json",
+      "description": "Unicode, quotes, backslash, RTL letters (no format controls), empty detail, unknown, missing or NON-STRING glyph: shown verbatim; glyph falls back to star.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "Fichiers été ✨ 日本語",
+              "detail": "café — \"quotes\" 'single' \\back\\slash",
+              "glyph": "files"
+            },
+            {
+              "title": "مرحبا שלום",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "Emoji 🚀🎉",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+              "detail": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+              "glyph": "speed"
+            },
+            {
+              "title": "Glyph five",
+              "detail": null,
+              "glyph": "star"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-markup",
+      "file": "manifests/notes-markup.json",
+      "description": "Titles/details containing < > & are dropped (the whole note).",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "Good note",
+              "detail": "Fine.",
+              "glyph": "check"
+            },
+            {
+              "title": "Good note",
+              "detail": "Fine.",
+              "glyph": "check"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-rtl-override",
+      "file": "manifests/notes-rtl-override.json",
+      "description": "U+202E / U+2066 bidi controls: the note is dropped.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "Good note",
+              "detail": "Fine.",
+              "glyph": "check"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-nul",
+      "file": "manifests/notes-nul.json",
+      "description": "A NUL character: the note is dropped.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "Good note",
+              "detail": "Fine.",
+              "glyph": "check"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-zero-width",
+      "file": "manifests/notes-zero-width.json",
+      "description": "Zero-width space, ZWJ and BOM characters: the note is dropped.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "Good note",
+              "detail": "Fine.",
+              "glyph": "check"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-newline",
+      "file": "manifests/notes-newline.json",
+      "description": "A newline or tab in a note: dropped.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "Good note",
+              "detail": "Fine.",
+              "glyph": "check"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-text-rejected-codepoints",
+      "file": "manifests/notes-text-rejected-codepoints.json",
+      "description": "One note per frozen rejected code point (title 'a<cp>b'): every one is dropped, only the good note remains. The list is in README.md.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "Good note",
+              "detail": "Fine.",
+              "glyph": "check"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-text-allowed-codepoints-1",
+      "file": "manifests/notes-text-allowed-codepoints-1.json",
+      "description": "Assigned/unassigned code points just outside the rejected set are ALLOWED (title 'a<cp>b'): U+2065 (unassigned between two Cf ranges), U+200A, U+2010, U+E0000, U+FFFE, U+1F600, U+00A0, U+3000.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "a⁥b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a‐b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a󠀀b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a￾b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a😀b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a　b",
+              "detail": null,
+              "glyph": "star"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-text-allowed-codepoints-2",
+      "file": "manifests/notes-text-allowed-codepoints-2.json",
+      "description": "More neighbours of the rejected ranges that are ALLOWED: U+00AC, U+00AE, U+E0002, U+180D, U+205F, U+2070, U+13441, U+1D172.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "a¬b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a®b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a󠀂b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a᠍b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a⁰b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a𓑁b",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "a𝅲b",
+              "detail": null,
+              "glyph": "star"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-combining-count",
+      "file": "manifests/notes-combining-count.json",
+      "description": "Scalars, not graphemes: 20 x 'e'+U+0301 is 40 scalars (kept), one more scalar is 41 (dropped); a ZWJ emoji sequence is dropped (ZWJ is rejected).",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "éééééééééééééééééééé",
+              "detail": null,
+              "glyph": "star"
+            },
+            {
+              "title": "Good note",
+              "detail": "Fine.",
+              "glyph": "check"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-surrogate-pairs",
+      "file": "manifests/notes-surrogate-pairs.json",
+      "description": "Lengths count Unicode scalars: 40 emoji (4 UTF-8 bytes, 2 UTF-16 units each) fit, 41 do not.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀",
+              "detail": "🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉",
+              "glyph": "star"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-count-9",
+      "file": "manifests/notes-count-9.json",
+      "description": "9 valid notes: the first 8 are kept.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "Note 1",
+              "detail": null,
+              "glyph": "check"
+            },
+            {
+              "title": "Note 2",
+              "detail": null,
+              "glyph": "check"
+            },
+            {
+              "title": "Note 3",
+              "detail": null,
+              "glyph": "check"
+            },
+            {
+              "title": "Note 4",
+              "detail": null,
+              "glyph": "check"
+            },
+            {
+              "title": "Note 5",
+              "detail": null,
+              "glyph": "check"
+            },
+            {
+              "title": "Note 6",
+              "detail": null,
+              "glyph": "check"
+            },
+            {
+              "title": "Note 7",
+              "detail": null,
+              "glyph": "check"
+            },
+            {
+              "title": "Note 8",
+              "detail": null,
+              "glyph": "check"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-title-41",
+      "file": "manifests/notes-title-41.json",
+      "description": "A 41-scalar title: the note is dropped.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "Good note",
+              "detail": "Fine.",
+              "glyph": "check"
+            },
+            {
+              "title": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu",
+              "detail": null,
+              "glyph": "star"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-detail-81",
+      "file": "manifests/notes-detail-81.json",
+      "description": "An 81-scalar detail: the note is dropped.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "Good note",
+              "detail": "Fine.",
+              "glyph": "check"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-not-array",
+      "file": "manifests/notes-not-array.json",
+      "description": "notes is a string: treated as no notes.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "notes-element-not-object",
+      "file": "manifests/notes-element-not-object.json",
+      "description": "Non-object entries are skipped.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [
+            {
+              "title": "Good note",
+              "detail": "Fine.",
+              "glyph": "check"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "no-notes",
+      "file": "manifests/no-notes.json",
+      "description": "No notes at all: still an offer.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectNotes": [],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "requiredReason-160",
+      "file": "manifests/requiredReason-160.json",
+      "description": "Required with requiredReason 'rrrrrrrrrrrrrrrrrrrr'...: kept only when 1..160 plain scalars. The Required state itself is unaffected.",
+      "runs": [
+        {
+          "name": "required",
+          "expectRequiredReason": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "expect": {
+            "desktop": "Required:0.4.0",
+            "android": "Required:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "requiredReason-161",
+      "file": "manifests/requiredReason-161.json",
+      "description": "Required with requiredReason 'rrrrrrrrrrrrrrrrrrrr'...: kept only when 1..160 plain scalars. The Required state itself is unaffected.",
+      "runs": [
+        {
+          "name": "required",
+          "expectRequiredReason": null,
+          "expect": {
+            "desktop": "Required:0.4.0",
+            "android": "Required:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "requiredReason-with-newline",
+      "file": "manifests/requiredReason-with-newline.json",
+      "description": "Required with requiredReason 'line one\\nline two'...: kept only when 1..160 plain scalars. The Required state itself is unaffected.",
+      "runs": [
+        {
+          "name": "required",
+          "expectRequiredReason": null,
+          "expect": {
+            "desktop": "Required:0.4.0",
+            "android": "Required:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "requiredReason-bidi",
+      "file": "manifests/requiredReason-bidi.json",
+      "description": "Required with requiredReason 'pay\\u202e attention'...: kept only when 1..160 plain scalars. The Required state itself is unaffected.",
+      "runs": [
+        {
+          "name": "required",
+          "expectRequiredReason": null,
+          "expect": {
+            "desktop": "Required:0.4.0",
+            "android": "Required:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "requiredReason-markup",
+      "file": "manifests/requiredReason-markup.json",
+      "description": "Required with requiredReason 'Use <b>this</b>'...: kept only when 1..160 plain scalars. The Required state itself is unaffected.",
+      "runs": [
+        {
+          "name": "required",
+          "expectRequiredReason": null,
+          "expect": {
+            "desktop": "Required:0.4.0",
+            "android": "Required:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "released-invalid-date",
+      "file": "manifests/released-invalid-date.json",
+      "description": "released '2026-13-45': a real YYYY-MM-DD date (ASCII digits, year 0001-9999, leap days honoured) or dropped; display only, the offer stays.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectReleased": null,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "released-short",
+      "file": "manifests/released-short.json",
+      "description": "released '2026-1-1': a real YYYY-MM-DD date (ASCII digits, year 0001-9999, leap days honoured) or dropped; display only, the offer stays.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectReleased": null,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "released-text",
+      "file": "manifests/released-text.json",
+      "description": "released 'yesterday': a real YYYY-MM-DD date (ASCII digits, year 0001-9999, leap days honoured) or dropped; display only, the offer stays.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectReleased": null,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "released-leap-ok",
+      "file": "manifests/released-leap-ok.json",
+      "description": "released '2024-02-29': a real YYYY-MM-DD date (ASCII digits, year 0001-9999, leap days honoured) or dropped; display only, the offer stays.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectReleased": "2024-02-29",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "released-not-leap-2026",
+      "file": "manifests/released-not-leap-2026.json",
+      "description": "released '2026-02-29': a real YYYY-MM-DD date (ASCII digits, year 0001-9999, leap days honoured) or dropped; display only, the offer stays.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectReleased": null,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "released-not-leap-2100",
+      "file": "manifests/released-not-leap-2100.json",
+      "description": "released '2100-02-29': a real YYYY-MM-DD date (ASCII digits, year 0001-9999, leap days honoured) or dropped; display only, the offer stays.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectReleased": null,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "released-leap-2000",
+      "file": "manifests/released-leap-2000.json",
+      "description": "released '2000-02-29': a real YYYY-MM-DD date (ASCII digits, year 0001-9999, leap days honoured) or dropped; display only, the offer stays.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectReleased": "2000-02-29",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "released-year-0",
+      "file": "manifests/released-year-0.json",
+      "description": "released '0000-01-01': a real YYYY-MM-DD date (ASCII digits, year 0001-9999, leap days honoured) or dropped; display only, the offer stays.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectReleased": null,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "released-year-1",
+      "file": "manifests/released-year-1.json",
+      "description": "released '0001-01-01': a real YYYY-MM-DD date (ASCII digits, year 0001-9999, leap days honoured) or dropped; display only, the offer stays.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectReleased": "0001-01-01",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "released-year-9999",
+      "file": "manifests/released-year-9999.json",
+      "description": "released '9999-12-31': a real YYYY-MM-DD date (ASCII digits, year 0001-9999, leap days honoured) or dropped; display only, the offer stays.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectReleased": "9999-12-31",
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "released-arabic-digits",
+      "file": "manifests/released-arabic-digits.json",
+      "description": "released '٢٠٢٦-12-08': a real YYYY-MM-DD date (ASCII digits, year 0001-9999, leap days honoured) or dropped; display only, the offer stays.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectReleased": null,
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "urls-disallowed",
+      "file": "manifests/urls-disallowed.json",
+      "description": "Every URL violates the pinned shapes (and play.id is not our package): fields dropped, offer and notes stay.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectUrls": {
+            "desktop.tarball": "dropped",
+            "desktop.notesUrl": "dropped",
+            "desktop.releaseUrl": "dropped",
+            "android.apk": "dropped",
+            "android.notesUrl": "dropped",
+            "android.playId": "ignored"
+          },
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "play-id-foreign",
+      "file": "manifests/play-id-foreign.json",
+      "description": "Only play.id differs: ignored (the client uses its own package id).",
+      "runs": [
+        {
+          "name": "offer",
+          "expectUrls": {
+            "android.playId": "ignored",
+            "android.apk": "kept"
+          },
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "downloads-url-disallowed-with-valid-notes",
+      "file": "manifests/downloads-url-disallowed-with-valid-notes.json",
+      "description": "The tarball name is not the pinned one: the URL is dropped, the notes remain.",
+      "runs": [
+        {
+          "name": "offer",
+          "expectUrls": {
+            "desktop.tarball": "dropped",
+            "desktop.releaseUrl": "kept",
+            "desktop.notesUrl": "kept"
+          },
+          "expectNotesAndroid": [
+            {
+              "title": "Files has a list view",
+              "detail": "Switch between grid and list.",
+              "glyph": "files"
+            },
+            {
+              "title": "Faster reconnects",
+              "detail": "Back online in seconds after a Wi-Fi change.",
+              "glyph": "refresh"
+            },
+            {
+              "title": "Clearer Terminals",
+              "detail": "A plain message when the computer is offline.",
+              "glyph": "terminal"
+            },
+            {
+              "title": "Pairing fixed",
+              "detail": null,
+              "glyph": "swap"
+            }
+          ],
+          "expectNotes": [
+            {
+              "title": "Files has a list view",
+              "detail": "Switch between grid and list.",
+              "glyph": "files"
+            },
+            {
+              "title": "Faster reconnects",
+              "detail": "Back online in seconds after a Wi-Fi change.",
+              "glyph": "refresh"
+            },
+            {
+              "title": "Clearer Terminals",
+              "detail": "A plain message when the computer is offline.",
+              "glyph": "terminal"
+            },
+            {
+              "title": "Pairing fixed",
+              "detail": null,
+              "glyph": "swap"
+            }
+          ],
+          "expect": {
+            "desktop": "Offer:0.4.0",
+            "android": "Offer:0.4.0"
+          }
+        }
+      ]
+    }
+  ]
+}

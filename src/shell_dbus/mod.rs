@@ -80,7 +80,12 @@ pub const INTERFACE: &str = "derx06.desklink.com.Shell1";
 /// the client moves the bar on while `playing`) and `seekReason` (why the bar
 /// cannot seek, else empty); the `media-seek` action marks a seekable track and
 /// the `SeekMedia(device, position_ms)` method seeks it.
-const VERSION: u32 = 10;
+/// 11: `Desk` gains `update_available`, `update_version` and `update_required`
+/// (read-only: true while an update is on offer, the version to name, whether
+/// it is required) and the `ShowUpdate()` method, which only presents the
+/// DeskLink window and its update popup. An extension that does not know them
+/// ignores them; an app that does not send them never gets the call.
+const VERSION: u32 = 11;
 const INVALID_ARGS: &str = "org.freedesktop.DBus.Error.InvalidArgs";
 
 const XML: &str = r#"<node>
@@ -126,6 +131,7 @@ const XML: &str = r#"<node>
       <arg name="device_id" type="s" direction="in"/>
       <arg name="link" type="s" direction="in"/>
     </method>
+    <method name="ShowUpdate"/>
     <method name="Hello">
       <arg name="version" type="u" direction="in"/>
       <arg name="capabilities" type="as" direction="in"/>

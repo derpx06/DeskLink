@@ -91,6 +91,17 @@ share DeskLink's address space either way.
 | `--filesystem=xdg-download` | Where received files land. |
 | `--filesystem=~/DeskLink Bucket:create` | The Bucket folder, created on first use. |
 
+## The update check
+
+Once a day (and when you press Check for updates) DeskLink fetches one small signed file from the project's update
+address, compiled into the build (a release build has no other source). The request is an anonymous HTTPS GET: it
+carries the DeskLink version in its User-Agent and an `If-None-Match`, and no name, no device or install identifier,
+no cookie. The server can see your network address and the time, as any website can. The file is Ed25519-signed with
+the project's key and checked under a strict profile (size, JSON, canonical base64, signature, dates, links pinned to
+this project's release pages); anything else is ignored without a message. DeskLink only tells you a newer version
+exists and how to update for how you installed it; it never downloads, installs or runs anything. The `update_check`
+setting turns the daily check off. A build with no update address does no checking at all: no thread, no state file.
+
 ## Where DeskLink keeps its files
 
 `~/.config/desklink`, `~/.local/state/desklink` and `~/.cache/desklink` are

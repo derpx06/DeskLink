@@ -48,6 +48,12 @@ pub(super) struct Desk {
     pub(super) dnd_supported: bool,
     /// A session password is set.
     pub(super) has_password: bool,
+    /// An update is on offer (the update module's snapshot; false while
+    /// skipped, up to date, off or not set up).
+    pub(super) update_available: bool,
+    /// The version on offer ("0.4.0"), empty when none.
+    pub(super) update_version: String,
+    pub(super) update_required: bool,
 }
 
 impl Desk {
@@ -63,12 +69,18 @@ impl Desk {
         dict.insert("soundAvailable", self.sound_available);
         dict.insert("dndSupported", self.dnd_supported);
         dict.insert("hasPassword", self.has_password);
+        dict.insert("update_available", self.update_available);
+        dict.insert("update_version", self.update_version.as_str());
+        dict.insert("update_required", self.update_required);
         dict.end()
     }
 }
 
 pub(super) fn desk(devices: &[ShellDevice]) -> Desk {
     let settings = crate::device_links::config::app_settings();
+    let (update_available, update_version, update_required) = crate::update::handle()
+        .map(|update| crate::update::top_bar(&update.snapshot()))
+        .unwrap_or_default();
     Desk {
         keep_awake: settings.stay_awake,
         clipboard: settings.clipboard_sync,
@@ -83,6 +95,9 @@ pub(super) fn desk(devices: &[ShellDevice]) -> Desk {
         sound_available: crate::platform::reason("sound").is_none(),
         dnd_supported: crate::device_links::dnd::desk_state().is_some(),
         has_password: settings.session_password.is_some(),
+        update_available,
+        update_version,
+        update_required,
     }
 }
 

@@ -1,0 +1,15 @@
+{
+  "_comment": "TEST ONLY keys (kids test1/test2, never k1/k2). Release builds embed only the real keys; a unit test must fail if any kid starting with 'test' is present in a release key list.",
+  "keys": [
+    {
+      "kid": "test1",
+      "alg": "ed25519",
+      "public": "1ESE_TECkkgupykava9EhlyV7zD9PZRlo22v2jNoKS0"
+    },
+    {
+      "kid": "test2",
+      "alg": "ed25519",
+      "public": "gdqQHUmHGByYeiKgAEQ7735GcnSB-3C0oQopuPHKZ-g"
+    }
+  ]
+}

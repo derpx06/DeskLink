@@ -611,7 +611,7 @@ fn music_gets_a_previous_track_too() {
     assert!(list.contains(&"media-seek"));
     let shown = shell_media(&device).unwrap();
     assert_eq!((shown.position_ms, shown.length_ms), (30_000, 200_000));
-    assert_eq!(VERSION, 10);
+    assert_eq!(VERSION, 11);
 }
 
 /// The one table behind `SetSwitch`: every key resolves, a switch that is
@@ -736,6 +736,9 @@ fn the_settings_sound_and_counts_are_published() {
         sound_available: true,
         dnd_supported: false,
         has_password: true,
+        update_available: false,
+        update_version: String::new(),
+        update_required: false,
     }
     .to_variant();
     let desk = glib::VariantDict::new(Some(&desk));
@@ -926,4 +929,15 @@ fn notification_buttons_are_sentence_case() {
         );
     }
     assert!(checked >= 12, "the scan found the buttons ({checked})");
+}
+
+/// Interface 11: the Desk dict carries the three read-only update values
+/// under the names the extension reads, and `ShowUpdate` takes no argument.
+#[test]
+fn the_desk_dict_carries_the_update_values_and_show_update_has_no_arguments() {
+    let dict = glib::VariantDict::new(Some(&desk(&[]).to_variant()));
+    for key in ["update_available", "update_version", "update_required"] {
+        assert!(dict.contains(key), "{key}");
+    }
+    assert!(XML.contains("<method name=\"ShowUpdate\"/>"));
 }

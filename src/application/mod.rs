@@ -110,6 +110,8 @@ mod imp {
             crate::startup("GTK started");
             self.daemon.replace(Some(DaemonHandle::start()));
             crate::startup("daemon started");
+            // The update check: its own thread, inert without an address.
+            crate::update::start();
             // What this system can do, found out off the main thread.
             crate::platform::start();
             // The desk side of shared terminals (it leaves a running

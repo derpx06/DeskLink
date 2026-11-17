@@ -6,6 +6,8 @@ The first public release. It works and is still being shaped: expect rough
 edges and please report them. LAN only: the away-from-home relay is built but
 switched off.
 
+- Update check core (`src/update/`): a signed-manifest check that can tell the app when a newer DeskLink exists. It never downloads or installs anything and sends no identifier; it does nothing in a build without an update address. Top-bar interface 11 adds the read-only `update_available`, `update_version`, `update_required` and `ShowUpdate()`.
+
 **What it does**
 
 - Phone screen on the desktop, with hardware H.264 where the phone supports it.
