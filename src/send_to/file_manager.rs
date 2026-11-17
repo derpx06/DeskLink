@@ -793,6 +793,7 @@ mod tests {
             unreadable: 3,
             special: 1,
             protected: 1,
+            badname: 1,
         };
         let text = mixed.message().unwrap();
         for part in [
