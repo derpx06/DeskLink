@@ -95,11 +95,16 @@ fn row_label(device: &DeviceView, words: &Presentation, current: bool) -> String
     )
 }
 
-/// Every label under `widget`.
+/// Every label under `widget`, not those in a popover of it (the phone
+/// switcher belongs to the card but is not part of its face: its names and
+/// "Pair another phone" must stay).
 fn labels_in(widget: &gtk::Widget) -> Vec<gtk::Label> {
     let mut out = Vec::new();
     let mut stack = vec![widget.clone()];
     while let Some(next) = stack.pop() {
+        if next.is::<gtk::Popover>() {
+            continue;
+        }
         if let Some(label) = next.downcast_ref::<gtk::Label>() {
             out.push(label.clone());
         }
@@ -297,12 +302,15 @@ impl Sidebar {
                 }
             }
             // The icon and its count centred in the rail.
+            // Icons in one column, the count right after: centring the group put
+            // the bell left of the others when it had a count.
             if let Some(content) = row.child() {
                 content.set_halign(if rail {
-                    gtk::Align::Center
+                    gtk::Align::Start
                 } else {
                     gtk::Align::Fill
                 });
+                content.set_margin_start(if rail { 5 } else { 0 });
             }
             if rail && row.tooltip_text().is_none() {
                 row.set_tooltip_text(Some(title));

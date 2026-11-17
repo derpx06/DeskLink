@@ -121,6 +121,7 @@ menubutton.device-card > button:focus-visible { outline: 2px solid @dl_accent_te
 /* The rail (860-1000sp): icons and counts only, centred, no room for padding. */
 .navigation-sidebar.rail { padding: 0 6px; }
 .navigation-sidebar.rail > row { padding: 0 4px; min-width: 0; }
+.navigation-sidebar.rail .count-badge { min-width: 14px; min-height: 14px; font-size: 0.7em; padding: 0 2px; }
 .navigation-sidebar > row:focus-visible { outline: 2px solid @dl_accent_text; outline-offset: -2px; }
 .navigation-sidebar > row:disabled { opacity: 0.38; }
 .sidebar-footer { padding-top: 8px; padding-bottom: 12px; }

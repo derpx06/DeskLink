@@ -604,23 +604,47 @@ fn the_other_pages_use_a_big_window() {
 fn the_sidebar_is_a_narrow_rail_on_a_middling_window() {
     use adw::subclass::prelude::ObjectSubclassIsExt;
     crate::test_display::run(|| {
-        let window = home_window("paired", 900);
+        // Live: created wide, then resized into the rail's range.
+        let window = home_window("paired", 1280);
         let imp = window.imp();
+        assert!(!imp.rail.get(), "the full list at 1280 px");
         let names = || {
             named_widgets(imp.nav_list.upcast_ref(), "")
                 .into_iter()
                 .filter(|w| w.has_css_class("nav-label"))
                 .collect::<Vec<_>>()
         };
-        let search_buttons = || named_widgets(imp.sidebar_header.upcast_ref(), "rail-hide");
-        assert_eq!(imp.wide_breakpoint.condition().is_some(), true);
+        window.set_default_size(900, 700);
+        window.present();
+        spin();
+        let header_buttons = || named_widgets(imp.sidebar_header.upcast_ref(), "rail-hide");
+        // The phone switcher's popover is the card's, not its face: its words stay.
+        let switcher_words = || {
+            let mut out = Vec::new();
+            let mut stack = vec![imp
+                .device_card
+                .popover()
+                .expect("the switcher")
+                .upcast::<gtk::Widget>()];
+            while let Some(next) = stack.pop() {
+                if let Some(label) = next.downcast_ref::<gtk::Label>() {
+                    out.push((label.label().to_string(), label.get_visible()));
+                }
+                let mut child = next.first_child();
+                while let Some(c) = child {
+                    child = c.next_sibling();
+                    stack.push(c);
+                }
+            }
+            out
+        };
         assert!(imp.rail.get(), "the breakpoint applied at 900 px");
         assert!(
             names().iter().all(|label| !label.is_visible()),
             "names hidden"
         );
         assert!(
-            search_buttons().iter().all(|b| !b.is_visible()),
+            header_buttons().iter().all(|b| !b.is_visible()),
             "header buttons hidden"
         );
         assert!(!imp.sidebar_header.shows_title(), "no title");
@@ -634,6 +658,15 @@ fn the_sidebar_is_a_narrow_rail_on_a_middling_window() {
             .next()
             .expect("the Home row");
         assert_eq!(home.tooltip_text().as_deref(), Some("Home"));
+        let words = switcher_words();
+        assert!(
+            words.iter().any(|(text, _)| text == "Pair another phone"),
+            "the pair row exists: {words:?}"
+        );
+        assert!(
+            words.iter().all(|(_, visible)| *visible),
+            "the switcher keeps its words: {words:?}"
+        );
         let tip = imp.device_card.tooltip_text().expect("the card's tooltip");
         assert!(tip.contains("Pixel 9"), "the card says who: {tip}");
         assert!(imp.nav_list.has_css_class("rail"));
@@ -646,7 +679,7 @@ fn the_sidebar_is_a_narrow_rail_on_a_middling_window() {
         assert!(!imp.rail.get(), "the full list above 1000 px");
         assert!(names().iter().all(|label| label.is_visible()), "names back");
         assert!(
-            search_buttons().iter().all(|b| b.is_visible()),
+            header_buttons().iter().all(|b| b.is_visible()),
             "header buttons back"
         );
         assert_eq!(home.tooltip_text(), None);
