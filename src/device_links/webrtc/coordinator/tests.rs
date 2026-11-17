@@ -787,6 +787,13 @@ fn transfer_through_cuts(
         cuts += 1;
         assert!(cuts <= at_most, "still not there after {cuts} cuts");
         chaos.blackhole(true);
+        // The receiver may have finished in the gap between the last look and
+        // the cut (the Every soak cuts on a clock): a file already placed is
+        // the end of the transfer, not something to resume.
+        if let Ok(completed) = rig.answerer_done.try_recv() {
+            chaos.blackhole(false);
+            break completed;
+        }
         std::thread::sleep(Duration::from_millis(300));
         rig.cut();
         chaos.blackhole(false);
