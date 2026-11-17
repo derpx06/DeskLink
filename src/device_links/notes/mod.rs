@@ -35,7 +35,7 @@ use wire::*;
 // The crate-facing surface (everything else stays inside).
 pub(crate) use edits::{
     add_snippet, delete_snippet, duplicate_copies_preview, edit_note, edit_note_from, new_note,
-    note, notes, remove_duplicate_copies, snippets,
+    new_note_refusal, note, notes, remove_duplicate_copies, snippets,
 };
 pub(crate) use model::{Note, Snippet};
 

@@ -66,10 +66,16 @@ pub(super) fn notes_words(count: usize) -> String {
     }
 }
 
-/// Saves `text` as a new note (the same store and sync as the Notes page);
-/// false when the store is full.
-pub(super) fn quick_add(text: &str) -> bool {
-    notes::new_note(text.trim()).is_some()
+/// Saves `text` as a new note (the same store, bound and sync as the Notes
+/// page); why not, in words, when it cannot (too long, or the store is full).
+pub(super) fn quick_add(text: &str) -> Result<(), &'static str> {
+    let text = text.trim();
+    if let Some(why) = notes::new_note_refusal(text) {
+        return Err(why);
+    }
+    notes::new_note(text)
+        .map(|_| ())
+        .ok_or("Too many notes (2000 at most)")
 }
 
 pub(super) fn notes_card(win: &DesklinkWindow, device: &DeviceView) -> gtk::Box {
@@ -187,13 +193,15 @@ pub(super) fn notes_card(win: &DesklinkWindow, device: &DeviceView) -> gtk::Box 
         if text.trim().is_empty() {
             return;
         }
-        if quick_add(&text) {
-            // The store changed: Home is redrawn from it, the entry empty.
-            DRAFT.with(|draft| draft.borrow_mut().clear());
-            entry.set_text("");
-            toast_from(entry, "Note saved");
-        } else {
-            toast_from(entry, "Too many notes (2000 at most)");
+        match quick_add(&text) {
+            Ok(()) => {
+                // The store changed: Home is redrawn from it, the entry empty.
+                DRAFT.with(|draft| draft.borrow_mut().clear());
+                entry.set_text("");
+                toast_from(entry, "Note saved");
+            }
+            // Nothing is thrown away: the draft stays to be shortened.
+            Err(why) => toast_from(entry, why),
         }
     });
     body.append(&entry);

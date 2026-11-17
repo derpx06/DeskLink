@@ -913,3 +913,69 @@ fn a_failing_click_dismisses_its_optimistic_toast() {
         ));
     });
 }
+
+/// The dial pad dials with the selected phone, not an arbitrary one: with two
+/// phones that can call, `pick_phone` takes the wanted one, and without a
+/// wish it is the same phone every time (by name, then id).
+#[test]
+fn a_call_goes_out_from_the_wanted_phone_and_otherwise_deterministically() {
+    use crate::device_links::packet::PACKET_TYPE_TELEPHONY_REQUEST;
+    let phone = |name: &str, id: &str| {
+        let mut device = super::debug_fake_device("paired", name);
+        device.id = id.into();
+        device.trusted = true;
+        device.feature_transport_ready = true;
+        device
+            .incoming_capabilities
+            .push(PACKET_TYPE_TELEPHONY_REQUEST.to_string());
+        device
+    };
+    let devices = || vec![phone("Pixel", "p2"), phone("Galaxy", "g1")];
+    let name = |device: Option<DeviceView>| device.map(|device| device.name);
+    assert_eq!(
+        name(super::calls::pick_phone(devices(), Some("p2"))),
+        Some("Pixel".into()),
+        "the wanted phone, though another sorts first"
+    );
+    assert_eq!(
+        name(super::calls::pick_phone(devices(), None)),
+        Some("Galaxy".into()),
+        "no wish: by name"
+    );
+    assert_eq!(
+        name(super::calls::pick_phone(
+            devices().into_iter().rev().collect(),
+            None
+        )),
+        Some("Galaxy".into()),
+        "whatever order the map gave"
+    );
+    assert_eq!(
+        super::calls::pick_phone(devices(), Some("gone")).map(|d| d.name),
+        None
+    );
+}
+
+/// The banner's Details shows the error the banner shows: a passing error
+/// that arrives while it is up does not replace the text behind it.
+#[test]
+fn details_opens_the_banners_error_not_a_later_passing_one() {
+    crate::test_display::run(|| {
+        let resources = crate::load_resources().expect("the bundled resources");
+        gio::resources_register(&resources);
+        let app = adw::Application::builder()
+            .application_id("derx06.desklink.com.test")
+            .build();
+        let window = DesklinkWindow::new(&app);
+        let (daemon, _commands) = DaemonHandle::detached();
+        window.set_daemon(daemon);
+        window.report_error("Trusted device certificate changed", false);
+        window.report_error("something small and passing went wrong", false);
+        assert!(window.imp().error_banner.is_revealed());
+        assert_eq!(
+            window.imp().last_raw_error.borrow().as_str(),
+            "Trusted device certificate changed",
+            "the banner's own raw error"
+        );
+    });
+}

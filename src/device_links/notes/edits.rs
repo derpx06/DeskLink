@@ -147,8 +147,31 @@ pub(crate) fn new_note(body: &str) -> Option<String> {
     Some(id)
 }
 
+/// Why a new note with `body` would be refused for its size, in the words
+/// the editor uses: the same bound as an edit (20 KiB, one packet), so a
+/// note that could never sync or be edited is not created.
+pub(crate) fn new_note_refusal(body: &str) -> Option<&'static str> {
+    if body.len() > MAX_NOTE_BYTES {
+        return Some(TOO_LONG);
+    }
+    let probe = Note {
+        id: uuid::Uuid::nil().to_string(),
+        title: String::new(),
+        body: body.to_string(),
+        pinned: false,
+        created: 0,
+        modified: 0,
+        parent: 0,
+        ancestors: Vec::new(),
+        deleted: false,
+    };
+    (!fits_one_packet(&probe)).then_some(TOO_LONG)
+}
+
 pub(super) fn create_in_shelf(shelf: &mut Shelf, body: &str) -> Option<String> {
-    if shelf.notes.values().filter(|note| !note.deleted).count() >= MAX_NOTES {
+    if shelf.notes.values().filter(|note| !note.deleted).count() >= MAX_NOTES
+        || new_note_refusal(body).is_some()
+    {
         return None;
     }
     let now = now_ms();

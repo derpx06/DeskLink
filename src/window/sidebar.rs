@@ -378,7 +378,7 @@ impl Sidebar {
         let moving = win.daemon().map_or(0, |daemon| {
             super::transfers::rows(&daemon)
                 .iter()
-                .filter(|row| row.device_id == device.id || row.device_id.is_empty())
+                .filter(|row| super::transfers::row_belongs(row, &device.id))
                 .count()
         });
         self.update_rows(device, moving);

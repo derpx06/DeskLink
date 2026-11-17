@@ -224,6 +224,8 @@ pub(super) fn show(win: &DesklinkWindow) {
         .title("Dial")
         .content_width(340)
         .build();
+    // The pad suggests the selected phone's contacts: it dials with that phone.
+    let caller = super::calls::selected_caller(win);
     let (weak_dialog, weak_win) = (dialog.downgrade(), win.downgrade());
     let (clear_dialog,) = (dialog.downgrade(),);
     let pad = pad(
@@ -234,7 +236,7 @@ pub(super) fn show(win: &DesklinkWindow) {
                 dialog.close();
             }
             if let Some(win) = weak_win.upgrade() {
-                super::confirm_dial(&win, &number, None);
+                super::confirm_dial(&win, &number, caller.as_deref());
             }
         },
         move || {

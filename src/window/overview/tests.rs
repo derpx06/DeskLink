@@ -950,3 +950,101 @@ fn the_quick_note_entry_keeps_the_focus_when_its_card_changes_column() {
         window.close();
     });
 }
+
+/// The Home quick-note path obeys the note bound: a paste of 30 KiB is
+/// refused with the editor's words, nothing is stored and the draft stays to
+/// be shortened. (Needs a display.)
+#[test]
+fn a_quick_note_over_the_bound_is_refused_and_the_draft_is_kept() {
+    let _shelf = fresh_notes();
+    assert_eq!(
+        notes_card::quick_add(&"x".repeat(30 * 1024)),
+        Err(crate::device_links::notes::TOO_LONG)
+    );
+    assert!(crate::device_links::notes::notes().is_empty());
+    crate::test_display::run(|| {
+        let window = home_window("paired", 1280);
+        let entry = shown(&window, "home-note-entry")
+            .and_downcast::<gtk::Entry>()
+            .expect("the quick entry");
+        let big = "x".repeat(30 * 1024);
+        entry.set_text(&big);
+        entry.emit_activate();
+        assert_eq!(entry.text().len(), big.len(), "the draft is kept");
+        assert!(
+            crate::device_links::notes::notes().is_empty(),
+            "nothing saved"
+        );
+        entry.set_text("");
+        window.close();
+    });
+}
+
+/// Two phones, the second selected: Home's transfer card takes its progress
+/// from the second phone's transfer, never from the first phone's, on every
+/// tick. (Needs a display.)
+#[test]
+fn home_shows_the_selected_phones_transfer_not_another_phones() {
+    use crate::device_links::webrtc::transfer_board::TransferRow;
+    use adw::subclass::prelude::ObjectSubclassIsExt;
+    crate::test_display::run(|| {
+        let window = home_window("paired", 1280);
+        let second = super::super::debug_fake_device("paired", "Galaxy");
+        let (first_id, second_id) = (
+            window.imp().fake_devices.borrow()[0].id.clone(),
+            second.id.clone(),
+        );
+        window.imp().fake_devices.borrow_mut().push(second);
+        let row = |id: &str, device: &str, done: u64| TransferRow {
+            id: id.into(),
+            device_id: device.into(),
+            name: "movie.mkv".into(),
+            incoming: false,
+            done,
+            total: 100,
+            preparing: false,
+            paused: false,
+        };
+        // The first phone's transfer is first on the board.
+        super::super::transfers::FAKE_ROWS.with(|rows| {
+            *rows.borrow_mut() = vec![row("a", &first_id, 10), row("b", &second_id, 70)];
+        });
+        window.select_device(&second_id);
+        window.refresh_devices();
+        spin();
+        // A tick with Home unchanged refreshes it in place.
+        window.refresh_devices();
+        spin();
+        let bar = shown(&window, "overview-transfer-bar")
+            .and_downcast::<gtk::ProgressBar>()
+            .expect("the transfer bar");
+        assert!((bar.fraction() - 0.7).abs() < 0.01, "{}", bar.fraction());
+        super::super::transfers::FAKE_ROWS.with(|rows| rows.borrow_mut().clear());
+        window.close();
+    });
+}
+
+/// One predicate for the selected phone's transfers on every surface.
+#[test]
+fn only_the_selected_phones_transfers_are_its_own() {
+    use crate::device_links::webrtc::transfer_board::TransferRow;
+    let row = |id: &str, device: &str| TransferRow {
+        id: id.into(),
+        device_id: device.into(),
+        name: "f".into(),
+        incoming: false,
+        done: 0,
+        total: 1,
+        preparing: false,
+        paused: false,
+    };
+    let rows = vec![row("a", "A"), row("b", "B"), row("c", "")];
+    let ids = |device: &str| -> Vec<String> {
+        super::super::transfers::rows_for(device, rows.clone())
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+    };
+    assert_eq!(ids("B"), ["b", "c"], "another phone's transfer is not B's");
+    assert_eq!(ids("A"), ["a", "c"]);
+}

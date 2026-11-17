@@ -55,6 +55,20 @@ thread_local! {
     pub(crate) static FAKE_ROWS: RefCell<Vec<TransferRow>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Whether `row` is `device_id`'s (a row with no phone is every phone's).
+/// The one predicate for every surface that shows transfers of the selected
+/// phone: Home, the Files page, the sidebar count.
+pub(super) fn row_belongs(row: &TransferRow, device_id: &str) -> bool {
+    row.device_id == device_id || row.device_id.is_empty()
+}
+
+/// `rows` that belong to `device_id`.
+pub(super) fn rows_for(device_id: &str, rows: Vec<TransferRow>) -> Vec<TransferRow> {
+    rows.into_iter()
+        .filter(|row| row_belongs(row, device_id))
+        .collect()
+}
+
 /// The transfers moving now, injected ones included in debug builds.
 pub(super) fn rows(daemon: &DaemonHandle) -> Vec<TransferRow> {
     // Fakes first: one that names a lane is put on the real board.

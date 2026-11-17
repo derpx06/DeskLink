@@ -308,7 +308,7 @@ pub(super) fn notifications_card(device: &DeviceView) -> gtk::Box {
 fn transfer_progress(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Box> {
     let row = crate::window::transfers::rows(daemon)
         .into_iter()
-        .find(|row| row.device_id == device.id || row.device_id.is_empty())?;
+        .find(|row| crate::window::transfers::row_belongs(row, &device.id))?;
     let progress = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)

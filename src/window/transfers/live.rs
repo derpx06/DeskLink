@@ -88,7 +88,9 @@ fn refresh(
 ) {
     let device = selected.1.as_str();
     failures.sync(daemon, &selected.0);
-    let rows = rows(daemon);
+    // This phone's only: another phone's card here would carry this phone's
+    // name, and its Cancel would cancel that other phone's transfer.
+    let rows = crate::window::transfers::rows_for(&selected.0, rows(daemon));
     let mut widgets = widgets.borrow_mut();
     // Cards whose transfer has ended.
     widgets.retain(|id, shown| {

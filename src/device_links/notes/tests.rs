@@ -569,3 +569,26 @@ fn a_full_shelf_takes_straight_edits_but_no_conflict_copies() {
     );
     assert_eq!(shelf.notes["n2"].body, "old");
 }
+
+/// A new note obeys the editor's bound: one the editor would refuse to save
+/// at once (and a phone would refuse to take) is not created, and the shelf
+/// is left as it was. The Home quick-note path went through here unchecked.
+#[test]
+fn a_new_note_over_the_editors_bound_is_not_created() {
+    let _shelf = ONE_SHELF.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = std::env::temp_dir().join(format!("desklink-notes-{}", uuid::Uuid::new_v4()));
+    install(dir.clone());
+    let before = super::notes().len();
+    let big = "x".repeat(MAX_NOTE_BYTES + 1);
+    assert_eq!(super::new_note_refusal(&big), Some(TOO_LONG));
+    assert_eq!(new_note(&big), None, "refused");
+    assert_eq!(super::notes().len(), before, "the shelf is unchanged");
+    let fits = "x".repeat(MAX_NOTE_BYTES);
+    assert_eq!(super::new_note_refusal("a short note"), None);
+    // At the bound exactly: refused only if it would not fit a packet,
+    // which is what the editor decides too.
+    assert_eq!(
+        super::new_note_refusal(&fits).is_none(),
+        new_note(&fits).is_some()
+    );
+}

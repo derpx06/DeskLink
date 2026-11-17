@@ -360,7 +360,6 @@ impl DesklinkWindow {
     pub(super) fn report_error(&self, raw: &str, connected: bool) {
         let imp = self.imp();
         let (message, lasting) = friendly_error(raw);
-        imp.last_raw_error.replace(raw.to_string());
         if connected && is_offline_message(&message) {
             debug_log!("[UI] Offline report while a device is connected: {raw}");
             return;
@@ -368,6 +367,9 @@ impl DesklinkWindow {
         if lasting {
             // An error takes the banner over; a standing problem returns to
             // it once the error's time is up.
+            // Details opens what the banner shows: only a lasting error sets it
+            // (a toast carries its own raw text as its action's target).
+            imp.last_raw_error.replace(raw.to_string());
             imp.sticky_id.replace(None);
             imp.banner_since.set(Some(std::time::Instant::now()));
             imp.error_banner.set_title(&message);

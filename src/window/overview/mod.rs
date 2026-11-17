@@ -70,7 +70,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         .collect();
     let transfers: Vec<String> = super::transfers::rows(daemon)
         .into_iter()
-        .filter(|row| row.device_id == device.id || row.device_id.is_empty())
+        .filter(|row| super::transfers::row_belongs(row, &device.id))
         .map(|row| row.id)
         .collect();
     let minute = clock_time(gtk::glib::DateTime::now_local().ok());
@@ -485,7 +485,13 @@ fn refresh_in_place(win: &DesklinkWindow, daemon: &DaemonHandle) {
             }
         }
     }
-    let row = super::transfers::rows(daemon).into_iter().next();
+    // The selected phone's own transfer, never another phone's (the card
+    // was built for this phone).
+    let row = win.selected_id().and_then(|id| {
+        super::transfers::rows_for(&id, super::transfers::rows(daemon))
+            .into_iter()
+            .next()
+    });
     for widget in named_widgets(&root, "overview-transfer-") {
         let Some(row) = row.as_ref() else {
             continue;

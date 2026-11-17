@@ -682,6 +682,29 @@ thread_local! {
 /// meaning to. Every dial goes through here and nowhere else. The default
 /// answer is Cancel, so a stray Enter never places a call. With `phone`, that
 /// phone places the call; else the first that can.
+/// The phone a call or message goes out from: with `wanted`, that phone (or
+/// none: a contact belongs to its phone); without, the first that can, by
+/// name then id, so the choice is the same every time.
+pub(super) fn pick_phone(mut devices: Vec<DeviceView>, wanted: Option<&str>) -> Option<DeviceView> {
+    devices.retain(|device| {
+        device.trusted
+            && device.feature_transport_ready
+            && wanted.is_none_or(|id| id == device.id)
+            && can_send_feature(device, PACKET_TYPE_TELEPHONY_REQUEST)
+    });
+    devices.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
+    devices.into_iter().next()
+}
+
+/// The selected phone's id if it can place calls now: what a pad opened on
+/// that phone dials with (otherwise any phone that can, `pick_phone`).
+pub(super) fn selected_caller(win: &DesklinkWindow) -> Option<String> {
+    use adw::subclass::prelude::ObjectSubclassIsExt;
+    let id = win.selected_id()?;
+    let daemon = win.imp().daemon.borrow().clone()?;
+    pick_phone(daemon.devices(), Some(&id)).map(|device| device.id)
+}
+
 pub(crate) fn confirm_dial(win: &DesklinkWindow, number: &str, phone: Option<&str>) {
     confirm_telephony(win, number, phone, "dial");
 }
@@ -729,12 +752,7 @@ fn confirm_telephony(
     };
     // Only a request that will be asked uses up the allowance.
     DIAL_ASKED.with(|last| last.set(Some(now)));
-    let phone = daemon
-        .devices()
-        .into_iter()
-        .filter(|device| device.trusted && device.feature_transport_ready)
-        .filter(|device| phone.is_none_or(|id| id == device.id))
-        .find(|device| can_send_feature(device, PACKET_TYPE_TELEPHONY_REQUEST));
+    let phone = pick_phone(daemon.devices(), phone);
     let Some(phone) = phone else {
         let dialog = adw::AlertDialog::new(
             Some("No Phone to Call With"),
