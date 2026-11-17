@@ -668,14 +668,22 @@ fn an_awake_phone_is_probed_every_two_seconds_and_judged_on_both_paths() {
             |_| lan_dead_after(dozing, false, data),
         )
     };
-    assert!(tick(s(1), false, None).probe.is_empty());
-    assert_eq!(
-        tick(s(2), false, None).probe.len(),
-        1,
-        "awake: probed at 2 s"
+    assert!(
+        tick(s(5), false, Some(s(1))).probe.is_empty(),
+        "healthy data: 10 s"
     );
-    assert!(tick(s(2), true, None).probe.is_empty(), "dozing: 10 s");
-    assert_eq!(tick(s(10), true, None).probe.len(), 1);
+    assert_eq!(tick(s(10), false, Some(s(1))).probe.len(), 1);
+    assert!(tick(s(1), false, Some(s(4))).probe.is_empty());
+    assert_eq!(
+        tick(s(2), false, Some(s(4))).probe.len(),
+        1,
+        "suspicious: 2 s"
+    );
+    assert!(
+        tick(s(2), true, Some(s(60))).probe.is_empty(),
+        "dozing: 10 s"
+    );
+    assert_eq!(tick(s(10), true, Some(s(60))).probe.len(), 1);
     assert!(tick(s(8), false, None).dead.is_empty(), "LAN alone: 30 s");
     assert_eq!(
         tick(s(8), false, Some(s(9))).dead.len(),
