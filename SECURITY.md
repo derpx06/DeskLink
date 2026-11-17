@@ -108,6 +108,18 @@ setting turns the daily check off. A build with no update address does no checki
 created `0700` and their files `0600` (older versions made them readable by
 other users; DeskLink tightens them once at start).
 
+## Update check
+
+DeskLink fetches the update server's `latest.json` over HTTPS about once a day, and when you open the app
+if the last answer is old. The request carries no identifier and no account, no cookies and no query
+string; only DeskLink's version number, in the `User-Agent`. The server operator (Firebase Hosting) can see
+your network address and the time, as any website can. The file is signed (Ed25519, public keys compiled
+into DeskLink); anything unsigned, tampered, expired, older than one already seen, or with an address
+outside the project's own is ignored. A manifest is a report that a version exists: it cannot run a
+command or install anything, and DeskLink only shows an update window when you open the app. Builds have no
+way to point the check elsewhere (only debug builds read an address override). Turn it off in Settings >
+About; with it off no update request is made.
+
 ## What the relay can and cannot see
 
 The relay ([`relay/`](relay/)) only helps two paired devices find each other

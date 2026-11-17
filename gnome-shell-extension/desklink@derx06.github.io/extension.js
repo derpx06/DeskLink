@@ -36,7 +36,7 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
 import {BatteryRing, fillMenu, shortStatus, statusLine, styleVariant} from './menu.js';
-import {has, looksLikeLink, panelBadge, pillVisible, visibilityGate} from './model.js';
+import {has, looksLikeLink, panelBadge, pillVisible, updateInfo, visibilityGate} from './model.js';
 import {PhoneCalls, PhoneNotifications} from './notifications.js';
 
 const BUS_NAME = 'derx06.desklink.com';
@@ -87,6 +87,7 @@ const ShellProxy = Gio.DBusProxy.makeProxyWrapper(`<node>
       <arg name="device_id" type="s" direction="in"/>
       <arg name="link" type="s" direction="in"/>
     </method>
+    <method name="ShowUpdate"/>
     <method name="Hello">
       <arg name="version" type="u" direction="in"/>
       <arg name="capabilities" type="as" direction="in"/>
@@ -468,7 +469,7 @@ export default class DeskLinkExtension extends Extension {
         toggle.checked = !!selected?.ready;
         toggle._setTitle(selected?.name ?? 'DeskLink', selected ? shortStatus(selected) : 'Pair a phone');
         this._indicator.showConnected(running && !locked && devices.some(device => device.ready),
-            panelBadge(devices));
+            panelBadge(devices, updateInfo(desk)));
         if (!locked)
             this._fillMenu(toggle.menu, this._qs, devices, selected, desk);
 
@@ -683,7 +684,7 @@ export default class DeskLinkExtension extends Extension {
         this._pillGate.set(pillVisible({running, pillOn: desk.pill, items, devices}));
         this._button.showLabel(this._chipText());
         const ongoing = items[0] ? `, ${items[0].title || items[0].app}` : '';
-        this._button.showState(!!selected?.ready, panelBadge(devices).badge,
+        this._button.showState(!!selected?.ready, panelBadge(devices, updateInfo(desk)).badge,
             selected ? `${selected.name}, ${statusLine(selected)}${ongoing}` : 'no phone connected');
         if (items.length > 0)
             this._startChipTimer();

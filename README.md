@@ -213,6 +213,13 @@ and [`relay/README.md`](relay/README.md).
 
 Details are in [`SECURITY.md`](SECURITY.md).
 
+## Updates
+
+DeskLink tells you, when you open it, that a newer version exists and shows the right way to update for
+how you installed it (it never installs anything itself). The check is one anonymous HTTPS request a day
+for a signed file; no name, device ID or pairing data is sent. Turn it off in Settings > About. Details:
+[`docs/UPDATES.md`](docs/UPDATES.md).
+
 ## What it does not do
 
 Browsing the phone's files, the presentation remote, system volume, run

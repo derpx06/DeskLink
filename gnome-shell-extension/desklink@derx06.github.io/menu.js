@@ -21,7 +21,7 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Slider} from 'resource:///org/gnome/shell/ui/slider.js';
 
 import {
-    EMPTY, NOW_ROWS, bodyHeight, has, tilesNote, chipState, footer, headerGlyph, headerLine, liveWords, offlineHint, mediaClock, mediaPosition, menuBlocks, moreSummary, quickTiles, sections, seekReason,
+    EMPTY, NOW_ROWS, bodyHeight, has, tilesNote, chipState, footer, headerGlyph, headerLine, liveWords, offlineHint, mediaClock, mediaPosition, menuBlocks, moreSummary, quickTiles, sections, seekReason, updateInfo,
     seekThrottle, statusLine, timer, duration,
 } from './model.js';
 
@@ -666,7 +666,8 @@ export function fillMenu(menu, ctx) {
 
     // A short screen (1080p at 200 %): tiles first, one row of "now".
     const short = (Main.layoutManager.primaryMonitor?.height ?? 1000) < 700;
-    const blocks = menuBlocks(selected, devices, activities, short);
+    const update = updateInfo(desk);
+    const blocks = menuBlocks(selected, devices, activities, short, update);
     if (blocks.includes('empty')) {
         const empty = column({style_class: 'desklink-empty'});
         empty.add_child(label(EMPTY.title, 'desklink-row-title'));
@@ -792,6 +793,20 @@ export function fillMenu(menu, ctx) {
             if (why)
                 grid.add_child(wrapped(dim(label(why, 'desklink-row-detail'))));
             body.addMenuItem(row(grid));
+            break;
+        }
+        case 'update': {
+            // One quiet row under the tiles; it only asks the app to show its update window.
+            const item = new PopupMenu.PopupBaseMenuItem({style_class: 'desklink-row desklink-inset-row desklink-update'});
+            item.add_child(new St.Icon({icon_name: 'software-update-available-symbolic', style_class: 'desklink-row-icon', y_align: Clutter.ActorAlign.CENTER}));
+            const words = column();
+            words.add_child(wrapped(label(update.title, 'desklink-row-title')));
+            words.add_child(wrapped(dim(label(update.detail, 'desklink-row-detail'))));
+            item.add_child(words);
+            item.accessible_name = update.name;
+            item.connect('activate', () => ctx.call('ShowUpdate', []));
+            ctx.track?.(item, 'update');
+            body.addMenuItem(item);
             break;
         }
         case 'media':

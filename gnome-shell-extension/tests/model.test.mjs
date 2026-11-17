@@ -6,7 +6,7 @@ import {fileURLToPath} from 'node:url';
 
 import {
     bodyHeight, everythingSent, footer, headerLine, lastSeen, mediaClock, mediaPosition, menuBlocks, moreSummary, seekReason, seekThrottle,
-    looksLikeLink, quickTiles, headerGlyph, offlineHint, EMPTY, chipState, panelBadge, pillVisible, visibilityGate, has, tilesNote, sections, sessionLine, shortStatus, statusLine, timer, duration, checking,
+    looksLikeLink, quickTiles, headerGlyph, offlineHint, EMPTY, chipState, panelBadge, pillVisible, visibilityGate, has, tilesNote, sections, sessionLine, shortStatus, updateInfo, statusLine, timer, duration, checking,
 } from '../desklink@derx06.github.io/model.js';
 
 const ALL_ACTIONS = ['open', 'ring', 'lock', 'send-files', 'send-link', 'send-clipboard', 'ping', 'show-screen',
@@ -526,7 +526,7 @@ test('a ready but quiet phone reads "Checking connection…" and its tiles grey 
     assert.ok(checking(quiet));
     assert.equal(statusLine(quiet), 'Checking connection…');
     assert.equal(headerLine(quiet), 'Checking connection…');
-    assert.equal(shortStatus(quiet), 'Checking connection…');
+    assert.equal(shortStatus(quiet), 'Checking…');
     assert.ok(quickTiles(quiet).every(tile => !tile.enabled));
     assert.match(tilesNote(quiet), /Checking the connection to/);
     assert.equal(chipState(quiet).state, 'connecting');
@@ -536,4 +536,41 @@ test('a ready but quiet phone reads "Checking connection…" and its tiles grey 
     assert.ok(quickTiles(phone()).some(tile => tile.enabled));
     // Not ready: the old words win.
     assert.equal(statusLine(phone({ready: false, quiet: true})), 'Connecting…');
+});
+
+// The update row and dot: only for a desk that says `update_available === true`; an old desk sends nothing.
+test('the update row reads the desk, hides when absent, and treats the version as plain text', () => {
+    assert.equal(updateInfo({}), null);
+    assert.equal(updateInfo(undefined), null);
+    assert.equal(updateInfo({update_available: false, update_version: '0.4.0'}), null);
+    assert.equal(updateInfo({update_available: 'yes'}), null);
+    const found = updateInfo({update_available: true, update_version: '0.4.0', update_required: false});
+    assert.deepEqual(found, {required: false, version: '0.4.0', title: 'Update available',
+        detail: 'DeskLink 0.4.0 · Show', name: 'Update available · DeskLink 0.4.0 · Show'});
+    assert.equal(updateInfo({update_available: true, update_version: '0.4.0', update_required: true}).title, 'Update needed');
+    assert.equal(updateInfo({update_available: true}).detail, 'Show'); // an app that sent no version
+    assert.equal(updateInfo({update_available: true, update_version: 7}).version, '');
+    assert.equal(updateInfo({update_available: true, update_version: '0.4.0-beta.1'}).version, '0.4.0-beta.1');
+    for (const bad of ['0.4.0<b>x</b>', '0.4.0 "&', '9'.repeat(25), '', 'latest', '0.4.0\n'])
+        assert.equal(updateInfo({update_available: true, update_version: bad}).detail, 'Show', JSON.stringify(bad));
+});
+
+test('the update row sits under the tiles, shows for an away phone, and tints the badge accent', () => {
+    const update = updateInfo({update_available: true, update_version: '0.4.0'});
+    assert.deepEqual(menuBlocks(phone(), [phone()], [], false, update), ['tiles', 'update', 'more', 'footer']);
+    assert.deepEqual(menuBlocks(phone(), [phone()], [], true, update), ['tiles', 'update', 'more', 'footer']);
+    assert.deepEqual(menuBlocks(phone({ready: false}), [phone()], [], false, update), ['offline', 'update', 'more', 'footer']);
+    assert.deepEqual(menuBlocks(phone(), [phone()], [], false, null), ['tiles', 'more', 'footer']);
+    const quiet = phone({unread: 0});
+    assert.deepEqual(panelBadge([quiet], update), {badge: 'accent', words: 'Pixel connected, update available'});
+    assert.equal(panelBadge([quiet], {required: true}).words, 'Pixel connected, update needed');
+    assert.equal(panelBadge([phone({screen: 'view'})], update).badge, 'live'); // coral still wins
+    assert.equal(panelBadge([], update).badge, null); // no phone connected: no dot
+});
+
+test('the extension asks for ShowUpdate only through the update row, which the Shell proxy declares', () => {
+    const dir = '../desklink@derx06.github.io/';
+    const read = f => readFileSync(fileURLToPath(new URL(dir + f, import.meta.url)), 'utf8');
+    assert.ok(read('extension.js').includes('<method name="ShowUpdate"/>'));
+    assert.equal([...read('menu.js').matchAll(/'ShowUpdate'/g)].length, 1);
 });

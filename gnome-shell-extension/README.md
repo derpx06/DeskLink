@@ -28,6 +28,8 @@ More              every area, folded; open it, pick one, Back returns
   Privacy & security  unlock with the phone · lock when I walk away · keep-awake from the phone ·
                       phones may hear this mic · All settings… · Unpair…
   This computer       Keep awake · Lock & hand off · Look for the phone again
+Update            only while a newer DeskLink exists: "Update available · DeskLink 0.4.0 · Show" ("Update needed" when
+                  required), under the tiles; Show opens the app's update window
 Footer            Open DeskLink · Settings · Pause / Resume notifications
 ```
 
@@ -72,7 +74,13 @@ the security keys refuse `on`) and `SendLink(device, link)`; and the actions
 `ping`, `send-link`, `show-screen`, `media-prev`, `insert-photo-file|scan|text|qr`,
 `open-files|notes|clipboard|snippets|notifications|contacts|terminals|settings` and
 `unpair`. An action is listed only when the phone takes it. An older app (interface
-below 9) simply shows fewer rows; below 10 it has no timeline. Interface 10 adds `media.positionMs|lengthMs|seekReason`, the `media-seek` action and the `SeekMedia(device, position_ms)` method. `model.js` has no GNOME imports and says what the
+below 9) simply shows fewer rows; below 10 it has no timeline. Interface 10 adds `media.positionMs|lengthMs|seekReason`, the `media-seek` action and the `SeekMedia(device, position_ms)` method. Interface 11 adds `Desk.update_available` (bool), `update_version` (string) and `update_required` (bool),
+read-only, and the argument-less `ShowUpdate()` method, which only asks the app to show its update window
+(never installs). The extension shows the row and a small accent dot on the icon and the pill only when it
+reads `update_available === true` and calls `ShowUpdate` only from that row, so an older app (no
+properties) shows nothing and is never asked for a method it lacks, and an older extension ignores the
+properties. The version is shown as plain text, cut to the characters of a version number and 24 long.
+`model.js` has no GNOME imports and says what the
 menu holds; `tests/model.test.mjs` also checks that every action and key it names is
 in `src/shell_dbus/`. Run the tests with `node --test gnome-shell-extension/tests/*.test.mjs`.
 

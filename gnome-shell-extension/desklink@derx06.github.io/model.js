@@ -67,7 +67,7 @@ export function shortStatus(device, now = new Date()) {
     if (!device)
         return statusLine(device, now);
     if (checking(device))
-        return 'Checking connection…';
+        return 'Checking…'; // the tile's subtitle is narrow: the header says it in full
     if (!device.ready)
         return device.reachable ? 'Connecting…' : 'Not connected'; // the header has "last seen"
     const parts = [];
@@ -233,7 +233,7 @@ export function visibilityGate({show, hide, schedule, cancel, delay = 300}) {
 /// The top bar glyph's badge and its words (the accessible name; GNOME has no
 /// hover text for a panel icon). Coral while a phone uses this computer, else
 /// the accent for unread notifications or a transfer; `null` when quiet.
-export function panelBadge(devices) {
+export function panelBadge(devices, update = null) {
     const ready = devices.filter(device => device.ready);
     if (ready.length === 0)
         return {badge: null, words: 'No phone connected'};
@@ -247,7 +247,26 @@ export function panelBadge(devices) {
         words.push('transferring files');
     if (unread > 0)
         words.push(`${unread} new notification${unread === 1 ? '' : 's'}`);
-    return {badge: live ? 'live' : (unread > 0 || moving ? 'accent' : null), words: words.join(', ')};
+    if (update)
+        words.push(update.required ? 'update needed' : 'update available');
+    return {badge: live ? 'live' : (unread > 0 || moving || update ? 'accent' : null), words: words.join(', ')};
+}
+
+/// The one quiet row and the dot for a newer DeskLink: what the desk says in
+/// `Desk` (`update_available`, `update_version`, `update_required`; an old
+/// desk sends none of them, so `=== true` is the whole guard). The version
+/// comes from a signed file but is still untrusted text: shown only when it
+/// looks like a version number (<= 24 characters), else left out, so there is
+/// no markup and no long line.
+export function updateInfo(desk) {
+    if (desk?.update_available !== true)
+        return null;
+    const raw = typeof desk.update_version === 'string' ? desk.update_version : '';
+    const version = raw.length <= 24 && /^[0-9]+(\.[0-9]+){0,3}([-+][0-9A-Za-z.+-]+)?$/.test(raw) ? raw : '';
+    const required = desk.update_required === true;
+    const title = required ? 'Update needed' : 'Update available';
+    const detail = version ? `DeskLink ${version} · Show` : 'Show';
+    return {required, version, title, detail, name: `${title} · ${detail}`};
 }
 
 // Rows -----------------------------------------------------------------
@@ -397,7 +416,7 @@ export function sections(device, desk, extras = {}) {
 /// timers, a phone using this computer; then the quick tiles and the music. Every area is folded into
 /// More. A new kind of row is one more entry here and one more case in
 /// menu.js's `fillMenu`.
-export function menuBlocks(selected, devices = [], activities = [], short = false) {
+export function menuBlocks(selected, devices = [], activities = [], short = false, update = null) {
     if (!selected)
         return ['empty'];
     const blocks = [];
@@ -427,6 +446,8 @@ export function menuBlocks(selected, devices = [], activities = [], short = fals
         blocks.push('tiles');
     if (!short && selected.ready && selected.media)
         blocks.push('media');
+    if (update)
+        blocks.push('update');
     blocks.push('more', 'footer');
     return blocks;
 }
