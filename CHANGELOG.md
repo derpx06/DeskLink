@@ -22,7 +22,10 @@ switched off.
 - "Find anything" (Ctrl+K): one search over the actions, pages, phones, terminals, recent files, notes, snippets,
   clipboard history, contacts and settings.
 - The GNOME top-bar menu is the complete remote for a paired phone (what is happening now first, four large
-  tiles, plain offline and empty states). Top-bar interface 10.
+  tiles, plain offline and empty states). Top-bar interface 11.
+
+- Send to phone in the file manager: Files shows a top-level "Send to phone" when python-nautilus is installed (otherwise Scripts > "Send to <phone>"), Nemo a top-level action for one phone, Dolphin a submenu for files and folders. Every refusal (folders, network or trash locations, missing or unreadable files, more than 500 files) is now shown as a notification instead of being silent; a phone that is not connected says its files wait. Settings > Files > "Show Send to phone in the file manager" (on by default) turns all of it off and removes every file it wrote; `desklink --remove-integration` does the same for a package's post-removal hook. In a Flatpak, Settings shows the commands to copy.
+- Security: the send-files action re-checks every path when it runs (ordinary readable file, never DeskLink's own keys or state), accepts at most 500 files per request and 5 requests per 10 seconds.
 
 **Connection**
 

@@ -16,6 +16,13 @@ relay = os.environ.get("DESKLINK_RELAY_URL", "")
 if relay:
     manifest["build-options"]["env"]["DESKLINK_RELAY_URL"] = relay
 
+update = os.environ.get("DESKLINK_UPDATE_URL", "")
+if update:
+    import re
+    if not re.fullmatch(r"https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/-]*)?", update):
+        sys.exit("error: DESKLINK_UPDATE_URL must be an https:// address")
+    manifest["build-options"]["env"]["DESKLINK_UPDATE_URL"] = update
+
 modules = [m for m in manifest["modules"] if isinstance(m, dict) and m.get("name") == "desklink"]
 if len(modules) != 1:
     sys.exit("error: the manifest must have exactly one module named desklink")

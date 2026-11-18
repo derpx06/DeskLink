@@ -245,3 +245,12 @@ forget every phone), the top-bar extension copy in
 with `gnome-extensions disable desklink@derx06.github.io` first), and the
 search provider file `~/.local/share/gnome-shell/search-providers/derx06.desklink.com.search-provider.ini`.
 Flatpak: `flatpak uninstall --delete-data derx06.desklink.com`.
+
+To remove the file-manager entries first, turn off Settings > Files > "Show Send to phone in the file manager", or run
+`desklink --remove-integration`. It removes `~/.local/share/nautilus-python/extensions/desklink_send_to.py`,
+`~/.local/share/desklink/send-to-phones.json`, the "Send to <phone>" and "Add to DeskLink Bucket" scripts in
+`~/.local/share/nautilus/scripts`, `~/.local/share/nemo/scripts` and `~/.config/caja/scripts`, the
+`~/.local/share/nemo/actions/*.nemo_action`, `~/.local/share/kio/servicemenus/derx06.desklink.com-send.desktop` and
+`~/.local/share/Thunar/sendto/*` DeskLink wrote, and the Open With entries
+`~/.local/share/applications/derx06.desklink.com.{SendTo,Bucket}.desktop`. Restart Files (`nautilus -q`) afterwards.
+Your pairing data in `~/.config/desklink` is kept on purpose.

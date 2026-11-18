@@ -5,6 +5,7 @@ pkgname=desklink
 # Empty: the 0.3 beta is LAN-only (the relay is switched off in the build), so the
 # value is inert. Set it to the deployed server (relay/deploy/DEPLOY.md) when the relay is enabled.
 _relay_url=''
+_update_url=''
 pkgver=0.3.0
 pkgrel=1
 pkgdesc='Use your Android phone and Linux desktop together'
@@ -55,6 +56,10 @@ build() {
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_NET_OFFLINE=true
   export DESKLINK_RELAY_URL="$_relay_url"
+  # The update check is inert unless this is set to the signed manifest's address
+  # (https://..., see docs/UPDATES.md); a distribution package normally leaves it empty
+  # and updates through its package manager.
+  export DESKLINK_UPDATE_URL="$_update_url"
   arch-meson "DeskLink-$pkgver" build
   meson compile -C build
 }

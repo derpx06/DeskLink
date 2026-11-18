@@ -33,5 +33,10 @@ mod release_guard_tests {
                 && (line.ends_with("true;") || line.ends_with("false;"))));
         let workflow = include_str!("../../../.github/workflows/release.yml");
         assert!(workflow.contains("const RELAY_ENABLED: bool = (true|false)"));
+        // The update address reaches the build: without it a tagged release has
+        // an inert update check even with real keys.
+        assert!(workflow.contains("DESKLINK_UPDATE_URL: ${{ vars.DESKLINK_UPDATE_URL }}"));
+        assert!(workflow.contains("update check inert: DESKLINK_UPDATE_URL not set"));
+        assert!(include_str!("../../../flatpak/ci-manifest.py").contains("DESKLINK_UPDATE_URL"));
     }
 }

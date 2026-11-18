@@ -54,6 +54,13 @@ there is no build for them: use the **Flatpak**, which carries its own GTK.
 Derivatives follow their base: Linux Mint 22, Pop!_OS 24.04, Zorin OS 18 and
 elementary OS 8 are Ubuntu 24.04; Manjaro and EndeavourOS are Arch.
 
+Build-time settings (environment variables at `cargo`/`meson` time; both default to empty):
+`DESKLINK_RELAY_URL` (inert while the relay is switched off) and `DESKLINK_UPDATE_URL`, the address of the signed
+update manifest (`https://...`). **Empty means the update check is inert**: no request, no popup. Distribution
+packages (AUR, Debian, OBS) normally leave it empty because the package manager updates the app; set it
+(`export DESKLINK_UPDATE_URL=...` in `build()` / `debian/rules` / the spec's `%build`) only for a package that should
+check the project's manifest. The Flatpak build gets it from `flatpak/ci-manifest.py` (CI variable of the same name).
+
 Version note: 0.3.0 is the first public release. Any earlier 1.x development package (none was published) sorts
 above it: remove it before installing 0.3.0 (or use an epoch if one ever needs to be kept).
 

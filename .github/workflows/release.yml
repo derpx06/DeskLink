@@ -12,6 +12,9 @@ permissions:
 # Actions > Variables; a release without it would ship a placeholder address.
 env:
   DESKLINK_RELAY_URL: ${{ vars.DESKLINK_RELAY_URL }}
+  # The signed update manifest's address (docs/UPDATES.md): a repository VARIABLE, not a
+  # secret. Empty is allowed and gives a build whose update check is inert.
+  DESKLINK_UPDATE_URL: ${{ vars.DESKLINK_UPDATE_URL }}
 
 jobs:
   # Nothing is built or published unless the checks pass on this tag.
@@ -46,6 +49,15 @@ jobs:
               exit 1
             fi
             echo "::warning::DESKLINK_RELAY_URL is not set: this release is LAN-only (RELAY_ENABLED is false)"
+          fi
+          # The update address: https only, read from the environment (never interpolated here).
+          if [ -z "$DESKLINK_UPDATE_URL" ]; then
+            echo "::warning::update check inert: DESKLINK_UPDATE_URL not set"
+            echo "## Update check inert" >> "$GITHUB_STEP_SUMMARY"
+            echo "DESKLINK_UPDATE_URL is not set: this build never checks for updates." >> "$GITHUB_STEP_SUMMARY"
+          elif ! printf '%s' "$DESKLINK_UPDATE_URL" | grep -Eq '^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/-]*)?$'; then
+            echo "::error::DESKLINK_UPDATE_URL must be an https:// address"
+            exit 1
           fi
 
       - name: Build the app tarball
