@@ -23,7 +23,7 @@ use super::*;
 /// - `ui-kit [W H]`: the UI kit's component sheet in its own window.
 /// - `page NAME`, `select N` (the Nth fake device), `open-terminal N`,
 ///   `open-switcher`, `window-size W H`, `color-scheme dark|light|default`,
-///   `open-pair`, `open-codes`, `nav content|sidebar`,
+///   `open-pair`, `open-codes`, `nav content|sidebar`, `text-scale F`,
 ///   `fake-transfer NAME DONE/TOTAL` (a leading `-` on DONE makes it
 ///   incoming; TOTAL 0 is still preparing).
 #[cfg(debug_assertions)]
@@ -959,7 +959,6 @@ pub(super) fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &st
                 );
             }
         }
-        // "nav content|sidebar": which pane a collapsed window shows.
         // "text-scale 2.0": the system text scale (what GNOME's setting does
         // through gtk-xft-dpi), for shots of large text.
         "text-scale" => {
@@ -967,6 +966,7 @@ pub(super) fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &st
                 settings.set_gtk_xft_dpi((96.0 * 1024.0 * scale) as i32);
             }
         }
+        // "nav content|sidebar": which pane a collapsed window shows.
         "nav" => win.imp().split_view.set_show_content(id == "content"),
         _ => return false,
     }

@@ -166,7 +166,9 @@ impl Presentation {
         if self.detail.is_empty() {
             self.word.to_string()
         } else {
-            format!("{} {}", self.word, self.detail)
+            // Without the bidi marks an RTL window puts around "12 ms": a
+            // screen reader reads words, not controls.
+            crate::bidi::strip_isolates(&format!("{} {}", self.word, self.detail))
         }
     }
 }
@@ -343,5 +345,22 @@ mod tests {
         assert_eq!(Presentation::of(&phone).word, "Nearby");
         phone.status = DeviceStatus::PairRequested;
         assert_eq!(Presentation::of(&phone).status, Status::Idle);
+    }
+
+    /// A screen reader's words carry no bidi marks, though the visible
+    /// "9 ms" of an RTL window is isolated; the plain readout is unchanged.
+    #[test]
+    fn the_spoken_words_have_no_bidi_marks_and_the_ltr_round_trip_is_unchanged() {
+        let words = Presentation {
+            status: Status::Ok,
+            word: "Connected",
+            card: "Connected",
+            detail: crate::bidi::ltr_run_for("over Wi-Fi · 9 ms", true),
+            short: String::new(),
+        };
+        assert!(words.detail.contains('\u{2066}'));
+        assert_eq!(words.spoken(), "Connected over Wi-Fi · 9 ms");
+        // (On a plain thread, which is LTR, `the_connector_shows_how_the_phone_is_reached`
+        // pins "over Wi-Fi · 9 ms" exactly.)
     }
 }
