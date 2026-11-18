@@ -36,6 +36,9 @@ switched off.
 - Pairing from the phone now brings the connection up by itself; an unpair the phone never heard is answered
   the next time it connects.
 - A finished transfer whose completion was lost is answered, not received twice.
+- Reconnecting: a late old worker no longer ends a newer connection; features sent while the link is quiet keep their
+  order; a responder phone with a live LAN link asks the desk to offer after 20 s of silence (at most every 30 s,
+  doubling to 5 min), and the desk answers by offering and clearing "Can't reach".
 
 **Look and feel**
 
@@ -44,6 +47,8 @@ switched off.
 - A narrow sidebar rail between the overlay and 1000sp; Files, Notes, Terminals, Contacts and Settings use a big
   window (the chosen contact, or the page list, beside the open one).
 - Keep awake is off for new installs and holds the computer awake only while a phone is connected.
+- Ctrl+F searches the current page; Ctrl+K stays the global search.
+- Sentence-case Insert menu rows and "New note"; right-to-left readouts (terminal size, round trip) read correctly.
 
 **Security and robustness**
 
