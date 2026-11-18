@@ -1,4 +1,4 @@
-// Run with: node --test gnome-shell-extension/tests/
+// Run with: node --test gnome-shell-extension/tests/*.test.mjs (or `npm test` in gnome-shell-extension/)
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {existsSync, readFileSync, readdirSync} from 'node:fs';

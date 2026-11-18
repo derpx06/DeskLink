@@ -717,7 +717,7 @@ The design intent is in `docs/UI-REDESIGN.md` (a specification written 2026-11-0
 | `notifications.js` | Phone notifications as GNOME notifications with reply, call banners with Answer/Decline |
 | `stylesheet.css`, `desklink-symbolic.svg`, `metadata.json` | |
 
-The extension talks to the app over the session bus: proxy to `derx06.desklink.com` at `/derx06/desklink/com/Shell`, `DO_NOT_AUTO_START`, bus-name watch, `HelloRemote(1, [notifications, quick-settings, calls])`, `g-properties-changed`. If the app is not running, an invoke launches `derx06.desklink.com.desktop`. The JS tests are run with `node --test gnome-shell-extension/tests/`; they are not wired into cargo or meson or CI.
+The extension talks to the app over the session bus: proxy to `derx06.desklink.com` at `/derx06/desklink/com/Shell`, `DO_NOT_AUTO_START`, bus-name watch, `HelloRemote(1, [notifications, quick-settings, calls])`, `g-properties-changed`. If the app is not running, an invoke launches `derx06.desklink.com.desktop`. The JS tests are run with `node --test gnome-shell-extension/tests/*.test.mjs` (or `npm test` in `gnome-shell-extension/`); they are not wired into cargo or meson or CI.
 
 **`derx06.desklink.com.Shell1`** (`shell_dbus/mod.rs`, `VERSION = 10`):
 

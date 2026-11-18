@@ -7,4 +7,7 @@ pack:
 install: pack
 	gnome-extensions install --force $(UUID).shell-extension.zip
 
-.PHONY: pack install
+test:
+	node --test tests/*.test.mjs
+
+.PHONY: pack install test

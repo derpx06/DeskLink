@@ -1,0 +1,7 @@
+{
+  "name": "desklink-shell-extension",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}

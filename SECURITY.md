@@ -95,8 +95,8 @@ share DeskLink's address space either way.
 
 Once a day (and when you press Check for updates) DeskLink fetches one small signed file from the project's update
 address, compiled into the build (a release build has no other source). The request is an anonymous HTTPS GET: it
-carries the DeskLink version in its User-Agent and an `If-None-Match`, and no name, no device or install identifier,
-no cookie. The server can see your network address and the time, as any website can. The file is Ed25519-signed with
+carries the DeskLink version in its User-Agent and an `If-None-Match`, and no name, no device identifier, no cookie (a random install
+number is kept on this computer only, to decide your staged-rollout bucket, and is never sent). The server can see your network address and the time, as any website can. The file is Ed25519-signed with
 the project's key and checked under a strict profile (size, JSON, canonical base64, signature, dates, links pinned to
 this project's release pages); anything else is ignored without a message. DeskLink only tells you a newer version
 exists and how to update for how you installed it; it never downloads, installs or runs anything. Settings, Advanced, Check
@@ -112,7 +112,7 @@ other users; DeskLink tightens them once at start).
 
 DeskLink fetches the update server's `latest.json` over HTTPS about once a day, and when you open the app
 if the last answer is old. The request carries no identifier and no account, no cookies and no query
-string; only DeskLink's version number, in the `User-Agent`. The server operator (Firebase Hosting) can see
+string (a random install number is kept on this computer only, to decide your rollout bucket, and is never sent); only DeskLink's version number, in the `User-Agent`. The server operator (Firebase Hosting) can see
 your network address and the time, as any website can. The file is signed (Ed25519, public keys compiled
 into DeskLink); anything unsigned, tampered, expired, older than one already seen, or with an address
 outside the project's own is ignored. A manifest is a report that a version exists: it cannot run a

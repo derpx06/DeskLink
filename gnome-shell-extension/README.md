@@ -82,7 +82,7 @@ properties) shows nothing and is never asked for a method it lacks, and an older
 properties. The version is shown as plain text, cut to the characters of a version number and 24 long.
 `model.js` has no GNOME imports and says what the
 menu holds; `tests/model.test.mjs` also checks that every action and key it names is
-in `src/shell_dbus/`. Run the tests with `node --test gnome-shell-extension/tests/*.test.mjs`.
+in `src/shell_dbus/`. Run the tests with `node --test gnome-shell-extension/tests/*.test.mjs`, `npm test` or `make test` in this folder (a bare `node --test tests/` does not load them).
 
 ## Checking it on the real top bar
 

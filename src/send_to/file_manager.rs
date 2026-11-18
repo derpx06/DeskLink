@@ -80,8 +80,13 @@ impl Skipped {
         }
         if self.remote > 0 {
             parts.push(format!(
-                "{} aren't stored on this computer (network, trash or recent locations): copy them to a folder first.",
-                count(self.remote, "item", "items")
+                "{} stored on this computer (network, trash or recent location): copy {} to a folder first.",
+                if self.remote == 1 {
+                    "1 item isn't".to_string()
+                } else {
+                    format!("{} items aren't", self.remote)
+                },
+                if self.remote == 1 { "it" } else { "them" }
             ));
         }
         if self.badname > 0 {
@@ -92,22 +97,25 @@ impl Skipped {
             ));
         }
         if self.missing > 0 {
-            parts.push(format!(
-                "{} no longer exist.",
-                count(self.missing, "file", "files")
-            ));
+            parts.push(if self.missing == 1 {
+                "1 file no longer exists.".to_string()
+            } else {
+                format!("{} files no longer exist.", self.missing)
+            });
         }
         if self.unreadable > 0 {
-            parts.push(format!(
-                "{} can't be read.",
-                count(self.unreadable, "file", "files")
-            ));
+            parts.push(if self.unreadable == 1 {
+                "1 file can't be read.".to_string()
+            } else {
+                format!("{} files can't be read.", self.unreadable)
+            });
         }
         if self.special > 0 {
-            parts.push(format!(
-                "{} aren't ordinary files.",
-                count(self.special, "item", "items")
-            ));
+            parts.push(if self.special == 1 {
+                "1 item isn't an ordinary file.".to_string()
+            } else {
+                format!("{} items aren't ordinary files.", self.special)
+            });
         }
         if self.protected > 0 {
             parts.push("DeskLink's own files aren't sent.".to_string());
@@ -799,12 +807,50 @@ mod tests {
         for part in [
             "Folders aren't sent yet.",
             "2 items aren't stored on this computer",
-            "1 file no longer exist",
-            "3 files can't be read",
-            "1 item aren't ordinary",
+            "copy them to a folder first",
+            "1 file no longer exists.",
+            "3 files can't be read.",
+            "1 item isn't an ordinary file.",
             "DeskLink's own files",
         ] {
             assert!(text.contains(part), "{part} in {text}");
+        }
+        let one = Skipped {
+            missing: 1,
+            unreadable: 1,
+            special: 1,
+            remote: 1,
+            ..Skipped::default()
+        };
+        let many = Skipped {
+            missing: 4,
+            unreadable: 4,
+            special: 4,
+            remote: 4,
+            ..Skipped::default()
+        };
+        let (one, many) = (one.message().unwrap(), many.message().unwrap());
+        for part in [
+            "1 item isn't stored on this computer",
+            "copy it to a folder first",
+            "1 file no longer exists.",
+            "1 file can't be read.",
+            "1 item isn't an ordinary file.",
+        ] {
+            assert!(one.contains(part), "{part} in {one}");
+        }
+        for part in [
+            "4 items aren't stored on this computer",
+            "copy them to a folder first",
+            "4 files no longer exist.",
+            "4 files can't be read.",
+            "4 items aren't an ordinary file",
+        ] {
+            if part.contains("an ordinary") {
+                assert!(many.contains("4 items aren't ordinary files."), "{many}");
+            } else {
+                assert!(many.contains(part), "{part} in {many}");
+            }
         }
         assert!(too_many_message(900).starts_with("More than 500 files"));
         assert_eq!(
