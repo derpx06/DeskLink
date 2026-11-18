@@ -590,8 +590,9 @@ fn capital(text: &str) -> String {
         .unwrap_or_default()
 }
 
-/// A label is sentence case already; this keeps any stray Title Case one in line: rows of the
-/// palette are sentence case.
+/// Rows of the palette are sentence case: "Take a Photo as a File" becomes
+/// "Take a photo as a file" (the insert rows already are; this keeps any
+/// other Title Case label in line).
 fn sentence_case(text: &str) -> String {
     let mut words = text.split(' ');
     let first = words.next().unwrap_or_default().to_string();

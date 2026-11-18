@@ -170,21 +170,19 @@ mod tests {
         assert_eq!(offered_for(false).last().unwrap().0, 4);
     }
 
-    /// Sentence case, like the rest of the app (QA4-19): only the first word and
-    /// acronyms (PDF, QR) are capitalised.
+    /// Sentence case, like the rest of the app (QA4-19): the five rows, exactly.
     #[test]
     fn the_insert_rows_are_sentence_case() {
-        for (_, _, label, _) in CAPTURES {
-            for word in label.split(' ').skip(1) {
-                let acronym = word
-                    .trim_matches(|c| c == '(' || c == ')')
-                    .chars()
-                    .all(|c| !c.is_lowercase());
-                assert!(
-                    acronym || word.chars().next().is_some_and(|c| !c.is_uppercase()),
-                    "{label}"
-                );
-            }
-        }
+        let labels: Vec<&str> = CAPTURES.iter().map(|(_, _, label, _)| *label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Take a photo",
+                "Take a photo as a file",
+                "Scan a document (PDF)",
+                "Copy text from a picture",
+                "Scan a QR code",
+            ]
+        );
     }
 }
