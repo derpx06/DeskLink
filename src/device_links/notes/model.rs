@@ -104,14 +104,14 @@ pub(super) fn trim_note(text: &str) -> &str {
 }
 
 impl Note {
-    /// Its title, or its first line, or "New Note".
+    /// Its title, or its first line, or "New note".
     pub(crate) fn label(&self) -> String {
         let label = if trim_note(&self.title).is_empty() {
             self.body
                 .lines()
                 .map(|line| trim_note(line.trim_start_matches(['#', ' ', '-', '*'])))
                 .find(|line| !line.is_empty())
-                .unwrap_or("New Note")
+                .unwrap_or("New note")
         } else {
             trim_note(&self.title)
         };

@@ -485,7 +485,7 @@ pub(crate) fn entries(
         });
     }
     if !phones.is_empty() {
-        menu.push(TrayEntry::action("New Note", "new-note").icon("document-edit-symbolic"));
+        menu.push(TrayEntry::action("New note", "new-note").icon("document-edit-symbolic"));
     }
     menu.push(TrayEntry::Separator);
     menu.push(TrayEntry::action("Open DeskLink", "open").icon("focus-windows-symbolic"));

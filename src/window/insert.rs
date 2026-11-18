@@ -13,23 +13,23 @@ pub(crate) const CAPTURES: [(&str, &str, &str, &str); 5] = [
     (
         "photo",
         "clipboard",
-        "Take a Photo",
+        "Take a photo",
         "camera-photo-symbolic",
     ),
     (
         "photo",
         "file",
-        "Take a Photo as a File",
+        "Take a photo as a file",
         "document-save-symbolic",
     ),
-    ("scan", "file", "Scan a Document (PDF)", "scanner-symbolic"),
+    ("scan", "file", "Scan a document (PDF)", "scanner-symbolic"),
     (
         "text",
         "clipboard",
-        "Copy Text from a Picture",
+        "Copy text from a picture",
         "format-text-plain-symbolic",
     ),
-    ("qr", "clipboard", "Scan a QR Code", "view-grid-symbolic"),
+    ("qr", "clipboard", "Scan a QR code", "view-grid-symbolic"),
 ];
 
 /// The rows to offer for a phone: its index in [`CAPTURES`] (the tray's verb)
@@ -168,5 +168,23 @@ mod tests {
         assert_eq!(kinds(false), ["photo", "photo", "scan", "qr"]);
         // The tray's verbs keep their place in CAPTURES.
         assert_eq!(offered_for(false).last().unwrap().0, 4);
+    }
+
+    /// Sentence case, like the rest of the app (QA4-19): only the first word and
+    /// acronyms (PDF, QR) are capitalised.
+    #[test]
+    fn the_insert_rows_are_sentence_case() {
+        for (_, _, label, _) in CAPTURES {
+            for word in label.split(' ').skip(1) {
+                let acronym = word
+                    .trim_matches(|c| c == '(' || c == ')')
+                    .chars()
+                    .all(|c| !c.is_lowercase());
+                assert!(
+                    acronym || word.chars().next().is_some_and(|c| !c.is_uppercase()),
+                    "{label}"
+                );
+            }
+        }
     }
 }

@@ -590,7 +590,7 @@ fn capital(text: &str) -> String {
         .unwrap_or_default()
 }
 
-/// "Take a Photo as a File" is "Take a photo as a file" here: rows of the
+/// A label is sentence case already; this keeps any stray Title Case one in line: rows of the
 /// palette are sentence case.
 fn sentence_case(text: &str) -> String {
     let mut words = text.split(' ');

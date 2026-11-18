@@ -838,7 +838,7 @@ fn text_typed_over_a_note_deleted_underneath_is_kept_and_brings_it_back() {
     assert!(copy.is_none(), "no copy of a tombstone");
     let note = &shelf.notes[&id];
     assert!(!note.deleted && note.body == "typed after");
-    assert_eq!(shelf.notes.len(), 1, "no junk 'New Note (conflicted copy)'");
+    assert_eq!(shelf.notes.len(), 1, "no junk 'New note (conflicted copy)'");
     // Deleting again an already deleted note stays a deletion.
     edit_from_in_shelf(&mut shelf, &id, None, |note| note.deleted = true).unwrap();
     nap();
