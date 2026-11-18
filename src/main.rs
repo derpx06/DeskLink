@@ -75,6 +75,7 @@ fn since_process_start_ms() -> f64 {
 mod about;
 mod application;
 mod autostart;
+mod bidi;
 mod bucket_progress;
 mod config;
 mod dbus_names;

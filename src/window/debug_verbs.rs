@@ -960,6 +960,13 @@ pub(super) fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &st
             }
         }
         // "nav content|sidebar": which pane a collapsed window shows.
+        // "text-scale 2.0": the system text scale (what GNOME's setting does
+        // through gtk-xft-dpi), for shots of large text.
+        "text-scale" => {
+            if let (Some(settings), Ok(scale)) = (gtk::Settings::default(), id.parse::<f64>()) {
+                settings.set_gtk_xft_dpi((96.0 * 1024.0 * scale) as i32);
+            }
+        }
         "nav" => win.imp().split_view.set_show_content(id == "content"),
         _ => return false,
     }

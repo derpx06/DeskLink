@@ -53,7 +53,7 @@ impl LinkState {
         matches!(self, Self::Direct | Self::Relay)
             .then_some(device.rtt_ms)
             .flatten()
-            .map(|ms| format!("{ms} ms"))
+            .map(|ms| crate::bidi::ltr_run(&format!("{ms} ms")))
     }
 }
 

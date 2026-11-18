@@ -985,7 +985,10 @@ fn fill_side(
                 .unwrap_or_else(|| info.title.trim_start_matches('-').to_string()),
         ),
         ("Started", started(&info.id).unwrap_or_default()),
-        ("Size", format!("{}×{}", info.cols, info.rows)),
+        (
+            "Size",
+            crate::bidi::ltr_run(&format!("{}×{}", info.cols, info.rows)),
+        ),
     ] {
         let row = gtk::Box::builder()
             .spacing(12)
