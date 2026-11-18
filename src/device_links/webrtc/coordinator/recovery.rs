@@ -265,7 +265,10 @@ fn sign(
 
 /// Whether the card still says the phone can't be reached (a new link resets
 /// the ladder but not the words).
-fn shows_unavailable(devices: &Arc<Mutex<HashMap<String, DeviceView>>>, device_id: &str) -> bool {
+pub(super) fn shows_unavailable(
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    device_id: &str,
+) -> bool {
     devices.lock().is_ok_and(|devices| {
         devices
             .get(device_id)

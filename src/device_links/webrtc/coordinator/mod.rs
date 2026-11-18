@@ -305,7 +305,7 @@ pub(crate) fn handle_signaling_packet(
                 // offer, so a "Can't reach" that only said the ladder ran out
                 // is not true any more (the ladder stays capped: if the offer
                 // fails too, the words come back).
-                if shows_unavailable(&devices, &binding.device_id) {
+                if recovery::shows_unavailable(&devices, &binding.device_id) {
                     crate::device_links::daemon::state::clear_error(&devices, &binding.device_id);
                 }
                 restart_as_initiator(binding, sessions, config, devices, events)
