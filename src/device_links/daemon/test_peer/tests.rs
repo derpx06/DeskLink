@@ -2501,3 +2501,68 @@ fn an_unpair_right_after_the_accept_stops_the_scheduled_offer() {
     std::thread::sleep(std::time::Duration::from_millis(1_500));
     assert!(!desk_attempt(&desk), "no offer for an unpaired phone");
 }
+
+/// QA4-17: the desk is the initiator, its recovery ladder is spent ("Can't
+/// reach", nobody retries) and the phone's LAN link is alive. The responder
+/// phone's signed `restart_request` over that link makes the desk offer
+/// again, and the "Can't reach" words go. A state ask, never a command: it
+/// only works because the desk verified the phone's signature, and it does
+/// not reset the ladder (it stays capped).
+#[test]
+fn a_responder_phones_restart_request_revives_a_desk_whose_ladder_is_spent() {
+    use crate::device_links::webrtc::coordinator::{start_initiator, unavailable_words};
+    let net = TestNetwork::new();
+    let (a, b) = peer_pair(&net, "qa417-desk", "qa417-phone");
+    let (mut desk, mut phone) = if a.local_id() < b.local_id() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    // Paired both ways (no capabilities advertised: nothing starts by itself).
+    phone.request_pair();
+    net.advance(0);
+    desk.pump();
+    desk.accept();
+    net.advance(0);
+    phone.pump();
+    assert!(desk.is_trusted() && phone.is_trusted());
+    let id = phone.local_id();
+    desk.sessions
+        .with_session(&desk.binding, |session| {
+            session.webrtc_recovery_attempt = 99
+        })
+        .unwrap();
+    super::super::state::mark_error(&desk.devices, &id, unavailable_words("Pixel"));
+    assert!(!desk_attempt(&desk));
+    // The responder phone asks, over the live LAN link.
+    start_initiator(
+        phone.binding.clone(),
+        Arc::clone(&phone.sessions),
+        Arc::clone(&phone.config),
+        Arc::clone(&phone.devices),
+        Arc::clone(&phone.events),
+    )
+    .unwrap();
+    net.advance(0);
+    desk.pump();
+    assert!(
+        wait_for(std::time::Duration::from_secs(5), || desk_attempt(&desk)),
+        "the desk did not offer"
+    );
+    let shown = desk.devices.lock().unwrap()[&id].last_error.clone();
+    assert!(
+        !shown
+            .as_deref()
+            .is_some_and(crate::device_links::webrtc::coordinator::is_unavailable),
+        "Can't reach is cleared: {shown:?}"
+    );
+    // Capped, not reset.
+    let rung = desk
+        .sessions
+        .with_session(&desk.binding, |session| session.webrtc_recovery_attempt)
+        .unwrap();
+    assert!(
+        rung <= 5 && rung > 0,
+        "the ladder stays capped at its last rung, not reset: {rung}"
+    );
+}
